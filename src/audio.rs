@@ -1,6 +1,6 @@
 //! Audio system domain: backend-agnostic mixer/device control and audio playback.
 //!
-//! Mixer/device control types live in [`types`] and [`client`], while decoding, procedural
+//! Mixer/device control types live in `types` and `client`, while decoding, procedural
 //! presets, XDG Sound Theme lookup, resampling, and playback live in [`sound`] and [`player`].
 
 #[cfg(feature = "alsa")]

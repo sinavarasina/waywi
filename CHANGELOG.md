@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-11-15
+
+### Fixed
+- Configured `[package.metadata.docs.rs]` with pure-Rust features so `docs.rs` builds succeed without system C audio development headers (`libpipewire-0.3`, `libpulse`, `alsa`).
+- Removed redundant `package.homepage` field in `Cargo.toml`.
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

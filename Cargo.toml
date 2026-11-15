@@ -1,11 +1,10 @@
 [package]
 name = "waywi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Varasina Farmadani <sina@sinanonym.my.id>"]
 description = "Wayland widget toolkit in Rust"
-homepage = "https://github.com/sinavarasina/waywi"
 repository = "https://github.com/sinavarasina/waywi"
 documentation = "https://docs.rs/waywi"
 license = "MIT"
@@ -15,7 +14,26 @@ categories = ["gui", "os::linux-apis"]
 exclude = [".github/", "target/"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = [
+    "renderer-software",
+    "renderer-gpu",
+    "text",
+    "image-png",
+    "image-svg",
+    "image-gif",
+    "image-webp",
+    "animation",
+    "fractional-scale",
+    "clipboard",
+    "idle-notify",
+    "control-ipc",
+    "hyprland-ipc",
+    "sway-ipc",
+    "dbus",
+    "global-shortcuts",
+    "accessibility",
+    "audio-playback",
+]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
