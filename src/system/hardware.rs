@@ -1,0 +1,15 @@
+//! Physical hardware telemetry: battery/power supplies (`/sys/class/power_supply`),
+//! panel backlights + DDC/CI monitor luminance, and thermal/hwmon sensors (`/sys/class/hwmon`).
+
+pub mod brightness;
+pub mod power;
+pub mod sensors;
+
+pub use brightness::{
+    BacklightDevice, BrightnessSnapshot, DdcMonitorInfo, VCP_LUMINANCE, decode_ddc_vcp_reply,
+    encode_ddc_get_vcp, encode_ddc_set_vcp, read_backlights, read_backlights_from,
+    set_backlight_percent, set_backlight_raw,
+};
+pub(crate) use brightness::{DdcWorker, backlight_percent_to_raw, write_backlight_sysfs_raw};
+pub use power::{BatteryInfo, PowerStatus, read_batteries, read_batteries_from};
+pub use sensors::{ThermalSensor, read_sensors, read_sensors_from};

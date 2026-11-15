@@ -1,0 +1,61 @@
+//! D-Bus integration domain: core client/signal worker and desktop service modules.
+//!
+//! Service-specific helpers live in dedicated submodules including [`bluetooth`], [`logind`],
+//! [`modem`], [`mpris`], [`notifications`], [`tray`], [`power_profiles`], [`network_manager`],
+//! [`upower`], [`idle_privacy`], and [`global_shortcuts`].
+
+pub mod bluetooth;
+pub mod client;
+#[cfg(feature = "global-shortcuts")]
+pub mod global_shortcuts;
+pub mod idle_privacy;
+pub mod logind;
+pub mod modem;
+pub mod mpris;
+pub mod network_manager;
+pub mod notifications;
+pub mod power_profiles;
+pub mod tray;
+pub mod types;
+pub mod upower;
+pub(crate) mod worker;
+pub(crate) mod zvariant_helpers;
+
+pub(crate) use bluetooth::spawn_bluetooth_worker;
+pub use bluetooth::{BluetoothAdapter, BluetoothDevice, BluetoothSnapshot};
+pub use client::DbusClient;
+pub(crate) use client::DbusSharedBus;
+#[cfg(feature = "global-shortcuts")]
+pub(crate) use global_shortcuts::GlobalShortcutsWorker;
+#[cfg(feature = "global-shortcuts")]
+pub use global_shortcuts::{
+    BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent, GlobalShortcuts,
+};
+pub use idle_privacy::{GeoClueSnapshot, ScreenSaverSnapshot};
+pub(crate) use idle_privacy::{spawn_geoclue_worker, spawn_screensaver_worker};
+pub(crate) use logind::LogindWorker;
+pub use logind::{LogindEvent, LogindInhibitor, LogindSnapshot};
+pub(crate) use modem::spawn_modem_worker;
+pub use modem::{ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState};
+pub use mpris::{MprisPlaybackStatus, MprisSnapshot};
+pub(crate) use network_manager::NetworkManagerWorker;
+pub use network_manager::{
+    NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo,
+    NmDeviceType, NmState,
+};
+pub(crate) use notifications::NotificationServerWorker;
+pub use notifications::{
+    DesktopNotification, NotificationCloseReason, NotificationEvent, NotificationImageData,
+    NotificationUrgency,
+};
+pub(crate) use power_profiles::PowerProfilesWorker;
+pub use power_profiles::{PowerProfileHold, PowerProfileKind, PowerProfileSnapshot};
+pub(crate) use tray::TrayWorker;
+pub use tray::{
+    TrayCategory, TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus,
+    TrayToolTip,
+};
+pub use types::{Dbus, DbusBus, DbusSignalEvent, DbusValue};
+pub(crate) use upower::spawn_upower_worker;
+pub use upower::{UPowerDevice, UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot};
+pub(crate) use worker::{DbusSignalWorker, ServiceWatchWorker};

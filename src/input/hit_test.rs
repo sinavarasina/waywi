@@ -1,0 +1,74 @@
+use crate::geometry::{Affine2D, Point, Rect};
+
+use super::events::EventHandlers;
+use super::keys::NodeId;
+
+/// Hit-testable resolved node entry retained for one surface.
+pub(crate) struct HitTestNode<M> {
+    pub(crate) node_id: NodeId,
+    /// Un-transformed local layout bounds `[0..w, 0..h]` in element space (actually surface-space
+    /// origin + size before local transform).
+    pub(crate) local_rect: Rect,
+    /// Forward transform from surface-local space -> world affine maps surface-local layout rect to
+    /// transformed surface-local coordinates.
+    pub(crate) affine: Affine2D,
+    pub(crate) inverse_affine: Option<Affine2D>,
+    pub(crate) clip_rect: Option<Rect>,
+    pub(crate) z_index: i32,
+    pub(crate) paint_order: usize,
+    pub(crate) visible: bool,
+    pub(crate) input_enabled: bool,
+    pub(crate) handlers: EventHandlers<M>,
+}
+
+impl<M: 'static> HitTestNode<M> {
+    /// Returns the world-space bounding box used for selective `wl_region` input regions.
+    #[must_use]
+    pub(crate) fn world_bounds(&self) -> Rect {
+        let transformed = self.affine.transform_rect(self.local_rect);
+        match self.clip_rect {
+            Some(clip) => transformed.intersect(clip).unwrap_or(Rect::ZERO),
+            None => transformed,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn contains_surface_point(&self, p: Point) -> Option<Point> {
+        if !self.visible || !self.input_enabled {
+            return None;
+        }
+        if let Some(clip) = self.clip_rect
+            && !clip.contains(p)
+        {
+            return None;
+        }
+        let inv = self.inverse_affine?;
+        let un_transformed = inv.transform_point(p);
+        if self.local_rect.contains(un_transformed) {
+            Some(Point::new(
+                un_transformed.x - self.local_rect.x,
+                un_transformed.y - self.local_rect.y,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Hit-tests surface-local `point` against retained nodes, returning the topmost hit node and
+/// element-local coordinates.
+pub(crate) fn hit_test<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    let mut best: Option<((i32, usize), &HitTestNode<M>, Point)> = None;
+    for node in nodes {
+        if let Some(local) = node.contains_surface_point(point) {
+            let rank = (node.z_index, node.paint_order);
+            if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
+                best = Some((rank, node, local));
+            }
+        }
+    }
+    best.map(|(_, node, local)| (node, local))
+}
