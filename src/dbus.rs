@@ -21,8 +21,11 @@ pub mod upower;
 pub(crate) mod worker;
 pub(crate) mod zvariant_helpers;
 
-pub(crate) use bluetooth::spawn_bluetooth_worker;
-pub use bluetooth::{BluetoothAdapter, BluetoothDevice, BluetoothSnapshot};
+pub(crate) use bluetooth::{BluetoothAgentWorker, spawn_bluetooth_worker};
+pub use bluetooth::{
+    BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
+    BluetoothSnapshot, BluetoothTransportFilter,
+};
 pub use client::DbusClient;
 pub(crate) use client::DbusSharedBus;
 #[cfg(feature = "global-shortcuts")]

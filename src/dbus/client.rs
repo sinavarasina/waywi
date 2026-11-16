@@ -33,6 +33,7 @@ pub struct DbusClient {
     shared_session: DbusSharedBus,
     shared_system: DbusSharedBus,
     pub(crate) notifications_conn: Arc<Mutex<Option<zbus::Connection>>>,
+    pub(crate) bluetooth_agent_pending: super::bluetooth::PendingAgentMap,
 }
 
 impl Default for DbusClient {
@@ -50,6 +51,7 @@ impl DbusClient {
             shared_session: Arc::new(Mutex::new(None)),
             shared_system: Arc::new(Mutex::new(None)),
             notifications_conn: Arc::new(Mutex::new(None)),
+            bluetooth_agent_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

@@ -159,6 +159,11 @@ pub(crate) enum SubscriptionSpec<M> {
         map: FrameSharedFn<crate::dbus::BluetoothSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
+    DbusBluetoothAgent {
+        key: SubscriptionKey,
+        map: FrameSharedFn<crate::dbus::BluetoothAgentEvent, M>,
+    },
+    #[cfg(feature = "dbus")]
     DbusModem {
         key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::ModemSnapshot, M>,
@@ -340,6 +345,8 @@ impl<M: 'static> Subscription<M> {
             DbusLogind { key },
             #[cfg(feature = "dbus")]
             DbusBluetooth { key },
+            #[cfg(feature = "dbus")]
+            DbusBluetoothAgent { key },
             #[cfg(feature = "dbus")]
             DbusModem { key },
             #[cfg(feature = "dbus")]

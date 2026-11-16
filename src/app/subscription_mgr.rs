@@ -93,6 +93,8 @@ pub(crate) struct LoopInbox<M> {
     #[cfg(feature = "dbus")]
     pub(crate) dbus_bluetooth: VecDeque<crate::dbus::BluetoothSnapshot>,
     #[cfg(feature = "dbus")]
+    pub(crate) dbus_bluetooth_agent: VecDeque<crate::dbus::BluetoothAgentEvent>,
+    #[cfg(feature = "dbus")]
     pub(crate) dbus_modem: VecDeque<crate::dbus::ModemSnapshot>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_screensaver: VecDeque<crate::dbus::ScreenSaverSnapshot>,
@@ -133,6 +135,8 @@ impl<M> Default for LoopInbox<M> {
             dbus_logind: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_bluetooth: VecDeque::new(),
+            #[cfg(feature = "dbus")]
+            dbus_bluetooth_agent: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_modem: VecDeque::new(),
             #[cfg(feature = "dbus")]
@@ -233,6 +237,12 @@ pub(crate) struct SubscriptionManager<M> {
     #[cfg(feature = "dbus")]
     dbus_bluetooth_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
     #[cfg(feature = "dbus")]
+    pub(crate) dbus_bluetooth_agent_subs:
+        Vec<FrameSharedFn<crate::dbus::BluetoothAgentEvent, M>>,
+    #[cfg(feature = "dbus")]
+    dbus_bluetooth_agent_worker:
+        Option<(crate::dbus::BluetoothAgentWorker, calloop::RegistrationToken)>,
+    #[cfg(feature = "dbus")]
     pub(crate) dbus_modem_subs: Vec<FrameSharedFn<crate::dbus::ModemSnapshot, M>>,
     #[cfg(feature = "dbus")]
     dbus_modem_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
@@ -324,6 +334,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             #[cfg(feature = "dbus")]
             dbus_bluetooth_worker: None,
             #[cfg(feature = "dbus")]
+            dbus_bluetooth_agent_subs: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_bluetooth_agent_worker: None,
+            #[cfg(feature = "dbus")]
             dbus_modem_subs: Vec::new(),
             #[cfg(feature = "dbus")]
             dbus_modem_worker: None,
@@ -397,6 +411,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_upower_subs.clear();
             self.dbus_logind_subs.clear();
             self.dbus_bluetooth_subs.clear();
+            self.dbus_bluetooth_agent_subs.clear();
             self.dbus_modem_subs.clear();
             self.dbus_screensaver_subs.clear();
             self.dbus_geoclue_subs.clear();
@@ -488,6 +503,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusBluetooth { map, .. } => {
                     self.dbus_bluetooth_subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusBluetoothAgent { map, .. } => {
+                    self.dbus_bluetooth_agent_subs.push(map.clone());
                 }
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusModem { map, .. } => {
@@ -714,6 +733,17 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             }
             {
                 let inbox_cl = Rc::clone(inbox);
+                let bt_pending = std::sync::Arc::clone(&dbus_client.bluetooth_agent_pending);
+                sync_singleton_dbus_worker(
+                    !self.dbus_bluetooth_agent_subs.is_empty(),
+                    &mut self.dbus_bluetooth_agent_worker,
+                    loop_handle,
+                    move |ev| inbox_cl.borrow_mut().dbus_bluetooth_agent.push_back(ev),
+                    move |tx| crate::dbus::BluetoothAgentWorker::spawn(tx, bt_pending),
+                );
+            }
+            {
+                let inbox_cl = Rc::clone(inbox);
                 sync_shared_dbus_worker(
                     !self.dbus_modem_subs.is_empty(),
                     &mut self.dbus_modem_worker,
@@ -906,6 +936,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 self.dbus_upower_worker,
                 self.dbus_logind_worker,
                 self.dbus_bluetooth_worker,
+                self.dbus_bluetooth_agent_worker,
                 self.dbus_modem_worker,
                 self.dbus_screensaver_worker,
                 self.dbus_geoclue_worker,

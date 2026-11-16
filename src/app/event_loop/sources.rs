@@ -149,6 +149,11 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         );
         fanout_broadcast(
             &rt.inbox,
+            |inbox| inbox.dbus_bluetooth_agent.drain(..).collect(),
+            &rt.sub_mgr.dbus_bluetooth_agent_subs,
+        );
+        fanout_broadcast(
+            &rt.inbox,
             |inbox| inbox.dbus_modem.drain(..).collect(),
             &rt.sub_mgr.dbus_modem_subs,
         );

@@ -70,7 +70,8 @@ pub use crate::compositor::{CompositorClient, CompositorWorkspace, WorkspaceTarg
 
 #[cfg(feature = "dbus")]
 pub use crate::dbus::{
-    BluetoothAdapter, BluetoothDevice, BluetoothSnapshot, Dbus, DbusBus, DbusClient,
+    BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
+    BluetoothSnapshot, BluetoothTransportFilter, Dbus, DbusBus, DbusClient,
     DbusSignalEvent, DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor,
     LogindSnapshot, ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState,
     MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection,
