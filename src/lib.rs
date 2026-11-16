@@ -15,6 +15,24 @@
 #![warn(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Optional process-wide global allocators. Both are compile-time choices made by the final
+// binary (opt-in, non-default; see `docs/integrations.md`), so they replace the system
+// allocator for the whole process -- including waywi's dependency graph and the frame arena's
+// backing chunk reservations.
+#[cfg(all(feature = "allocator-mimalloc", feature = "allocator-jemalloc"))]
+compile_error!(
+    "features `allocator-mimalloc` and `allocator-jemalloc` are mutually exclusive; enable at most one allocator feature"
+);
+
+#[cfg(feature = "allocator-mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(not(feature = "allocator-mimalloc"))]
+#[cfg(feature = "allocator-jemalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub(crate) mod arena;
 pub(crate) mod asset;
 pub(crate) mod reconcile;

@@ -38,8 +38,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (library features + mimalloc)
+        run: cargo clippy --all-targets --features ci-all,allocator-mimalloc -- -D warnings
+
+      - name: Clippy (library features + jemalloc)
+        run: cargo clippy --all-targets --features ci-all,allocator-jemalloc -- -D warnings
 
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
@@ -48,10 +51,10 @@ jobs:
         run: cargo clippy --no-default-features --lib -- -D warnings
 
       - name: Documentation
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --features ci-all
 
-      - name: Tests (all features)
-        run: cargo test --all-features
+      - name: Tests (library features)
+        run: cargo test --features ci-all
 
       - name: Tests (default features)
         run: cargo test
