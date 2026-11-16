@@ -237,11 +237,12 @@ pub(crate) struct SubscriptionManager<M> {
     #[cfg(feature = "dbus")]
     dbus_bluetooth_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
     #[cfg(feature = "dbus")]
-    pub(crate) dbus_bluetooth_agent_subs:
-        Vec<FrameSharedFn<crate::dbus::BluetoothAgentEvent, M>>,
+    pub(crate) dbus_bluetooth_agent_subs: Vec<FrameSharedFn<crate::dbus::BluetoothAgentEvent, M>>,
     #[cfg(feature = "dbus")]
-    dbus_bluetooth_agent_worker:
-        Option<(crate::dbus::BluetoothAgentWorker, calloop::RegistrationToken)>,
+    dbus_bluetooth_agent_worker: Option<(
+        crate::dbus::BluetoothAgentWorker,
+        calloop::RegistrationToken,
+    )>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_modem_subs: Vec<FrameSharedFn<crate::dbus::ModemSnapshot, M>>,
     #[cfg(feature = "dbus")]

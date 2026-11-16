@@ -71,19 +71,19 @@ pub use crate::compositor::{CompositorClient, CompositorWorkspace, WorkspaceTarg
 #[cfg(feature = "dbus")]
 pub use crate::dbus::{
     BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
-    BluetoothSnapshot, BluetoothTransportFilter, Dbus, DbusBus, DbusClient,
-    DbusSignalEvent, DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor,
-    LogindSnapshot, ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState,
+    BluetoothSnapshot, BluetoothTransportFilter, Dbus, DbusBus, DbusClient, DbusSignalEvent,
+    DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor, LogindSnapshot,
+    ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState,
     MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection,
-    NmConnectivity, NmDeviceInfo, NmDeviceType, NmState, NotificationCloseReason,
-    NotificationEvent, NotificationImageData, NotificationUrgency, PowerProfileHold,
-    PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory, TrayEvent,
-    TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip, UPowerDevice,
-    UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
+    NmConnectivity, NmDeviceInfo, NmDeviceType, NmSavedConnection, NmState, NmWifiSecurity,
+    NotificationCloseReason, NotificationEvent, NotificationImageData, NotificationUrgency,
+    PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
+    TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
+    UPowerDevice, UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
 };
-#[cfg(feature = "dbus")]
-pub use crate::dbus::{MprisEvent, MprisLoopStatus};
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{
     BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent, GlobalShortcuts,
 };
+#[cfg(feature = "dbus")]
+pub use crate::dbus::{MprisEvent, MprisLoopStatus};

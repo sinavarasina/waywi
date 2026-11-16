@@ -21,11 +21,11 @@ pub mod upower;
 pub(crate) mod worker;
 pub(crate) mod zvariant_helpers;
 
-pub(crate) use bluetooth::{BluetoothAgentWorker, spawn_bluetooth_worker};
 pub use bluetooth::{
     BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
     BluetoothSnapshot, BluetoothTransportFilter,
 };
+pub(crate) use bluetooth::{BluetoothAgentWorker, spawn_bluetooth_worker};
 pub use client::DbusClient;
 pub(crate) use client::DbusSharedBus;
 #[cfg(feature = "global-shortcuts")]
@@ -45,7 +45,7 @@ pub use mpris::{MprisEvent, MprisLoopStatus, MprisPlaybackStatus, MprisSnapshot}
 pub(crate) use network_manager::NetworkManagerWorker;
 pub use network_manager::{
     NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo,
-    NmDeviceType, NmState,
+    NmDeviceType, NmSavedConnection, NmState, NmWifiSecurity,
 };
 pub(crate) use notifications::NotificationServerWorker;
 pub use notifications::{

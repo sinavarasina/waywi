@@ -180,6 +180,7 @@ fn dbus_value_conversions_are_safe() {
         title: Some("Track".into()),
         artist: Some("Artist".into()),
         album: None,
+        ..Default::default()
     };
     assert_eq!(mpris.status, MprisPlaybackStatus::Playing);
 }

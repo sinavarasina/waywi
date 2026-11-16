@@ -75,7 +75,6 @@ impl MprisLoopStatus {
 }
 
 /// Typed snapshot of an MPRIS media player (`org.mpris.MediaPlayer2` + `org.mpris.MediaPlayer2.Player`).
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MprisSnapshot {
     pub service_name: String,
@@ -252,8 +251,9 @@ impl DbusClient {
         position_us: i64,
     ) -> Result<()> {
         let conn = self.connection(DbusBus::Session)?;
-        let obj = ObjectPath::try_from(track_id)
-            .map_err(|e| WaywiError::DbusError(format!("invalid MPRIS track_id `{track_id}`: {e}")))?;
+        let obj = ObjectPath::try_from(track_id).map_err(|e| {
+            WaywiError::DbusError(format!("invalid MPRIS track_id `{track_id}`: {e}"))
+        })?;
         conn.call_method(
             Some(service_name),
             MPRIS_OBJECT,
@@ -367,19 +367,26 @@ fn read_mpris_snapshot_blocking(
     let player_props = get_all_blocking(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE)?;
     let root_props =
         get_all_blocking(conn, service_name, MPRIS_OBJECT, MPRIS_ROOT_IFACE).unwrap_or_default();
-    Ok(parse_mpris_snapshot(service_name, &root_props, &player_props))
+    Ok(parse_mpris_snapshot(
+        service_name,
+        &root_props,
+        &player_props,
+    ))
 }
 
 async fn read_mpris_snapshot_async(
     conn: &zbus::Connection,
     service_name: &str,
 ) -> Option<MprisSnapshot> {
-    let player_props =
-        get_all_async(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE).await?;
+    let player_props = get_all_async(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE).await?;
     let root_props = get_all_async(conn, service_name, MPRIS_OBJECT, MPRIS_ROOT_IFACE)
         .await
         .unwrap_or_default();
-    Some(parse_mpris_snapshot(service_name, &root_props, &player_props))
+    Some(parse_mpris_snapshot(
+        service_name,
+        &root_props,
+        &player_props,
+    ))
 }
 
 pub(crate) fn parse_mpris_snapshot(
@@ -631,9 +638,7 @@ async fn run_mpris_worker(
                 if new_owner.is_empty() {
                     owners.remove(&name);
                     if snapshots.remove(&name).is_some() {
-                        let _ = sender.send(MprisEvent::PlayerRemoved {
-                            service_name: name,
-                        });
+                        let _ = sender.send(MprisEvent::PlayerRemoved { service_name: name });
                         let mut list: Vec<MprisSnapshot> = snapshots.values().cloned().collect();
                         sort_mpris_snapshots(&mut list);
                         let _ = sender.send(MprisEvent::PlayersUpdated(list));
@@ -654,11 +659,10 @@ async fn run_mpris_worker(
                 }
             }
             (FDO_PROPS_IFACE, "PropertiesChanged") if path == MPRIS_OBJECT => {
-                let Ok((changed_iface, _, _)) = msg.body().deserialize::<(
-                    String,
-                    HashMap<String, OwnedValue>,
-                    Vec<String>,
-                )>() else {
+                let Ok((changed_iface, _, _)) =
+                    msg.body()
+                        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                else {
                     continue;
                 };
                 if changed_iface != MPRIS_PLAYER_IFACE && changed_iface != MPRIS_ROOT_IFACE {
@@ -764,10 +768,7 @@ mod tests {
         meta.insert("xesam:title", Value::from("FREYJA.sys"));
         meta.insert("xesam:album", Value::from("kaoling"));
         meta.insert("xesam:artist", Value::from(vec!["CUL", "GUMI"]));
-        meta.insert(
-            "mpris:artUrl",
-            Value::from("https://example.com/cover.png"),
-        );
+        meta.insert("mpris:artUrl", Value::from("https://example.com/cover.png"));
         meta.insert("mpris:length", Value::from(245_000_000i64));
 
         let mut player_props: HashMap<String, OwnedValue> = HashMap::new();
@@ -816,11 +817,8 @@ mod tests {
             OwnedValue::try_from(Value::from(meta)).unwrap(),
         );
 
-        let snap = parse_mpris_snapshot(
-            "org.mpris.MediaPlayer2.spotify",
-            &root_props,
-            &player_props,
-        );
+        let snap =
+            parse_mpris_snapshot("org.mpris.MediaPlayer2.spotify", &root_props, &player_props);
         assert_eq!(snap.service_name, "org.mpris.MediaPlayer2.spotify");
         assert_eq!(snap.identity.as_deref(), Some("Spotify"));
         assert_eq!(snap.desktop_entry.as_deref(), Some("spotify"));

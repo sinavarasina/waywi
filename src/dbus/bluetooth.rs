@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use zbus::interface;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
@@ -32,7 +32,6 @@ const BLUEZ_AGENT_MGR_IFACE: &str = "org.bluez.AgentManager1";
 const BLUEZ_AGENT_OBJECT_PATH: &str = "/org/waywi/BluetoothAgent";
 
 /// Bluetooth controller state (`org.bluez.Adapter1`).
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BluetoothAdapter {
     pub object_path: String,
@@ -48,7 +47,6 @@ pub struct BluetoothAdapter {
 }
 
 /// Discovered or paired Bluetooth device (`org.bluez.Device1` + optional `org.bluez.Battery1`).
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BluetoothDevice {
     pub object_path: String,
@@ -281,11 +279,7 @@ impl DbusClient {
     }
 
     /// Sets whether a Bluetooth adapter is visible to nearby devices (`org.bluez.Adapter1.Discoverable`).
-    pub fn set_bluetooth_discoverable(
-        &self,
-        adapter_path: &str,
-        discoverable: bool,
-    ) -> Result<()> {
+    pub fn set_bluetooth_discoverable(&self, adapter_path: &str, discoverable: bool) -> Result<()> {
         self.set_property(
             DbusBus::System,
             BLUEZ_DEST,
@@ -438,11 +432,7 @@ impl DbusClient {
     }
 
     /// Disconnects a specific Bluetooth profile UUID on `device_path` (`org.bluez.Device1.DisconnectProfile`).
-    pub fn disconnect_bluetooth_device_profile(
-        &self,
-        device_path: &str,
-        uuid: &str,
-    ) -> Result<()> {
+    pub fn disconnect_bluetooth_device_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
         let conn = self.connection(DbusBus::System)?;
         conn.call_method(
             Some(BLUEZ_DEST),
@@ -725,13 +715,9 @@ async fn run_bluetooth_agent_worker(
         if header.message_type() == zbus::message::Type::MethodCall
             && header.path().map(|p| p.as_str()) == Some(BLUEZ_AGENT_OBJECT_PATH)
             && header.interface().map(|i| i.as_str()) == Some("org.bluez.Agent1")
+            && let Some("Cancel" | "Release") = header.member().map(|m| m.as_str())
         {
-            match header.member().map(|m| m.as_str()) {
-                Some("Cancel" | "Release") => {
-                    cancel_all_pending_slots(&pending);
-                }
-                _ => {}
-            }
+            cancel_all_pending_slots(&pending);
         }
     }
 
@@ -768,13 +754,10 @@ impl BluezAgentIface {
             .sender
             .send(BluetoothAgentEvent::Request(make_req(request_id)));
 
-        let reply = futures_lite::future::or(
-            AgentReplyFuture { slot },
-            async {
-                self.stop.wait_stopped().await;
-                None
-            },
-        )
+        let reply = futures_lite::future::or(AgentReplyFuture { slot }, async {
+            self.stop.wait_stopped().await;
+            None
+        })
         .await;
 
         if let Ok(mut guard) = self.pending.lock() {
