@@ -37,7 +37,8 @@ pub(crate) use logind::LogindWorker;
 pub use logind::{LogindEvent, LogindInhibitor, LogindSnapshot};
 pub(crate) use modem::spawn_modem_worker;
 pub use modem::{ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState};
-pub use mpris::{MprisPlaybackStatus, MprisSnapshot};
+pub(crate) use mpris::MprisWorker;
+pub use mpris::{MprisEvent, MprisLoopStatus, MprisPlaybackStatus, MprisSnapshot};
 pub(crate) use network_manager::NetworkManagerWorker;
 pub use network_manager::{
     NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo,

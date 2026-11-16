@@ -162,6 +162,11 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
             |inbox| inbox.dbus_geoclue.drain(..).collect(),
             &rt.sub_mgr.dbus_geoclue_subs,
         );
+        fanout_broadcast(
+            &rt.inbox,
+            |inbox| inbox.dbus_mpris.drain(..).collect(),
+            &rt.sub_mgr.dbus_mpris_subs,
+        );
     }
 
     #[cfg(feature = "global-shortcuts")]

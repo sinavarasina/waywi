@@ -98,6 +98,8 @@ pub(crate) struct LoopInbox<M> {
     pub(crate) dbus_screensaver: VecDeque<crate::dbus::ScreenSaverSnapshot>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_geoclue: VecDeque<crate::dbus::GeoClueSnapshot>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_mpris: VecDeque<crate::dbus::MprisEvent>,
     #[cfg(feature = "global-shortcuts")]
     pub(crate) global_shortcut_events:
         VecDeque<(SubscriptionKey, crate::dbus::GlobalShortcutEvent)>,
@@ -137,6 +139,8 @@ impl<M> Default for LoopInbox<M> {
             dbus_screensaver: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_geoclue: VecDeque::new(),
+            #[cfg(feature = "dbus")]
+            dbus_mpris: VecDeque::new(),
             #[cfg(feature = "global-shortcuts")]
             global_shortcut_events: VecDeque::new(),
             #[cfg(feature = "control-ipc")]
@@ -240,6 +244,10 @@ pub(crate) struct SubscriptionManager<M> {
     pub(crate) dbus_geoclue_subs: Vec<FrameSharedFn<crate::dbus::GeoClueSnapshot, M>>,
     #[cfg(feature = "dbus")]
     dbus_geoclue_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_mpris_subs: Vec<FrameSharedFn<crate::dbus::MprisEvent, M>>,
+    #[cfg(feature = "dbus")]
+    dbus_mpris_worker: Option<(crate::dbus::MprisWorker, calloop::RegistrationToken)>,
     #[cfg(feature = "global-shortcuts")]
     pub(crate) global_shortcut_subs: Vec<GlobalShortcutSub<M>>,
     #[cfg(feature = "global-shortcuts")]
@@ -327,6 +335,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             dbus_geoclue_subs: Vec::new(),
             #[cfg(feature = "dbus")]
             dbus_geoclue_worker: None,
+            #[cfg(feature = "dbus")]
+            dbus_mpris_subs: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_mpris_worker: None,
             #[cfg(feature = "global-shortcuts")]
             global_shortcut_subs: Vec::new(),
             #[cfg(feature = "global-shortcuts")]
@@ -388,6 +400,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_modem_subs.clear();
             self.dbus_screensaver_subs.clear();
             self.dbus_geoclue_subs.clear();
+            self.dbus_mpris_subs.clear();
         }
         #[cfg(feature = "global-shortcuts")]
         self.global_shortcut_subs.clear();
@@ -487,6 +500,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusGeoClue { map, .. } => {
                     self.dbus_geoclue_subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusMpris { map, .. } => {
+                    self.dbus_mpris_subs.push(map.clone());
                 }
                 #[cfg(feature = "global-shortcuts")]
                 SubscriptionSpec::GlobalShortcuts {
@@ -728,6 +745,17 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                     crate::dbus::spawn_geoclue_worker,
                 );
             }
+            {
+                let inbox_cl = Rc::clone(inbox);
+                sync_shared_dbus_worker(
+                    !self.dbus_mpris_subs.is_empty(),
+                    &mut self.dbus_mpris_worker,
+                    loop_handle,
+                    &sess_bus,
+                    move |ev| inbox_cl.borrow_mut().dbus_mpris.push_back(ev),
+                    crate::dbus::MprisWorker::spawn,
+                );
+            }
         }
 
         #[cfg(feature = "global-shortcuts")]
@@ -881,6 +909,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 self.dbus_modem_worker,
                 self.dbus_screensaver_worker,
                 self.dbus_geoclue_worker,
+                self.dbus_mpris_worker,
             );
         }
         #[cfg(feature = "global-shortcuts")]

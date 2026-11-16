@@ -173,6 +173,11 @@ pub(crate) enum SubscriptionSpec<M> {
         key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::GeoClueSnapshot, M>,
     },
+    #[cfg(feature = "dbus")]
+    DbusMpris {
+        key: SubscriptionKey,
+        map: FrameSharedFn<crate::dbus::MprisEvent, M>,
+    },
     #[cfg(feature = "global-shortcuts")]
     GlobalShortcuts {
         key: SubscriptionKey,
@@ -341,6 +346,8 @@ impl<M: 'static> Subscription<M> {
             DbusScreenSaver { key },
             #[cfg(feature = "dbus")]
             DbusGeoClue { key },
+            #[cfg(feature = "dbus")]
+            DbusMpris { key },
             #[cfg(feature = "idle-notify")]
             IdleNotify { key, timeout, input_only },
             #[cfg(feature = "clipboard")]

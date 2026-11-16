@@ -80,6 +80,8 @@ pub use crate::dbus::{
     TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip, UPowerDevice,
     UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
 };
+#[cfg(feature = "dbus")]
+pub use crate::dbus::{MprisEvent, MprisLoopStatus};
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{
     BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent, GlobalShortcuts,
