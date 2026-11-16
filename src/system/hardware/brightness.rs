@@ -343,13 +343,18 @@ impl DdcWorker {
                             }
                         }
                         DdcCmd::SetLuminance { i2c_bus, percent } => {
-                            let path = PathBuf::from(format!("/dev/i2c-{i2c_bus}"));
                             let max_lum = {
                                 let g = shared.lock().unwrap_or_else(|e| e.into_inner());
                                 g.iter()
                                     .find(|m| m.i2c_bus == i2c_bus)
-                                    .map_or(100, |m| m.max_luminance)
+                                    .map(|m| m.max_luminance)
                             };
+                            // Never write VCP values before this bus's monitor has reported its
+                            // own maximum: an unverified target could receive arbitrary raw data.
+                            let Some(max_lum) = max_lum else {
+                                continue;
+                            };
+                            let path = PathBuf::from(format!("/dev/i2c-{i2c_bus}"));
                             let target = ((f64::from(percent.clamp(0.0, 100.0)) / 100.0)
                                 * f64::from(max_lum))
                             .round() as u16;
