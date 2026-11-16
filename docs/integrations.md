@@ -32,7 +32,7 @@ Optional Linux subsystems are selected at compile time via Cargo features. Missi
 
 - **Compositors (`hyprland-ipc`, `sway-ipc`)**: Direct IPC bindings (`Hyprland`, `Sway`) plus the unified `CompositorClient` (`ctx.compositor()?`) for workspace and layout switching.
 - **Audio & Playback (`pipewire`, `pulseaudio`, `alsa`, `audio-playback`)**: `AudioClient` probes `PipeWire -> PulseAudio -> ALSA` and exposes sink/source volume, mute, device selection, and hardware route updates. `AudioPlayer` supports WAV, PCM, synthesized presets (`SoundPreset`), XDG Sound Theme lookup, and optional `rodio` decoding.
-- **D-Bus (`dbus`, `global-shortcuts`)**: Dedicated `zbus` background worker bridged into `calloop` for session/system queries, `org.freedesktop.Notifications`, `StatusNotifierItem` + `dbusmenu` tray hosting, and XDG portal global shortcuts.
+- **D-Bus (`dbus`, `global-shortcuts`)**: Dedicated `zbus` background workers bridged into `calloop` for session/system queries and subscriptions, `org.freedesktop.Notifications`, `StatusNotifierItem` + `dbusmenu` tray hosting, MPRIS media player streams and controls, NetworkManager Wi-Fi connection management, BlueZ device controls and `Agent1` pairing, and XDG portal global shortcuts.
 - **Control IPC (`control-ipc`)**: `Control::signal` and `Control::socket` with `waywi::control::send_command(...)` for single-instance remote triggers.
 - **Brightness & Privacy permissions**:
   - Backlight writes use `systemd-logind` (`dbus`) or `/sys/class/backlight/*` (`video` group).

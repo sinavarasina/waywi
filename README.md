@@ -6,9 +6,8 @@ Wayland widget toolkit for Linux panels, overlays, OSDs, popups, and desktop uti
 
 Add `waywi` to `Cargo.toml` (default features enable `renderer-software`, `text`, `image-png`, `animation`):
 
-```toml
-[dependencies]
-waywi = "0.1"
+```bash
+cargo add waywi
 ```
 
 Minimal application skeleton:
