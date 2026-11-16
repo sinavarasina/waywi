@@ -9,7 +9,9 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus, connect_shared_bus};
+use super::client::{
+    DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
+};
 use super::types::{Dbus, DbusBus};
 use super::worker::AsyncStopSignal;
 
@@ -89,8 +91,14 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Reads the current [`PowerProfileSnapshot`] from the system bus.
+    /// Reads the current [`PowerProfileSnapshot`] from the subscription cache (0 ms) or the
+    /// system bus.
     pub fn power_profile_snapshot(&self) -> Result<PowerProfileSnapshot> {
+        if let Ok(guard) = self.cache.power_profiles.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         let mut last_err = None;
         for &(dest, path) in POWER_PROFILE_TARGETS {
@@ -117,25 +125,44 @@ impl DbusClient {
         )))
     }
 
-    /// Switches the active system power profile (`"power-saver"`, `"balanced"`, `"performance"`).
+    /// Switches the active system power profile (`"power-saver"`, `"balanced"`, `"performance"`)
+    /// without blocking the UI thread.
     pub fn set_power_profile(&self, profile: PowerProfileKind) -> Result<()> {
-        let mut last_err = None;
-        for &(dest, path) in POWER_PROFILE_TARGETS {
-            match self.set_property(
+        let target = profile.as_str().to_owned();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
                 DbusBus::System,
-                dest,
-                path,
-                dest,
-                "ActiveProfile",
-                Value::from(profile.as_str()),
-            ) {
-                Ok(()) => return Ok(()),
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            WaywiError::DbusError("power profiles service unavailable".to_owned())
-        }))
+                "PowerProfiles.SetActiveProfile",
+                target,
+            ),
+            move |conn| async move {
+                let val_str = profile.as_str();
+                let mut last_err = None;
+                for &(dest, path) in POWER_PROFILE_TARGETS {
+                    match conn
+                        .call_method(
+                            Some(dest),
+                            path,
+                            Some("org.freedesktop.DBus.Properties"),
+                            "Set",
+                            &(dest, "ActiveProfile", Value::from(val_str)),
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(WaywiError::DbusError(format!(
+                    "SetActiveProfile failed: {}",
+                    last_err.map_or_else(
+                        || "power profiles service unavailable".to_owned(),
+                        |e| e.to_string(),
+                    )
+                )))
+            },
+        )
     }
 
     /// Acquires a temporary power profile hold and returns the hold cookie for [`Self::release_power_profile`].
@@ -171,20 +198,35 @@ impl DbusClient {
         )))
     }
 
-    /// Releases a previously acquired power profile hold cookie.
+    /// Releases a previously acquired power profile hold cookie without blocking the UI thread.
     pub fn release_power_profile(&self, cookie: u32) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let mut last_err = None;
-        for &(dest, path) in POWER_PROFILE_TARGETS {
-            match conn.call_method(Some(dest), path, Some(dest), "ReleaseProfile", &(cookie,)) {
-                Ok(_) => return Ok(()),
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(WaywiError::DbusError(format!(
-            "ReleaseProfile failed: {}",
-            last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
-        )))
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "PowerProfiles.ReleaseProfile",
+                cookie.to_string(),
+            ),
+            move |conn| async move {
+                let mut last_err = None;
+                for &(dest, path) in POWER_PROFILE_TARGETS {
+                    match conn
+                        .call_method(Some(dest), path, Some(dest), "ReleaseProfile", &(cookie,))
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(WaywiError::DbusError(format!(
+                    "ReleaseProfile failed: {}",
+                    last_err.map_or_else(
+                        || "power profiles service unavailable".to_owned(),
+                        |e| e.to_string(),
+                    )
+                )))
+            },
+        )
     }
 }
 

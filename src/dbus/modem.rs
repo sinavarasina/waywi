@@ -7,7 +7,10 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus};
+use super::client::{
+    DBUS_SLOW_TIMEOUT, DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec,
+    validate_object_path,
+};
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
 use super::zvariant_helpers::{
@@ -155,8 +158,14 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Reads the current [`ModemSnapshot`] from `org.freedesktop.ModemManager1`.
+    /// Reads the current [`ModemSnapshot`] from the subscription cache (0 ms) or
+    /// `org.freedesktop.ModemManager1`.
     pub fn modem_snapshot(&self) -> Result<ModemSnapshot> {
+        if let Ok(guard) = self.cache.modem.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         let objs = get_managed_objects_blocking(&conn, MM_DEST, MM_PATH)?;
         let mut snap = parse_modem_objects(&objs);
@@ -171,18 +180,33 @@ impl DbusClient {
         Ok(snap)
     }
 
-    /// Enables or disables a cellular modem via `org.freedesktop.ModemManager1.Modem.Enable`.
+    /// Enables or disables a cellular modem via `org.freedesktop.ModemManager1.Modem.Enable`
+    /// without blocking the UI thread.
     pub fn enable_modem(&self, modem_path: &str, enabled: bool) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        conn.call_method(
-            Some(MM_DEST),
-            modem_path,
-            Some(MM_MODEM_IFACE),
-            "Enable",
-            &(enabled,),
+        let path = validate_object_path(modem_path, "modem object path")?;
+        let target = path.clone();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "Modem.Enable",
+                target,
+            )
+            .with_dedup(format!("mm:enable:{path}"))
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                conn.call_method(
+                    Some(MM_DEST),
+                    path.as_str(),
+                    Some(MM_MODEM_IFACE),
+                    "Enable",
+                    &(enabled,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Modem.Enable failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("Modem.Enable failed: {e}")))?;
-        Ok(())
     }
 }
 

@@ -102,6 +102,8 @@ pub(crate) struct LoopInbox<M> {
     pub(crate) dbus_geoclue: VecDeque<crate::dbus::GeoClueSnapshot>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_mpris: VecDeque<crate::dbus::MprisEvent>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_action_results: VecDeque<crate::dbus::DbusActionResult>,
     #[cfg(feature = "global-shortcuts")]
     pub(crate) global_shortcut_events:
         VecDeque<(SubscriptionKey, crate::dbus::GlobalShortcutEvent)>,
@@ -145,6 +147,8 @@ impl<M> Default for LoopInbox<M> {
             dbus_geoclue: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_mpris: VecDeque::new(),
+            #[cfg(feature = "dbus")]
+            dbus_action_results: VecDeque::new(),
             #[cfg(feature = "global-shortcuts")]
             global_shortcut_events: VecDeque::new(),
             #[cfg(feature = "control-ipc")]
@@ -259,6 +263,13 @@ pub(crate) struct SubscriptionManager<M> {
     pub(crate) dbus_mpris_subs: Vec<FrameSharedFn<crate::dbus::MprisEvent, M>>,
     #[cfg(feature = "dbus")]
     dbus_mpris_worker: Option<(crate::dbus::MprisWorker, calloop::RegistrationToken)>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_action_result_subs: Vec<FrameSharedFn<crate::dbus::DbusActionResult, M>>,
+    #[cfg(feature = "dbus")]
+    dbus_action_result_worker: Option<(
+        crate::dbus::DbusActionResultWorker,
+        calloop::RegistrationToken,
+    )>,
     #[cfg(feature = "global-shortcuts")]
     pub(crate) global_shortcut_subs: Vec<GlobalShortcutSub<M>>,
     #[cfg(feature = "global-shortcuts")]
@@ -354,6 +365,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             dbus_mpris_subs: Vec::new(),
             #[cfg(feature = "dbus")]
             dbus_mpris_worker: None,
+            #[cfg(feature = "dbus")]
+            dbus_action_result_subs: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_action_result_worker: None,
             #[cfg(feature = "global-shortcuts")]
             global_shortcut_subs: Vec::new(),
             #[cfg(feature = "global-shortcuts")]
@@ -417,6 +432,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_screensaver_subs.clear();
             self.dbus_geoclue_subs.clear();
             self.dbus_mpris_subs.clear();
+            self.dbus_action_result_subs.clear();
         }
         #[cfg(feature = "global-shortcuts")]
         self.global_shortcut_subs.clear();
@@ -524,6 +540,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusMpris { map, .. } => {
                     self.dbus_mpris_subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusActionResults { map, .. } => {
+                    self.dbus_action_result_subs.push(map.clone());
                 }
                 #[cfg(feature = "global-shortcuts")]
                 SubscriptionSpec::GlobalShortcuts {
@@ -678,57 +698,109 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 );
             }
             {
+                let active = !self.dbus_power_profile_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.power_profiles.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_power_profile_subs.is_empty(),
+                    active,
                     &mut self.dbus_power_profile_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_power_profiles.push_back(ev),
+                    move |ev| {
+                        if let Ok(mut g) = cache.power_profiles.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_power_profiles.push_back(ev);
+                    },
                     crate::dbus::PowerProfilesWorker::spawn,
                 );
             }
             {
+                let active = !self.dbus_network_manager_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.network_manager.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_network_manager_subs.is_empty(),
+                    active,
                     &mut self.dbus_network_manager_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_network_manager.push_back(ev),
+                    move |ev| {
+                        if let Ok(mut g) = cache.network_manager.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_network_manager.push_back(ev);
+                    },
                     crate::dbus::NetworkManagerWorker::spawn,
                 );
             }
             {
+                let active = !self.dbus_upower_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.upower.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_upower_subs.is_empty(),
+                    active,
                     &mut self.dbus_upower_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_upower.push_back(ev),
+                    move |ev| {
+                        if let Ok(mut g) = cache.upower.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_upower.push_back(ev);
+                    },
                     crate::dbus::spawn_upower_worker,
                 );
             }
             {
+                let active = !self.dbus_logind_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.logind.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_logind_subs.is_empty(),
+                    active,
                     &mut self.dbus_logind_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_logind.push_back(ev),
+                    move |ev| {
+                        if let crate::dbus::LogindEvent::Snapshot(ref snap) = ev
+                            && let Ok(mut g) = cache.logind.write()
+                        {
+                            *g = Some(snap.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_logind.push_back(ev);
+                    },
                     crate::dbus::LogindWorker::spawn,
                 );
             }
             {
+                let active = !self.dbus_bluetooth_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.bluetooth.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_bluetooth_subs.is_empty(),
+                    active,
                     &mut self.dbus_bluetooth_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_bluetooth.push_back(ev),
+                    move |ev| {
+                        if let Ok(mut g) = cache.bluetooth.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_bluetooth.push_back(ev);
+                    },
                     crate::dbus::spawn_bluetooth_worker,
                 );
             }
@@ -744,13 +816,23 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 );
             }
             {
+                let active = !self.dbus_modem_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.modem.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_modem_subs.is_empty(),
+                    active,
                     &mut self.dbus_modem_worker,
                     loop_handle,
                     &sys_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_modem.push_back(ev),
+                    move |ev| {
+                        if let Ok(mut g) = cache.modem.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_modem.push_back(ev);
+                    },
                     crate::dbus::spawn_modem_worker,
                 );
             }
@@ -777,14 +859,37 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 );
             }
             {
+                let active = !self.dbus_mpris_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.mpris.write() {
+                    *g = None;
+                }
                 let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
                 sync_shared_dbus_worker(
-                    !self.dbus_mpris_subs.is_empty(),
+                    active,
                     &mut self.dbus_mpris_worker,
                     loop_handle,
                     &sess_bus,
-                    move |ev| inbox_cl.borrow_mut().dbus_mpris.push_back(ev),
+                    move |ev| {
+                        if let crate::dbus::MprisEvent::PlayersUpdated(ref list) = ev
+                            && let Ok(mut g) = cache.mpris.write()
+                        {
+                            *g = Some(list.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_mpris.push_back(ev);
+                    },
                     crate::dbus::MprisWorker::spawn,
+                );
+            }
+            {
+                let inbox_cl = Rc::clone(inbox);
+                let action_outbox = std::sync::Arc::clone(&dbus_client.action_outbox);
+                sync_singleton_dbus_worker(
+                    !self.dbus_action_result_subs.is_empty(),
+                    &mut self.dbus_action_result_worker,
+                    loop_handle,
+                    move |ev| inbox_cl.borrow_mut().dbus_action_results.push_back(ev),
+                    move |tx| crate::dbus::DbusActionResultWorker::spawn(tx, action_outbox),
                 );
             }
         }
@@ -942,6 +1047,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 self.dbus_screensaver_worker,
                 self.dbus_geoclue_worker,
                 self.dbus_mpris_worker,
+                self.dbus_action_result_worker,
             );
         }
         #[cfg(feature = "global-shortcuts")]

@@ -10,7 +10,9 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus, connect_shared_bus};
+use super::client::{
+    DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
+};
 use super::types::{Dbus, DbusBus};
 use super::worker::AsyncStopSignal;
 use super::zvariant_helpers::{dict_bool, dict_str, dict_u64, get_all_async, get_all_blocking};
@@ -66,56 +68,109 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Reads the current [`LogindSnapshot`] for the active user session.
+    /// Reads the current [`LogindSnapshot`] for the active user session from cache (0 ms) or the
+    /// system bus.
     pub fn logind_snapshot(&self) -> Result<LogindSnapshot> {
+        if let Ok(guard) = self.cache.logind.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         read_logind_snapshot_blocking(&conn)
     }
 
-    /// Sets device brightness via `org.freedesktop.login1.Session.SetBrightness` without root.
+    /// Sets device brightness via `org.freedesktop.login1.Session.SetBrightness` without root or
+    /// blocking the UI thread.
     pub fn set_backlight_brightness(
         &self,
         subsystem: &str,
         device_name: &str,
         brightness: u32,
     ) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let session_path =
-            resolve_session_path_blocking(&conn).unwrap_or_else(|_| LOGIN1_SESSION_AUTO.to_owned());
-        conn.call_method(
-            Some(LOGIN1_DEST),
-            session_path.as_str(),
-            Some(LOGIN1_SESSION_IFACE),
-            "SetBrightness",
-            &(subsystem, device_name, brightness),
+        let sub = subsystem.to_owned();
+        let dev = device_name.to_owned();
+        let target = format!("{sub}:{dev}");
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "Session.SetBrightness",
+                target,
+            ),
+            move |conn| async move {
+                let session_path = resolve_session_path_async(&conn)
+                    .await
+                    .unwrap_or_else(|| LOGIN1_SESSION_AUTO.to_owned());
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    session_path.as_str(),
+                    Some(LOGIN1_SESSION_IFACE),
+                    "SetBrightness",
+                    &(sub.as_str(), dev.as_str(), brightness),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Session.SetBrightness failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("Session.SetBrightness failed: {e}")))?;
-        Ok(())
     }
 
-    /// Requests locking the active session via `org.freedesktop.login1.Session.Lock`.
+    /// Requests locking the active session via `org.freedesktop.login1.Session.Lock` without
+    /// blocking the UI thread.
     pub fn lock_session(&self) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let path = resolve_session_path_blocking(&conn)?;
-        self.call_method_unit(
-            DbusBus::System,
-            LOGIN1_DEST,
-            &path,
-            LOGIN1_SESSION_IFACE,
-            "Lock",
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "Session.Lock",
+                LOGIN1_SESSION_AUTO,
+            )
+            .with_dedup("logind:lock"),
+            move |conn| async move {
+                let path = resolve_session_path_async(&conn)
+                    .await
+                    .unwrap_or_else(|| LOGIN1_SESSION_AUTO.to_owned());
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    path.as_str(),
+                    Some(LOGIN1_SESSION_IFACE),
+                    "Lock",
+                    &(),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Session.Lock failed: {e}")))?;
+                Ok(())
+            },
         )
     }
 
-    /// Requests unlocking the active session via `org.freedesktop.login1.Session.Unlock`.
+    /// Requests unlocking the active session via `org.freedesktop.login1.Session.Unlock` without
+    /// blocking the UI thread.
     pub fn unlock_session(&self) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let path = resolve_session_path_blocking(&conn)?;
-        self.call_method_unit(
-            DbusBus::System,
-            LOGIN1_DEST,
-            &path,
-            LOGIN1_SESSION_IFACE,
-            "Unlock",
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "Session.Unlock",
+                LOGIN1_SESSION_AUTO,
+            )
+            .with_dedup("logind:unlock"),
+            move |conn| async move {
+                let path = resolve_session_path_async(&conn)
+                    .await
+                    .unwrap_or_else(|| LOGIN1_SESSION_AUTO.to_owned());
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    path.as_str(),
+                    Some(LOGIN1_SESSION_IFACE),
+                    "Unlock",
+                    &(),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Session.Unlock failed: {e}")))?;
+                Ok(())
+            },
         )
     }
 
@@ -160,17 +215,27 @@ impl DbusClient {
         Ok(LogindInhibitor { _fd: fd })
     }
 
-    fn call_manager_bool(&self, method: &str, interactive: bool) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        conn.call_method(
-            Some(LOGIN1_DEST),
-            LOGIN1_MANAGER_PATH,
-            Some(LOGIN1_MANAGER_IFACE),
-            method,
-            &(interactive,),
+    fn call_manager_bool(&self, method: &'static str, interactive: bool) -> Result<()> {
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                format!("Manager.{method}"),
+                LOGIN1_MANAGER_PATH,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    LOGIN1_MANAGER_PATH,
+                    Some(LOGIN1_MANAGER_IFACE),
+                    method,
+                    &(interactive,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Manager.{method} failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("Manager.{method} failed: {e}")))?;
-        Ok(())
     }
 }
 

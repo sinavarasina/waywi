@@ -9,7 +9,10 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus, connect_shared_bus};
+use super::client::{
+    DBUS_SLOW_TIMEOUT, DbusActionLane, DbusActionPayload, DbusClient, DbusSharedBus,
+    LaneActionSpec, connect_shared_bus, validate_object_path,
+};
 use super::types::{Dbus, DbusBus};
 use super::worker::AsyncStopSignal;
 use super::zvariant_helpers::{
@@ -220,8 +223,14 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Reads the current [`NetworkManagerSnapshot`] from the system bus.
+    /// Reads the current [`NetworkManagerSnapshot`] from the in-memory subscription cache (0 ms)
+    /// or queries the system bus if not yet cached.
     pub fn network_manager_snapshot(&self) -> Result<NetworkManagerSnapshot> {
+        if let Ok(guard) = self.cache.network_manager.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         read_nm_snapshot_blocking(&conn)
     }
@@ -238,46 +247,88 @@ impl DbusClient {
         )
     }
 
-    /// Enables or disables all NetworkManager networking via `org.freedesktop.NetworkManager.Enable`.
+    /// Enables or disables all NetworkManager networking via `org.freedesktop.NetworkManager.Enable`
+    /// on the NetworkManager lane without blocking the UI thread.
     pub fn nm_set_networking_enabled(&self, enabled: bool) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        conn.call_method(
-            Some(NM_DEST),
-            NM_PATH,
-            Some(NM_IFACE),
-            "Enable",
-            &(enabled,),
-        )
-        .map_err(|e| WaywiError::DbusError(format!("NetworkManager.Enable failed: {e}")))?;
-        Ok(())
-    }
-
-    /// Triggers an asynchronous Wi-Fi access-point scan on all wireless devices.
-    pub fn nm_scan_wifi(&self) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let root_props = get_all_blocking(&conn, NM_DEST, NM_PATH, NM_IFACE)?;
-        let device_paths = dict_str_vec(&root_props, "Devices");
-        let empty_opts: HashMap<&str, Value<'_>> = HashMap::new();
-        for path in device_paths.into_iter().take(32) {
-            if let Ok(dev_props) = get_all_blocking(&conn, NM_DEST, &path, NM_DEVICE_IFACE)
-                && dict_u32(&dev_props, "DeviceType") == Some(2)
-            {
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.Enable",
+                NM_PATH,
+            ),
+            move |conn| async move {
                 conn.call_method(
                     Some(NM_DEST),
-                    path.as_str(),
-                    Some(NM_WIRELESS_IFACE),
-                    "RequestScan",
-                    &(empty_opts.clone(),),
+                    NM_PATH,
+                    Some(NM_IFACE),
+                    "Enable",
+                    &(enabled,),
                 )
-                .map_err(|e| WaywiError::DbusError(format!("RequestScan failed: {e}")))?;
-            }
-        }
-        Ok(())
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("NetworkManager.Enable failed: {e}")))?;
+                Ok(())
+            },
+        )
     }
 
-    /// Enumerates visible Wi-Fi access points across NetworkManager wireless devices, matched
-    /// against saved Wi-Fi profiles.
+    /// Triggers an asynchronous Wi-Fi access-point scan on all wireless devices on the
+    /// NetworkManager lane without blocking the UI thread.
+    pub fn nm_scan_wifi(&self) -> Result<()> {
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "Wireless.RequestScan",
+                NM_PATH,
+            )
+            .with_dedup("nm:scan-wifi"),
+            move |conn| async move {
+                let Some(root_props) = get_all_async(&conn, NM_DEST, NM_PATH, NM_IFACE).await
+                else {
+                    return Err(WaywiError::DbusError(
+                        "failed to read NetworkManager root properties".into(),
+                    ));
+                };
+                let device_paths = dict_str_vec(&root_props, "Devices");
+                let mut last_err = None;
+                for path in device_paths.into_iter().take(32) {
+                    if let Some(dev_props) =
+                        get_all_async(&conn, NM_DEST, &path, NM_DEVICE_IFACE).await
+                        && dict_u32(&dev_props, "DeviceType") == Some(2)
+                    {
+                        let empty_opts: HashMap<&str, Value<'_>> = HashMap::new();
+                        if let Err(e) = conn
+                            .call_method(
+                                Some(NM_DEST),
+                                path.as_str(),
+                                Some(NM_WIRELESS_IFACE),
+                                "RequestScan",
+                                &(empty_opts,),
+                            )
+                            .await
+                        {
+                            last_err =
+                                Some(WaywiError::DbusError(format!("RequestScan failed: {e}")));
+                        }
+                    }
+                }
+                if let Some(err) = last_err {
+                    return Err(err);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Enumerates visible Wi-Fi access points across NetworkManager wireless devices, returning
+    /// the cached subscription list (0 ms) when available or querying the system bus.
     pub fn nm_list_wifi_access_points(&self) -> Result<Vec<NmAccessPoint>> {
+        if let Ok(guard) = self.cache.network_manager.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.access_points.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         let root_props = get_all_blocking(&conn, NM_DEST, NM_PATH, NM_IFACE)?;
         let device_paths = dict_str_vec(&root_props, "Devices");
@@ -289,82 +340,109 @@ impl DbusClient {
         ))
     }
 
-    /// Lists saved connection profiles from `org.freedesktop.NetworkManager.Settings`.
+    /// Lists saved connection profiles from `org.freedesktop.NetworkManager.Settings`, returning
+    /// the cached subscription list (0 ms) when available or querying the system bus.
     pub fn nm_list_saved_connections(&self) -> Result<Vec<NmSavedConnection>> {
+        if let Ok(guard) = self.cache.network_manager.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.saved_connections.clone());
+        }
         let conn = self.connection(DbusBus::System)?;
         list_saved_connections_blocking(&conn)
     }
 
-    /// Connects to a visible Wi-Fi [`NmAccessPoint`] without locking the profile to a single BSSID
-    /// (allowing seamless roaming across mesh / multi-AP networks).
+    /// Connects to a visible Wi-Fi [`NmAccessPoint`] on the NetworkManager lane without locking
+    /// the profile to a single BSSID (allowing seamless roaming across mesh / multi-AP networks).
     ///
     /// - If `password` is `None` and the access point matches an existing saved profile, activates
     ///   that saved connection via `ActivateConnection`.
     /// - Otherwise creates and activates a new connection profile via `AddAndActivateConnection`
     ///   using `ap.security` (`Open`, `Owe`, `Wep`, `WpaPsk`, `Wpa3Sae`).
-    pub fn nm_connect_wifi(&self, ap: &NmAccessPoint, password: Option<&str>) -> Result<String> {
+    pub fn nm_connect_wifi(&self, ap: &NmAccessPoint, password: Option<&str>) -> Result<()> {
         self.nm_connect_wifi_with_options(ap, password, false)
     }
 
-    /// Connects to a visible Wi-Fi [`NmAccessPoint`], optionally pinning activation to `ap.object_path`
-    /// when `lock_bssid` is `true`.
+    /// Connects to a visible Wi-Fi [`NmAccessPoint`] on the NetworkManager lane without blocking
+    /// the UI thread, optionally pinning activation to `ap.object_path` when `lock_bssid` is `true`.
     pub fn nm_connect_wifi_with_options(
         &self,
         ap: &NmAccessPoint,
         password: Option<&str>,
         lock_bssid: bool,
-    ) -> Result<String> {
-        let conn = self.connection(DbusBus::System)?;
-        let dev_path = if !ap.device_path.is_empty() {
-            ap.device_path.clone()
-        } else {
-            find_first_wifi_device_blocking(&conn)?
-        };
+    ) -> Result<()> {
         let specific_ap = if lock_bssid && !ap.object_path.is_empty() {
-            ap.object_path.as_str()
+            validate_object_path(&ap.object_path, "access point path")?
         } else {
-            "/"
+            "/".to_owned()
         };
 
         if password.is_none()
             && let Some(ref saved_path) = ap.saved_connection_path
         {
-            return self.nm_activate_connection(saved_path, &dev_path, Some(specific_ap));
+            return self.nm_activate_connection(saved_path, &ap.device_path, Some(&specific_ap));
         }
 
-        let settings = build_wifi_connection_settings(&ap.ssid, ap.security, password, false);
-        let dev_obj = ObjectPath::try_from(dev_path.as_str())
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        let ap_obj =
-            ObjectPath::try_from(specific_ap).map_err(|e| WaywiError::DbusError(e.to_string()))?;
+        let ssid = ap.ssid.clone();
+        let target = ssid.clone();
+        let security = ap.security;
+        let pw_owned = password.map(str::to_owned);
+        let dev_hint = ap.device_path.clone();
+        let dedup = format!("nm:connect:{ssid}");
 
-        let reply = conn
-            .call_method(
-                Some(NM_DEST),
-                NM_PATH,
-                Some(NM_IFACE),
-                "AddAndActivateConnection",
-                &(settings, dev_obj, ap_obj),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.AddAndActivateConnection",
+                target,
             )
-            .map_err(|e| {
-                WaywiError::DbusError(format!(
-                    "NetworkManager.AddAndActivateConnection failed: {e}"
-                ))
-            })?;
-        let (_conn_path, active_path): (OwnedObjectPath, OwnedObjectPath) = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(active_path.to_string())
+            .with_dedup(dedup)
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                let dev_path = if !dev_hint.is_empty() {
+                    dev_hint
+                } else {
+                    find_first_wifi_device_async(&conn).await.ok_or_else(|| {
+                        WaywiError::DbusError("no Wi-Fi device managed by NetworkManager".into())
+                    })?
+                };
+                let dev_obj = ObjectPath::try_from(dev_path.as_str())
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let ap_obj = ObjectPath::try_from(specific_ap.as_str())
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let settings =
+                    build_wifi_connection_settings(&ssid, security, pw_owned.as_deref(), false);
+                let reply = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_PATH,
+                        Some(NM_IFACE),
+                        "AddAndActivateConnection",
+                        &(settings, dev_obj, ap_obj),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WaywiError::DbusError(format!(
+                            "AddAndActivateConnection for `{ssid}` failed: {e}"
+                        ))
+                    })?;
+                let (_profile_path, active_path): (OwnedObjectPath, OwnedObjectPath) = reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                Ok(DbusActionPayload::with_object_path(active_path.to_string()))
+            },
+        )
     }
 
-    /// Connects to a hidden Wi-Fi network by `ssid` and optional `password`.
+    /// Connects to a hidden Wi-Fi network by `ssid` and optional `password` on the NetworkManager lane.
     pub fn nm_connect_hidden_wifi(
         &self,
         ssid: &str,
         password: Option<&str>,
         device_path: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let security = if password.is_some_and(|p| !p.is_empty()) {
             NmWifiSecurity::WpaPsk
         } else {
@@ -374,104 +452,169 @@ impl DbusClient {
     }
 
     /// Connects to a hidden Wi-Fi network with an explicit [`NmWifiSecurity`] mode (`Open`, `Owe`,
-    /// `WpaPsk`, `Wpa3Sae`, `Wep`).
+    /// `WpaPsk`, `Wpa3Sae`, `Wep`) on the NetworkManager lane without blocking the UI thread.
     pub fn nm_connect_hidden_wifi_with_security(
         &self,
         ssid: &str,
         security: NmWifiSecurity,
         password: Option<&str>,
         device_path: Option<&str>,
-    ) -> Result<String> {
-        let conn = self.connection(DbusBus::System)?;
-        let dev_path = match device_path {
-            Some(p) if !p.is_empty() => p.to_owned(),
-            _ => find_first_wifi_device_blocking(&conn)?,
-        };
-        let settings = build_wifi_connection_settings(ssid, security, password, true);
-        let dev_obj = ObjectPath::try_from(dev_path.as_str())
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        let root_obj =
-            ObjectPath::from_static_str("/").map_err(|e| WaywiError::DbusError(e.to_string()))?;
+    ) -> Result<()> {
+        if ssid.is_empty() {
+            return Err(WaywiError::DbusError("Wi-Fi SSID cannot be empty".into()));
+        }
+        let ssid_owned = ssid.to_owned();
+        let target = ssid_owned.clone();
+        let pw_owned = password.map(str::to_owned);
+        let dev_hint = device_path.unwrap_or_default().to_owned();
+        let dedup = format!("nm:connect-hidden:{ssid_owned}");
 
-        let reply = conn
-            .call_method(
-                Some(NM_DEST),
-                NM_PATH,
-                Some(NM_IFACE),
-                "AddAndActivateConnection",
-                &(settings, dev_obj, root_obj),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.AddAndActivateConnection",
+                target,
             )
-            .map_err(|e| {
-                WaywiError::DbusError(format!(
-                    "NetworkManager.AddAndActivateConnection (hidden) failed: {e}"
-                ))
-            })?;
-        let (_conn_path, active_path): (OwnedObjectPath, OwnedObjectPath) = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(active_path.to_string())
+            .with_dedup(dedup)
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                let dev_path = if !dev_hint.is_empty() {
+                    dev_hint
+                } else {
+                    find_first_wifi_device_async(&conn).await.ok_or_else(|| {
+                        WaywiError::DbusError("no Wi-Fi device managed by NetworkManager".into())
+                    })?
+                };
+                let dev_obj = ObjectPath::try_from(dev_path.as_str())
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let root_obj = ObjectPath::from_static_str("/")
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let settings = build_wifi_connection_settings(
+                    &ssid_owned,
+                    security,
+                    pw_owned.as_deref(),
+                    true,
+                );
+                let reply = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_PATH,
+                        Some(NM_IFACE),
+                        "AddAndActivateConnection",
+                        &(settings, dev_obj, root_obj),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WaywiError::DbusError(format!(
+                            "hidden Wi-Fi AddAndActivateConnection for `{ssid_owned}` failed: {e}"
+                        ))
+                    })?;
+                let (_profile_path, active_path): (OwnedObjectPath, OwnedObjectPath) = reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                Ok(DbusActionPayload::with_object_path(active_path.to_string()))
+            },
+        )
     }
 
-    /// Activates an existing saved NetworkManager connection profile (`ActivateConnection`).
+    /// Activates an existing saved NetworkManager connection profile (`ActivateConnection`) on the
+    /// NetworkManager lane without blocking the UI thread.
     pub fn nm_activate_connection(
         &self,
         connection_path: &str,
         device_path: &str,
         specific_object: Option<&str>,
-    ) -> Result<String> {
-        let conn = self.connection(DbusBus::System)?;
-        let conn_obj = ObjectPath::try_from(connection_path)
+    ) -> Result<()> {
+        let conn_obj = OwnedObjectPath::try_from(connection_path.to_owned())
             .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        let dev_obj = ObjectPath::try_from(if device_path.is_empty() {
-            "/"
-        } else {
-            device_path
-        })
-        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
         let spec_str = specific_object.filter(|s| !s.is_empty()).unwrap_or("/");
-        let spec_obj =
-            ObjectPath::try_from(spec_str).map_err(|e| WaywiError::DbusError(e.to_string()))?;
+        let spec_obj = OwnedObjectPath::try_from(spec_str.to_owned())
+            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+        let dev_hint = device_path.to_owned();
+        let target = connection_path.to_owned();
+        let dedup = format!("nm:activate:{connection_path}");
 
-        let reply = conn
-            .call_method(
-                Some(NM_DEST),
-                NM_PATH,
-                Some(NM_IFACE),
-                "ActivateConnection",
-                &(conn_obj, dev_obj, spec_obj),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.ActivateConnection",
+                target,
             )
-            .map_err(|e| {
-                WaywiError::DbusError(format!("NetworkManager.ActivateConnection failed: {e}"))
-            })?;
-        let active_path: OwnedObjectPath = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(active_path.to_string())
-    }
-
-    /// Deactivates an active connection by its `ActiveConnection` object path (`DeactivateConnection`).
-    pub fn nm_deactivate_connection(&self, active_connection_path: &str) -> Result<()> {
-        let conn = self.connection(DbusBus::System)?;
-        let obj = ObjectPath::try_from(active_connection_path)
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        conn.call_method(
-            Some(NM_DEST),
-            NM_PATH,
-            Some(NM_IFACE),
-            "DeactivateConnection",
-            &(obj,),
+            .with_dedup(dedup)
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                let resolved_dev = if !dev_hint.is_empty() {
+                    dev_hint
+                } else {
+                    find_first_wifi_device_async(&conn)
+                        .await
+                        .unwrap_or_else(|| "/".to_owned())
+                };
+                let dev_obj = ObjectPath::try_from(resolved_dev.as_str())
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let reply = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_PATH,
+                        Some(NM_IFACE),
+                        "ActivateConnection",
+                        &(conn_obj, dev_obj, spec_obj),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WaywiError::DbusError(format!(
+                            "NetworkManager.ActivateConnection failed: {e}"
+                        ))
+                    })?;
+                let active_path: OwnedObjectPath = reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                Ok(DbusActionPayload::with_object_path(active_path.to_string()))
+            },
         )
-        .map_err(|e| {
-            WaywiError::DbusError(format!("NetworkManager.DeactivateConnection failed: {e}"))
-        })?;
-        Ok(())
     }
 
-    /// Disconnects a specific NetworkManager device (`org.freedesktop.NetworkManager.Device.Disconnect`).
+    /// Deactivates an active connection by its `ActiveConnection` object path (`DeactivateConnection`)
+    /// on the NetworkManager lane without blocking the UI thread.
+    pub fn nm_deactivate_connection(&self, active_connection_path: &str) -> Result<()> {
+        let obj = OwnedObjectPath::try_from(active_connection_path.to_owned())
+            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+        let target = active_connection_path.to_owned();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.DeactivateConnection",
+                target,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(NM_DEST),
+                    NM_PATH,
+                    Some(NM_IFACE),
+                    "DeactivateConnection",
+                    &(obj,),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!(
+                        "NetworkManager.DeactivateConnection failed: {e}"
+                    ))
+                })?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Disconnects a specific NetworkManager device (`org.freedesktop.NetworkManager.Device.Disconnect`)
+    /// on the NetworkManager lane.
     pub fn nm_disconnect_device(&self, device_path: &str) -> Result<()> {
-        self.call_method_unit(
+        self.call_lane_method_unit(
+            DbusActionLane::NetworkManager,
             DbusBus::System,
             NM_DEST,
             device_path,
@@ -481,9 +624,10 @@ impl DbusClient {
     }
 
     /// Deletes/forgets a saved connection profile by its settings object path
-    /// (`org.freedesktop.NetworkManager.Settings.Connection.Delete`).
+    /// (`org.freedesktop.NetworkManager.Settings.Connection.Delete`) on the NetworkManager lane.
     pub fn nm_forget_connection(&self, connection_path: &str) -> Result<()> {
-        self.call_method_unit(
+        self.call_lane_method_unit(
+            DbusActionLane::NetworkManager,
             DbusBus::System,
             NM_DEST,
             connection_path,
@@ -492,19 +636,46 @@ impl DbusClient {
         )
     }
 
-    /// Deletes/forgets all saved Wi-Fi connection profiles matching `ssid` and returns the number
-    /// of deleted profiles.
-    pub fn nm_forget_wifi_ssid(&self, ssid: &str) -> Result<usize> {
-        let conn = self.connection(DbusBus::System)?;
-        let saved = list_saved_connections_blocking(&conn)?;
-        let mut deleted = 0usize;
-        for item in saved {
-            if item.ssid.as_deref() == Some(ssid) {
-                self.nm_forget_connection(&item.object_path)?;
-                deleted += 1;
-            }
+    /// Deletes/forgets all saved Wi-Fi connection profiles matching `ssid` on the NetworkManager
+    /// lane without blocking the UI thread.
+    pub fn nm_forget_wifi_ssid(&self, ssid: &str) -> Result<()> {
+        if ssid.is_empty() {
+            return Err(WaywiError::DbusError("Wi-Fi SSID cannot be empty".into()));
         }
-        Ok(deleted)
+        let target_ssid = ssid.to_owned();
+        let target = target_ssid.clone();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "Settings.ForgetWifiSsid",
+                target,
+            ),
+            move |conn| async move {
+                let saved = list_saved_connections_async(&conn).await;
+                let mut deleted = 0usize;
+                for item in saved {
+                    if item.ssid.as_deref() == Some(target_ssid.as_str()) {
+                        conn.call_method(
+                            Some(NM_DEST),
+                            item.object_path.as_str(),
+                            Some(NM_SETTINGS_CONN_IFACE),
+                            "Delete",
+                            &(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            WaywiError::DbusError(format!(
+                                "Settings.Connection.Delete failed for `{}`: {e}",
+                                item.object_path
+                            ))
+                        })?;
+                        deleted += 1;
+                    }
+                }
+                Ok(DbusActionPayload::with_count(deleted))
+            },
+        )
     }
 }
 
@@ -561,18 +732,16 @@ pub(crate) fn build_wifi_connection_settings<'a>(
     top
 }
 
-fn find_first_wifi_device_blocking(conn: &zbus::blocking::Connection) -> Result<String> {
-    let root_props = get_all_blocking(conn, NM_DEST, NM_PATH, NM_IFACE)?;
+async fn find_first_wifi_device_async(conn: &zbus::Connection) -> Option<String> {
+    let root_props = get_all_async(conn, NM_DEST, NM_PATH, NM_IFACE).await?;
     for dev_path in dict_str_vec(&root_props, "Devices").into_iter().take(32) {
-        if let Ok(dev_props) = get_all_blocking(conn, NM_DEST, &dev_path, NM_DEVICE_IFACE)
+        if let Some(dev_props) = get_all_async(conn, NM_DEST, &dev_path, NM_DEVICE_IFACE).await
             && dict_u32(&dev_props, "DeviceType") == Some(2)
         {
-            return Ok(dev_path);
+            return Some(dev_path);
         }
     }
-    Err(WaywiError::DbusError(
-        "no NetworkManager Wi-Fi device found".into(),
-    ))
+    None
 }
 
 fn list_saved_connections_blocking(

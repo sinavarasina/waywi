@@ -5,7 +5,7 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus};
+use super::client::{DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec};
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
 
@@ -101,18 +101,29 @@ impl DbusClient {
             .map_err(|e| WaywiError::DbusError(e.to_string()))
     }
 
-    /// Releases a previously acquired `org.freedesktop.ScreenSaver` inhibit cookie.
+    /// Releases a previously acquired `org.freedesktop.ScreenSaver` inhibit cookie without
+    /// blocking the UI thread.
     pub fn uninhibit_screensaver(&self, cookie: u32) -> Result<()> {
-        let conn = self.connection(DbusBus::Session)?;
-        conn.call_method(
-            Some(SCREENSAVER_DEST),
-            SCREENSAVER_PATH,
-            Some(SCREENSAVER_IFACE),
-            "UnInhibit",
-            &(cookie,),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "ScreenSaver.UnInhibit",
+                SCREENSAVER_PATH,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(SCREENSAVER_DEST),
+                    SCREENSAVER_PATH,
+                    Some(SCREENSAVER_IFACE),
+                    "UnInhibit",
+                    &(cookie,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.UnInhibit failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.UnInhibit failed: {e}")))?;
-        Ok(())
     }
 
     /// Reads `org.freedesktop.GeoClue2.Manager.InUse` from the system bus.

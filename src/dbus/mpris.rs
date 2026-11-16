@@ -2,13 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::{DbusClient, DbusSharedBus, connect_shared_bus, owned_value_to_dbus};
+use super::client::{
+    DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
+    owned_value_to_dbus, validate_bus_name,
+};
 use super::types::{Dbus, DbusBus, DbusValue};
 use super::worker::AsyncStopSignal;
 use super::zvariant_helpers::{
@@ -134,15 +137,26 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Lists active MPRIS media player bus names (`org.mpris.MediaPlayer2.*`).
+    /// Lists active MPRIS media player bus names (`org.mpris.MediaPlayer2.*`), returning the
+    /// cached subscription list (0 ms) when available or querying the session bus.
     pub fn list_mpris_players(&self) -> Result<Vec<String>> {
+        if let Ok(guard) = self.cache.mpris.read()
+            && let Some(ref list) = *guard
+        {
+            return Ok(list.iter().map(|s| s.service_name.clone()).collect());
+        }
         let conn = self.connection(DbusBus::Session)?;
         list_mpris_names_blocking(&conn)
     }
 
-    /// Reads snapshots for all active MPRIS media players on the session bus, sorted with
-    /// `Playing` players first.
+    /// Reads snapshots for all active MPRIS media players on the session bus, returning the
+    /// cached subscription list (0 ms) when available or querying the session bus.
     pub fn mpris_snapshots(&self) -> Result<Vec<MprisSnapshot>> {
+        if let Ok(guard) = self.cache.mpris.read()
+            && let Some(ref list) = *guard
+        {
+            return Ok(list.clone());
+        }
         let conn = self.connection(DbusBus::Session)?;
         let names = list_mpris_names_blocking(&conn)?;
         let mut out = Vec::with_capacity(names.len());
@@ -155,8 +169,15 @@ impl DbusClient {
         Ok(out)
     }
 
-    /// Reads a typed [`MprisSnapshot`] from `service_name` (e.g. `"org.mpris.MediaPlayer2.spotify"`).
+    /// Reads a typed [`MprisSnapshot`] from `service_name` (e.g. `"org.mpris.MediaPlayer2.spotify"`),
+    /// returning the cached subscription entry (0 ms) when available.
     pub fn mpris_snapshot(&self, service_name: &str) -> Result<MprisSnapshot> {
+        if let Ok(guard) = self.cache.mpris.read()
+            && let Some(ref list) = *guard
+            && let Some(found) = list.iter().find(|s| s.service_name == service_name)
+        {
+            return Ok(found.clone());
+        }
         let conn = self.connection(DbusBus::Session)?;
         read_mpris_snapshot_blocking(&conn, service_name)
     }
@@ -228,41 +249,65 @@ impl DbusClient {
     }
 
     /// Seeks relative to the current playback position by `offset_us` microseconds
-    /// (`org.mpris.MediaPlayer2.Player.Seek`).
+    /// (`org.mpris.MediaPlayer2.Player.Seek`) on the MPRIS lane without blocking the UI thread.
     pub fn mpris_seek(&self, service_name: &str, offset_us: i64) -> Result<()> {
-        let conn = self.connection(DbusBus::Session)?;
-        conn.call_method(
-            Some(service_name),
-            MPRIS_OBJECT,
-            Some(MPRIS_PLAYER_IFACE),
-            "Seek",
-            &(offset_us,),
+        let svc = validate_bus_name(service_name, "MPRIS service_name")?;
+        let target = svc.clone();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Mpris,
+                DbusBus::Session,
+                "Player.Seek",
+                target,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(svc.as_str()),
+                    MPRIS_OBJECT,
+                    Some(MPRIS_PLAYER_IFACE),
+                    "Seek",
+                    &(offset_us,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Player.Seek failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("Player.Seek failed: {e}")))?;
-        Ok(())
     }
 
     /// Sets the absolute playback position in microseconds for `track_id`
-    /// (`org.mpris.MediaPlayer2.Player.SetPosition`).
+    /// (`org.mpris.MediaPlayer2.Player.SetPosition`) on the MPRIS lane without blocking the UI thread.
     pub fn mpris_set_position(
         &self,
         service_name: &str,
         track_id: &str,
         position_us: i64,
     ) -> Result<()> {
-        let conn = self.connection(DbusBus::Session)?;
-        let obj = ObjectPath::try_from(track_id).map_err(|e| {
+        let svc = validate_bus_name(service_name, "MPRIS service_name")?;
+        let target = svc.clone();
+        let obj = OwnedObjectPath::try_from(track_id.to_owned()).map_err(|e| {
             WaywiError::DbusError(format!("invalid MPRIS track_id `{track_id}`: {e}"))
         })?;
-        conn.call_method(
-            Some(service_name),
-            MPRIS_OBJECT,
-            Some(MPRIS_PLAYER_IFACE),
-            "SetPosition",
-            &(obj, position_us),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Mpris,
+                DbusBus::Session,
+                "Player.SetPosition",
+                target,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(svc.as_str()),
+                    MPRIS_OBJECT,
+                    Some(MPRIS_PLAYER_IFACE),
+                    "SetPosition",
+                    &(obj, position_us),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Player.SetPosition failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("Player.SetPosition failed: {e}")))?;
-        Ok(())
     }
 
     /// Sets the player volume (`0.0..=1.0`, or higher if supported) via

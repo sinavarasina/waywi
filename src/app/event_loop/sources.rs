@@ -172,6 +172,11 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
             |inbox| inbox.dbus_mpris.drain(..).collect(),
             &rt.sub_mgr.dbus_mpris_subs,
         );
+        fanout_broadcast(
+            &rt.inbox,
+            |inbox| inbox.dbus_action_results.drain(..).collect(),
+            &rt.sub_mgr.dbus_action_result_subs,
+        );
     }
 
     #[cfg(feature = "global-shortcuts")]

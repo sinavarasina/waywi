@@ -12,7 +12,9 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::DbusClient;
+use super::client::{
+    DbusActionLane, DbusClient, LaneActionSpec, validate_bus_name, validate_object_path,
+};
 use super::types::{Dbus, DbusBus};
 use super::worker::AsyncStopSignal;
 
@@ -235,43 +237,50 @@ impl DbusClient {
         Ok(parse_tray_item_props(bus_name, object_path, &props))
     }
 
-    fn call_sni_action<B: serde::Serialize + zbus::zvariant::Type>(
-        &self,
-        service: &str,
-        method: &str,
-        body: &B,
-    ) -> Result<()> {
+    fn call_sni_action<B>(&self, service: &str, method: &'static str, body: B) -> Result<()>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType + Send + Sync + 'static,
+    {
+        let _ = validate_bus_name(service, "tray service")?;
         let (dest, path) = split_sni_service(service, None);
-        let conn = self.connection(DbusBus::Session)?;
-        conn.call_method(
-            Some(dest.as_str()),
-            path.as_str(),
-            Some(SNI_IFACE),
-            method,
-            body,
+        let op = format!("StatusNotifierItem.{method}");
+        let target = service.to_owned();
+        self.submit_lane_action(
+            LaneActionSpec::fast(DbusActionLane::Desktop, DbusBus::Session, op, target),
+            move |conn| async move {
+                conn.call_method(
+                    Some(dest.as_str()),
+                    path.as_str(),
+                    Some(SNI_IFACE),
+                    method,
+                    &body,
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("tray {method} failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("tray {method} failed: {e}")))?;
-        Ok(())
     }
 
-    /// Sends left-click `Activate(x, y)` to a tray item.
+    /// Sends left-click `Activate(x, y)` to a tray item without blocking the UI thread.
     pub fn tray_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "Activate", &(x, y))
+        self.call_sni_action(service, "Activate", (x, y))
     }
 
-    /// Sends middle-click `SecondaryActivate(x, y)` to a tray item.
+    /// Sends middle-click `SecondaryActivate(x, y)` to a tray item without blocking the UI thread.
     pub fn tray_secondary_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "SecondaryActivate", &(x, y))
+        self.call_sni_action(service, "SecondaryActivate", (x, y))
     }
 
-    /// Sends right-click `ContextMenu(x, y)` to a tray item.
+    /// Sends right-click `ContextMenu(x, y)` to a tray item without blocking the UI thread.
     pub fn tray_context_menu(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "ContextMenu", &(x, y))
+        self.call_sni_action(service, "ContextMenu", (x, y))
     }
 
-    /// Sends `Scroll(delta, orientation)` (`"vertical"` or `"horizontal"`) to a tray item.
+    /// Sends `Scroll(delta, orientation)` (`"vertical"` or `"horizontal"`) to a tray item
+    /// without blocking the UI thread.
     pub fn tray_scroll(&self, service: &str, delta: i32, orientation: &str) -> Result<()> {
-        self.call_sni_action(service, "Scroll", &(delta, orientation))
+        self.call_sni_action(service, "Scroll", (delta, orientation.to_owned()))
     }
 
     /// Reads top-level `com.canonical.dbusmenu` entries from a tray item's `menu_path`.
@@ -295,7 +304,8 @@ impl DbusClient {
         Ok(root.2.iter().filter_map(parse_dbusmenu_node).collect())
     }
 
-    /// Sends a `com.canonical.dbusmenu.Event` (e.g. `"clicked"` / `"hovered"`) for `item_id`.
+    /// Sends a `com.canonical.dbusmenu.Event` (e.g. `"clicked"` / `"hovered"`) for `item_id`
+    /// without blocking the UI thread.
     pub fn tray_menu_event(
         &self,
         bus_name: &str,
@@ -303,19 +313,33 @@ impl DbusClient {
         item_id: i32,
         event_id: &str,
     ) -> Result<()> {
-        let conn = self.connection(DbusBus::Session)?;
+        let bus = validate_bus_name(bus_name, "dbusmenu bus_name")?;
+        let path = validate_object_path(menu_path, "dbusmenu menu_path")?;
+        let target = path.clone();
+        let ev = validate_bus_name(event_id, "dbusmenu event_id")?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u32, |d| d.as_secs() as u32);
-        conn.call_method(
-            Some(bus_name),
-            menu_path,
-            Some(DBUSMENU_IFACE),
-            "Event",
-            &(item_id, event_id, Value::from(0i32), ts),
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "dbusmenu.Event",
+                target,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(bus.as_str()),
+                    path.as_str(),
+                    Some(DBUSMENU_IFACE),
+                    "Event",
+                    &(item_id, ev.as_str(), Value::from(0i32), ts),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("dbusmenu Event failed: {e}")))?;
+                Ok(())
+            },
         )
-        .map_err(|e| WaywiError::DbusError(format!("dbusmenu Event failed: {e}")))?;
-        Ok(())
     }
 }
 

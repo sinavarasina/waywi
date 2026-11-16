@@ -86,4 +86,4 @@ pub use crate::dbus::{
     BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent, GlobalShortcuts,
 };
 #[cfg(feature = "dbus")]
-pub use crate::dbus::{MprisEvent, MprisLoopStatus};
+pub use crate::dbus::{DbusActionLane, DbusActionResult, MprisEvent, MprisLoopStatus};

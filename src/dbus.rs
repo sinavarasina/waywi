@@ -26,8 +26,8 @@ pub use bluetooth::{
     BluetoothSnapshot, BluetoothTransportFilter,
 };
 pub(crate) use bluetooth::{BluetoothAgentWorker, spawn_bluetooth_worker};
-pub use client::DbusClient;
-pub(crate) use client::DbusSharedBus;
+pub use client::{DbusActionLane, DbusActionResult, DbusClient};
+pub(crate) use client::{DbusActionResultWorker, DbusSharedBus};
 #[cfg(feature = "global-shortcuts")]
 pub(crate) use global_shortcuts::GlobalShortcutsWorker;
 #[cfg(feature = "global-shortcuts")]

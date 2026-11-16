@@ -13,8 +13,8 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::client::DbusClient;
-use super::types::Dbus;
+use super::client::{DbusActionLane, DbusClient, LaneActionSpec};
+use super::types::{Dbus, DbusBus};
 
 const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
@@ -96,34 +96,53 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server.
+    /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server
+    /// without blocking the UI thread.
     pub fn close_notification(&self, id: u32, reason: NotificationCloseReason) -> Result<()> {
         let conn = self.active_notifications_conn()?;
-        futures_lite::future::block_on(async move {
-            let iface = conn
-                .object_server()
-                .interface::<_, NotificationsIface>(NOTIFICATIONS_OBJECT_PATH)
-                .await
-                .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-            NotificationsIface::notification_closed(iface.signal_emitter(), id, reason as u32)
-                .await
-                .map_err(|e| WaywiError::DbusError(e.to_string()))
-        })
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "Notifications.NotificationClosed",
+                id.to_string(),
+            ),
+            move |_| async move {
+                let iface = conn
+                    .object_server()
+                    .interface::<_, NotificationsIface>(NOTIFICATIONS_OBJECT_PATH)
+                    .await
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                NotificationsIface::notification_closed(iface.signal_emitter(), id, reason as u32)
+                    .await
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))
+            },
+        )
     }
 
-    /// Emits `org.freedesktop.Notifications.ActionInvoked(id, action_key)` from the active server.
+    /// Emits `org.freedesktop.Notifications.ActionInvoked(id, action_key)` from the active server
+    /// without blocking the UI thread.
     pub fn invoke_notification_action(&self, id: u32, action_key: &str) -> Result<()> {
         let conn = self.active_notifications_conn()?;
-        futures_lite::future::block_on(async move {
-            let iface = conn
-                .object_server()
-                .interface::<_, NotificationsIface>(NOTIFICATIONS_OBJECT_PATH)
-                .await
-                .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-            NotificationsIface::action_invoked(iface.signal_emitter(), id, action_key)
-                .await
-                .map_err(|e| WaywiError::DbusError(e.to_string()))
-        })
+        let key = action_key.to_owned();
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "Notifications.ActionInvoked",
+                id.to_string(),
+            ),
+            move |_| async move {
+                let iface = conn
+                    .object_server()
+                    .interface::<_, NotificationsIface>(NOTIFICATIONS_OBJECT_PATH)
+                    .await
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                NotificationsIface::action_invoked(iface.signal_emitter(), id, key.as_str())
+                    .await
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))
+            },
+        )
     }
 
     fn active_notifications_conn(&self) -> Result<zbus::Connection> {
