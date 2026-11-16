@@ -47,13 +47,12 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlotUserData> for WaylandState {
     ) {
         if let wl_buffer::Event::Release = event
             && let Some(surf) = state.surfaces.get_mut(&data.key)
+            && surf.pool.mark_released(data.slot, data.generation)
+            && surf.pending_redraw
         {
-            surf.pool.mark_released(data.slot);
-            if surf.pending_redraw {
-                state
-                    .events
-                    .push_back(WaylandEvent::BufferReleased { key: data.key });
-            }
+            state
+                .events
+                .push_back(WaylandEvent::BufferReleased { key: data.key });
         }
     }
 }

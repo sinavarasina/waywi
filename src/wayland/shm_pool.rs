@@ -16,10 +16,15 @@ fn align_64(n: usize) -> usize {
 }
 
 /// User data attached to every `wl_buffer` created from [`SurfaceShmPool`].
+///
+/// `generation` identifies a specific buffer incarnation of `slot`: when a mismatched buffer is
+/// destroyed and its slot index is reused, in-flight or stale `wl_buffer.release` events carrying
+/// the old generation must not free the replacement buffer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BufferSlotUserData {
     pub(crate) key: RetainedSurfaceKey,
     pub(crate) slot: usize,
+    pub(crate) generation: u64,
 }
 
 #[derive(Debug)]
@@ -29,6 +34,7 @@ struct ShmBufferSlot {
     width: u32,
     height: u32,
     stride: u32,
+    generation: u64,
     busy: bool,
     needs_full_redraw: bool,
     pending_damage: Vec<BufferRect>,
@@ -39,6 +45,7 @@ pub(crate) enum AcquireSlot<'a> {
     Ready {
         slot: usize,
         buffer: wl_buffer::WlBuffer,
+        generation: u64,
         pixels: &'a mut [u8],
         stride: u32,
         damage: Vec<BufferRect>,
@@ -46,8 +53,8 @@ pub(crate) enum AcquireSlot<'a> {
     AllBusy,
 }
 
-/// Reusable `memfd_create` + `wl_shm_pool` with on-demand single-or-double buffering and immediate
-/// `ftruncate(0)` + unmap when hidden/destroyed.
+/// Reusable `memfd_create` + `wl_shm_pool` with on-demand single-or-double buffering; the memfd is
+/// closed (never truncated) when hidden/destroyed so compositor-side mappings stay valid.
 #[derive(Debug, Default)]
 pub(crate) struct SurfaceShmPool {
     fd: Option<OwnedFd>,
@@ -55,6 +62,7 @@ pub(crate) struct SurfaceShmPool {
     wl_pool: Option<wl_shm_pool::WlShmPool>,
     pool_bytes: usize,
     slots: [Option<ShmBufferSlot>; 2],
+    next_generation: u64,
 }
 
 impl SurfaceShmPool {
@@ -69,21 +77,32 @@ impl SurfaceShmPool {
         }
     }
 
-    pub(crate) fn mark_released(&mut self, slot: usize) {
-        if let Some(Some(s)) = self.slots.get_mut(slot) {
+    /// Frees a committed slot when the compositor reports `wl_buffer.release` for the exact
+    /// buffer incarnation still owned by that slot; stale generations are ignored. Returns
+    /// `true` when the slot was actually freed.
+    pub(crate) fn mark_released(&mut self, slot: usize, generation: u64) -> bool {
+        if let Some(Some(s)) = self.slots.get_mut(slot)
+            && s.generation == generation
+        {
             s.busy = false;
+            return true;
         }
+        false
     }
 
-    pub(crate) fn mark_committed(&mut self, slot: usize) {
-        if let Some(Some(s)) = self.slots.get_mut(slot) {
+    pub(crate) fn mark_committed(&mut self, slot: usize, generation: u64) {
+        if let Some(Some(s)) = self.slots.get_mut(slot)
+            && s.generation == generation
+        {
             s.busy = true;
             s.needs_full_redraw = false;
             s.pending_damage.clear();
         }
     }
 
-    /// Shrinks the memfd to 0 bytes, drops mappings, and destroys pool/buffers when hidden/removed.
+    /// Destroys pool/buffers, drops mappings, and closes the memfd when hidden/removed. The file is
+    /// never truncated: a compositor may still map/use released buffers, and shrinking it under
+    /// that mapping causes SIGBUS in the compositor.
     pub(crate) fn shrink_and_unmap(&mut self) {
         for slot in &mut self.slots {
             if let Some(s) = slot.take() {
@@ -94,10 +113,7 @@ impl SurfaceShmPool {
         if let Some(pool) = self.wl_pool.take() {
             pool.destroy();
         }
-        if let Some(fd) = self.fd.take() {
-            let _ = ftruncate(&fd, 0);
-            drop(fd);
-        }
+        drop(self.fd.take());
         self.pool_bytes = 0;
     }
 
@@ -183,6 +199,8 @@ impl SurfaceShmPool {
             let pool = self.wl_pool.as_ref().ok_or_else(|| {
                 WaywiError::WaylandConnection("wl_shm_pool missing after resize".into())
             })?;
+            self.next_generation += 1;
+            let generation = self.next_generation;
             let buffer = pool.create_buffer(
                 offset as i32,
                 width as i32,
@@ -193,6 +211,7 @@ impl SurfaceShmPool {
                 BufferSlotUserData {
                     key: surface_key,
                     slot: target_idx,
+                    generation,
                 },
             );
             self.slots[target_idx] = Some(ShmBufferSlot {
@@ -201,6 +220,7 @@ impl SurfaceShmPool {
                 width,
                 height,
                 stride,
+                generation,
                 busy: false,
                 needs_full_redraw: true,
                 pending_damage: Vec::new(),
@@ -229,6 +249,7 @@ impl SurfaceShmPool {
         Ok(AcquireSlot::Ready {
             slot: target_idx,
             buffer,
+            generation: slot.generation,
             pixels: &mut mmap[slice_start..slice_end],
             stride,
             damage,
@@ -416,32 +437,94 @@ mod tests {
         let mut pool = SurfaceShmPool::default();
         assert_eq!(pool.allocated_slot_count(), 0);
 
-        let slot0 = match pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap() {
-            AcquireSlot::Ready { slot, .. } => slot,
-            AcquireSlot::AllBusy => panic!("expected slot 0 ready"),
+        let AcquireSlot::Ready {
+            slot: slot0,
+            generation: gen0,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected slot 0 ready");
         };
         assert_eq!(slot0, 0);
         assert_eq!(pool.allocated_slot_count(), 1);
         assert!(pool.current_pool_bytes() >= 64 * 32 * 4);
-        pool.mark_committed(slot0);
+        pool.mark_committed(slot0, gen0);
 
         // Slot 0 is still busy -> allocates slot 1 on-demand.
-        let slot1 = match pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap() {
-            AcquireSlot::Ready { slot, .. } => slot,
-            AcquireSlot::AllBusy => panic!("expected slot 1 ready"),
+        let AcquireSlot::Ready {
+            slot: slot1,
+            generation: gen1,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected slot 1 ready");
         };
         assert_eq!(slot1, 1);
         assert_eq!(pool.allocated_slot_count(), 2);
-        pool.mark_committed(slot1);
+        pool.mark_committed(slot1, gen1);
 
         assert!(matches!(
             pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap(),
             AcquireSlot::AllBusy
         ));
 
-        pool.mark_released(slot0);
+        pool.mark_released(slot0, gen0);
         assert!(matches!(
             pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap(),
+            AcquireSlot::Ready { slot: 0, .. }
+        ));
+
+        // Re-acquiring a released (still alive) slot reuses the same buffer generation.
+        let AcquireSlot::Ready {
+            slot: slot0b,
+            generation: gen0b,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected slot 0 ready");
+        };
+        assert_eq!(slot0b, 0);
+        assert_eq!(gen0b, gen0);
+        pool.mark_committed(slot0, gen0b);
+        pool.mark_released(slot0, gen0b);
+        pool.mark_released(slot1, gen1);
+
+        // A dimension mismatch destroys both buffers and recreates slot 0 with a new generation.
+        let AcquireSlot::Ready {
+            slot: slot2,
+            generation: gen2,
+            ..
+        } = pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected resized slot 0 ready");
+        };
+        assert_ne!(gen2, gen0);
+        pool.mark_committed(slot2, gen2);
+
+        let AcquireSlot::Ready {
+            slot: slot3,
+            generation: gen3,
+            ..
+        } = pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected slot 1 ready");
+        };
+        assert_eq!(slot3, 1);
+        pool.mark_committed(slot3, gen3);
+
+        assert!(matches!(
+            pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap(),
+            AcquireSlot::AllBusy
+        ));
+        // A stale release for a destroyed buffer incarnation must not free the recycled slot.
+        pool.mark_released(slot2, gen0);
+        assert!(matches!(
+            pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap(),
+            AcquireSlot::AllBusy
+        ));
+        pool.mark_released(slot2, gen2);
+        assert!(matches!(
+            pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap(),
             AcquireSlot::Ready { slot: 0, .. }
         ));
 

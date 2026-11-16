@@ -141,8 +141,12 @@ impl WaylandState {
         };
 
         // Two initial roundtrips populate advertised outputs, seats, and initial formats.
-        let _ = queue.roundtrip(&mut state);
-        let _ = queue.roundtrip(&mut state);
+        queue.roundtrip(&mut state).map_err(|e| {
+            WaywiError::WaylandConnection(format!("initial wayland roundtrip failed: {e}"))
+        })?;
+        queue.roundtrip(&mut state).map_err(|e| {
+            WaywiError::WaylandConnection(format!("second wayland roundtrip failed: {e}"))
+        })?;
         state.refresh_outputs();
 
         Ok((state, queue, qh))
@@ -370,7 +374,7 @@ impl WaylandState {
                 self.focused_keyboard_surface = None;
             }
             self.active_touches.retain(|_, v| *v != key);
-            // Detach buffer and shrink memfd to 0 bytes immediately before dropping role/surface.
+            // Detach buffer and drop the memfd (without truncating it) before dropping role/surface.
             let wl = surf.role.wl_surface();
             wl.attach(None, 0, 0);
             wl.commit();
@@ -493,6 +497,7 @@ impl WaylandState {
             AcquireSlot::Ready {
                 slot,
                 buffer,
+                generation,
                 pixels,
                 stride,
                 damage,
@@ -511,7 +516,7 @@ impl WaylandState {
                 wl_surface.attach(Some(&buffer), 0, 0);
                 wl_surface.commit();
 
-                surf.pool.mark_committed(slot);
+                surf.pool.mark_committed(slot, generation);
                 surf.pending_redraw = false;
                 Ok(true)
             }
