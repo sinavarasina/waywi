@@ -198,6 +198,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - **Control IPC (`control-ipc`)**:
   - `Signal` (`Usr1`, `Usr2`), `Control::signal(signal, msg)`, `Control::socket(socket_name_or_path, map)`.
   - `control::socket::{resolve_socket_path, send_command}`.
+  - Socket names resolve under `$XDG_RUNTIME_DIR` (fallback `/run/user/<euid>`; explicit paths preserved). The listener only replaces stale socket files owned by the current user after an `ECONNREFUSED` probe, and drains newline-terminated commands from same-UID peers only.
 
 ## D-Bus Subsystems (`dbus`)
 
