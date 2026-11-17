@@ -251,8 +251,8 @@ impl SystemProviders {
         os::read_load_average()
     }
 
-    /// Reads internal panel backlights and latest cached DDC/CI external monitor luminance
-    /// (scheduling an async background refresh without blocking).
+    /// Reads internal panel backlights and the latest cached DDC/CI external monitor luminance,
+    /// scheduling an async background refresh.
     pub fn brightness_snapshot(&mut self) -> Result<BrightnessSnapshot> {
         let backlights = hardware::read_backlights()?;
         let external_monitors = self.ddc_worker.snapshot_and_request_refresh();

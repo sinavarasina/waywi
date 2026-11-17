@@ -249,7 +249,7 @@ impl DbusClient {
     }
 
     /// Seeks relative to the current playback position by `offset_us` microseconds
-    /// (`org.mpris.MediaPlayer2.Player.Seek`) on the MPRIS lane without blocking the UI thread.
+    /// (`org.mpris.MediaPlayer2.Player.Seek`) on the MPRIS lane.
     pub fn mpris_seek(&self, service_name: &str, offset_us: i64) -> Result<()> {
         let svc = validate_bus_name(service_name, "MPRIS service_name")?;
         let target = svc.clone();
@@ -276,7 +276,7 @@ impl DbusClient {
     }
 
     /// Sets the absolute playback position in microseconds for `track_id`
-    /// (`org.mpris.MediaPlayer2.Player.SetPosition`) on the MPRIS lane without blocking the UI thread.
+    /// (`org.mpris.MediaPlayer2.Player.SetPosition`) on the MPRIS lane.
     pub fn mpris_set_position(
         &self,
         service_name: &str,

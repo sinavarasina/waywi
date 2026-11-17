@@ -80,8 +80,7 @@ impl DbusClient {
         read_logind_snapshot_blocking(&conn)
     }
 
-    /// Sets device brightness via `org.freedesktop.login1.Session.SetBrightness` without root or
-    /// blocking the UI thread.
+    /// Sets device brightness via `org.freedesktop.login1.Session.SetBrightness` without root.
     pub fn set_backlight_brightness(
         &self,
         subsystem: &str,
@@ -116,8 +115,7 @@ impl DbusClient {
         )
     }
 
-    /// Requests locking the active session via `org.freedesktop.login1.Session.Lock` without
-    /// blocking the UI thread.
+    /// Requests locking the active session via `org.freedesktop.login1.Session.Lock`.
     pub fn lock_session(&self) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(
@@ -145,8 +143,7 @@ impl DbusClient {
         )
     }
 
-    /// Requests unlocking the active session via `org.freedesktop.login1.Session.Unlock` without
-    /// blocking the UI thread.
+    /// Requests unlocking the active session via `org.freedesktop.login1.Session.Unlock`.
     pub fn unlock_session(&self) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(

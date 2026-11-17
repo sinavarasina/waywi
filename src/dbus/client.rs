@@ -725,9 +725,9 @@ impl Drop for DbusActionPool {
     }
 }
 
-/// Shared in-memory cache of the latest snapshots observed by D-Bus background workers so UI
-/// queries (`mpris_snapshot`, `bluetooth_snapshot`, `network_manager_snapshot`, etc.) return in
-/// 0 ms without blocking the Wayland event loop when a subscription is active.
+/// Shared in-memory cache of the latest snapshots observed by D-Bus background workers, so UI
+/// queries (`mpris_snapshot`, `bluetooth_snapshot`, `network_manager_snapshot`, etc.) read the
+/// latest snapshot directly instead of issuing D-Bus calls.
 #[derive(Default)]
 pub(crate) struct DbusSnapshotCache {
     pub(crate) mpris: RwLock<Option<Vec<MprisSnapshot>>>,
@@ -864,8 +864,7 @@ impl DbusClient {
         Ok(owned_value_to_dbus(&val))
     }
 
-    /// Enqueues a zero-argument D-Bus method call on the appropriate domain lane without blocking
-    /// the UI thread.
+    /// Enqueues a zero-argument D-Bus method call on the appropriate domain lane.
     pub fn call_method_unit(
         &self,
         bus: DbusBus,
@@ -913,7 +912,7 @@ impl DbusClient {
     }
 
     /// Enqueues a D-Bus property write via `org.freedesktop.DBus.Properties.Set` on the
-    /// appropriate domain lane without blocking the UI thread.
+    /// appropriate domain lane.
     pub(super) fn set_property(
         &self,
         bus: DbusBus,

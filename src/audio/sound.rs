@@ -16,7 +16,7 @@ const MAX_SOUND_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Standard mixer output rate shared by native PCM and rodio playback.
 pub(crate) const MIXER_SAMPLE_RATE: u32 = 48_000;
 
-/// Cheap `Copy` handle referencing a decoded audio buffer cached inside [`super::player::AudioPlayer`].
+/// `Copy` handle referencing a decoded audio buffer cached inside [`super::player::AudioPlayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SoundAsset {
     pub id: AssetId,

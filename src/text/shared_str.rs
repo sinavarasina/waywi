@@ -12,7 +12,7 @@ const INLINE_CAP: usize = 22;
 /// - `&'static str`: zero allocations;
 /// - inline stack buffer (up to 22 UTF-8 bytes): zero heap allocations for dynamic short labels
 ///   like `"72%"` or `"12:45"`;
-/// - `Arc<str>`: cheap shared reference counting for longer dynamic strings.
+/// - `Arc<str>`: shared reference counting for longer dynamic strings.
 #[derive(Clone)]
 pub struct SharedStr(SharedStrRepr);
 

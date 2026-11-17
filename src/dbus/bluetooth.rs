@@ -451,7 +451,7 @@ impl DbusClient {
     }
 
     /// Connects a specific Bluetooth profile UUID on `device_path` (`org.bluez.Device1.ConnectProfile`)
-    /// on the Bluetooth device lane without blocking the UI thread.
+    /// on the Bluetooth device lane.
     pub fn connect_bluetooth_device_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
         let dev = validate_object_path(device_path, "Bluetooth device path")?;
         let target = dev.clone();
@@ -497,7 +497,7 @@ impl DbusClient {
     }
 
     /// Disconnects a specific Bluetooth profile UUID on `device_path` (`org.bluez.Device1.DisconnectProfile`)
-    /// on the Bluetooth device lane without blocking the UI thread.
+    /// on the Bluetooth device lane.
     pub fn disconnect_bluetooth_device_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
         let dev = validate_object_path(device_path, "Bluetooth device path")?;
         let target = dev.clone();
@@ -606,7 +606,7 @@ impl DbusClient {
     }
 
     /// Unpairs/removes a Bluetooth device from its adapter (`org.bluez.Adapter1.RemoveDevice`)
-    /// on the Bluetooth adapter lane without blocking the UI thread.
+    /// on the Bluetooth adapter lane.
     pub fn remove_bluetooth_device(&self, adapter_path: &str, device_path: &str) -> Result<()> {
         let adapter = validate_object_path(adapter_path, "adapter path")?;
         let obj = OwnedObjectPath::try_from(device_path.to_owned())

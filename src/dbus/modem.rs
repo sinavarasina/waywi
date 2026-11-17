@@ -180,8 +180,7 @@ impl DbusClient {
         Ok(snap)
     }
 
-    /// Enables or disables a cellular modem via `org.freedesktop.ModemManager1.Modem.Enable`
-    /// without blocking the UI thread.
+    /// Enables or disables a cellular modem via `org.freedesktop.ModemManager1.Modem.Enable`.
     pub fn enable_modem(&self, modem_path: &str, enabled: bool) -> Result<()> {
         let path = validate_object_path(modem_path, "modem object path")?;
         let target = path.clone();

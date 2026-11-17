@@ -262,23 +262,22 @@ impl DbusClient {
         )
     }
 
-    /// Sends left-click `Activate(x, y)` to a tray item without blocking the UI thread.
+    /// Sends left-click `Activate(x, y)` to a tray item.
     pub fn tray_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
         self.call_sni_action(service, "Activate", (x, y))
     }
 
-    /// Sends middle-click `SecondaryActivate(x, y)` to a tray item without blocking the UI thread.
+    /// Sends middle-click `SecondaryActivate(x, y)` to a tray item.
     pub fn tray_secondary_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
         self.call_sni_action(service, "SecondaryActivate", (x, y))
     }
 
-    /// Sends right-click `ContextMenu(x, y)` to a tray item without blocking the UI thread.
+    /// Sends right-click `ContextMenu(x, y)` to a tray item.
     pub fn tray_context_menu(&self, service: &str, x: i32, y: i32) -> Result<()> {
         self.call_sni_action(service, "ContextMenu", (x, y))
     }
 
-    /// Sends `Scroll(delta, orientation)` (`"vertical"` or `"horizontal"`) to a tray item
-    /// without blocking the UI thread.
+    /// Sends `Scroll(delta, orientation)` (`"vertical"` or `"horizontal"`) to a tray item.
     pub fn tray_scroll(&self, service: &str, delta: i32, orientation: &str) -> Result<()> {
         self.call_sni_action(service, "Scroll", (delta, orientation.to_owned()))
     }
@@ -304,8 +303,7 @@ impl DbusClient {
         Ok(root.2.iter().filter_map(parse_dbusmenu_node).collect())
     }
 
-    /// Sends a `com.canonical.dbusmenu.Event` (e.g. `"clicked"` / `"hovered"`) for `item_id`
-    /// without blocking the UI thread.
+    /// Sends a `com.canonical.dbusmenu.Event` (e.g. `"clicked"` / `"hovered"`) for `item_id`.
     pub fn tray_menu_event(
         &self,
         bus_name: &str,

@@ -20,7 +20,7 @@ impl AssetId {
     }
 }
 
-/// Cheap `Copy` handle referencing a preloaded or dynamically loaded image asset in `App`'s
+/// `Copy` handle referencing a preloaded or dynamically loaded image asset in `App`'s
 /// shared decoded cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageAsset {

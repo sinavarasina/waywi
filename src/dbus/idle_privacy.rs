@@ -101,8 +101,7 @@ impl DbusClient {
             .map_err(|e| WaywiError::DbusError(e.to_string()))
     }
 
-    /// Releases a previously acquired `org.freedesktop.ScreenSaver` inhibit cookie without
-    /// blocking the UI thread.
+    /// Releases a previously acquired `org.freedesktop.ScreenSaver` inhibit cookie.
     pub fn uninhibit_screensaver(&self, cookie: u32) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(

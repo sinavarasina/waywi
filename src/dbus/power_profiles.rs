@@ -125,8 +125,7 @@ impl DbusClient {
         )))
     }
 
-    /// Switches the active system power profile (`"power-saver"`, `"balanced"`, `"performance"`)
-    /// without blocking the UI thread.
+    /// Switches the active system power profile (`"power-saver"`, `"balanced"`, `"performance"`).
     pub fn set_power_profile(&self, profile: PowerProfileKind) -> Result<()> {
         let target = profile.as_str().to_owned();
         self.submit_lane_action(
@@ -198,7 +197,7 @@ impl DbusClient {
         )))
     }
 
-    /// Releases a previously acquired power profile hold cookie without blocking the UI thread.
+    /// Releases a previously acquired power profile hold cookie.
     pub fn release_power_profile(&self, cookie: u32) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(

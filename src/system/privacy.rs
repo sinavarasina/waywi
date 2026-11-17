@@ -509,7 +509,7 @@ impl PrivacyMonitor {
         }
     }
 
-    /// Collects the latest aggregated [`PrivacySnapshot`] cleanly without blocking D-Bus I/O.
+    /// Collects the latest aggregated [`PrivacySnapshot`].
     pub fn sample(&mut self) -> PrivacySnapshot {
         self.ensure_started();
         let mut combined: BTreeSet<PrivacyAccessEntry> = BTreeSet::new();

@@ -96,8 +96,7 @@ impl Dbus {
 }
 
 impl DbusClient {
-    /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server
-    /// without blocking the UI thread.
+    /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server.
     pub fn close_notification(&self, id: u32, reason: NotificationCloseReason) -> Result<()> {
         let conn = self.active_notifications_conn()?;
         self.submit_lane_action(
@@ -120,8 +119,7 @@ impl DbusClient {
         )
     }
 
-    /// Emits `org.freedesktop.Notifications.ActionInvoked(id, action_key)` from the active server
-    /// without blocking the UI thread.
+    /// Emits `org.freedesktop.Notifications.ActionInvoked(id, action_key)` from the active server.
     pub fn invoke_notification_action(&self, id: u32, action_key: &str) -> Result<()> {
         let conn = self.active_notifications_conn()?;
         let key = action_key.to_owned();

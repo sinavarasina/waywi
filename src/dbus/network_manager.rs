@@ -248,7 +248,7 @@ impl DbusClient {
     }
 
     /// Enables or disables all NetworkManager networking via `org.freedesktop.NetworkManager.Enable`
-    /// on the NetworkManager lane without blocking the UI thread.
+    /// on the NetworkManager lane.
     pub fn nm_set_networking_enabled(&self, enabled: bool) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(
@@ -273,7 +273,7 @@ impl DbusClient {
     }
 
     /// Triggers an asynchronous Wi-Fi access-point scan on all wireless devices on the
-    /// NetworkManager lane without blocking the UI thread.
+    /// NetworkManager lane.
     pub fn nm_scan_wifi(&self) -> Result<()> {
         self.submit_lane_action(
             LaneActionSpec::fast(
@@ -363,8 +363,8 @@ impl DbusClient {
         self.nm_connect_wifi_with_options(ap, password, false)
     }
 
-    /// Connects to a visible Wi-Fi [`NmAccessPoint`] on the NetworkManager lane without blocking
-    /// the UI thread, optionally pinning activation to `ap.object_path` when `lock_bssid` is `true`.
+    /// Connects to a visible Wi-Fi [`NmAccessPoint`] on the NetworkManager lane, optionally
+    /// pinning activation to `ap.object_path` when `lock_bssid` is `true`.
     pub fn nm_connect_wifi_with_options(
         &self,
         ap: &NmAccessPoint,
@@ -452,7 +452,7 @@ impl DbusClient {
     }
 
     /// Connects to a hidden Wi-Fi network with an explicit [`NmWifiSecurity`] mode (`Open`, `Owe`,
-    /// `WpaPsk`, `Wpa3Sae`, `Wep`) on the NetworkManager lane without blocking the UI thread.
+    /// `WpaPsk`, `Wpa3Sae`, `Wep`) on the NetworkManager lane.
     pub fn nm_connect_hidden_wifi_with_security(
         &self,
         ssid: &str,
@@ -520,7 +520,7 @@ impl DbusClient {
     }
 
     /// Activates an existing saved NetworkManager connection profile (`ActivateConnection`) on the
-    /// NetworkManager lane without blocking the UI thread.
+    /// NetworkManager lane.
     pub fn nm_activate_connection(
         &self,
         connection_path: &str,
@@ -579,7 +579,7 @@ impl DbusClient {
     }
 
     /// Deactivates an active connection by its `ActiveConnection` object path (`DeactivateConnection`)
-    /// on the NetworkManager lane without blocking the UI thread.
+    /// on the NetworkManager lane.
     pub fn nm_deactivate_connection(&self, active_connection_path: &str) -> Result<()> {
         let obj = OwnedObjectPath::try_from(active_connection_path.to_owned())
             .map_err(|e| WaywiError::DbusError(e.to_string()))?;
@@ -637,7 +637,7 @@ impl DbusClient {
     }
 
     /// Deletes/forgets all saved Wi-Fi connection profiles matching `ssid` on the NetworkManager
-    /// lane without blocking the UI thread.
+    /// lane.
     pub fn nm_forget_wifi_ssid(&self, ssid: &str) -> Result<()> {
         if ssid.is_empty() {
             return Err(WaywiError::DbusError("Wi-Fi SSID cannot be empty".into()));
