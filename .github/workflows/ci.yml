@@ -61,3 +61,27 @@ jobs:
 
       - name: Tests (no default features)
         run: cargo test --no-default-features --lib
+
+  miri:
+    name: Miri (unsafe-core unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Targets the modules owning waywi's hand-written unsafe code: the frame
+      # arena (pool/FrameVec/shared_fn), the TLS-backed MemoStore, and SharedStr.
+      - name: Miri (arena + memo + shared_str)
+        run: >
+          cargo +nightly miri test --no-default-features --lib --
+          arena:: render::memo:: text::shared_str::

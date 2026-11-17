@@ -14,6 +14,7 @@
 
 #![warn(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 // Optional process-wide global allocators. Both are compile-time choices made by the final
 // binary (opt-in, non-default; see `docs/integrations.md`), so they replace the system

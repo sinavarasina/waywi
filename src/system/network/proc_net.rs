@@ -298,6 +298,8 @@ fn read_interface_ips() -> HashMap<String, (Option<String>, Option<String>)> {
             let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: `ifa_addr` is checked non-null above and points to a valid `sockaddr`
+            // owned by the `getifaddrs` list, so reading `sa_family` is sound.
             let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
             let entry = map.entry(name).or_default();
             if family == libc::AF_INET && entry.0.is_none() {

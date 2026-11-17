@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
 - Wayland startup roundtrips now propagate disconnect errors instead of silently continuing with an empty state.
 
 ### Changed
+- `#![deny(clippy::undocumented_unsafe_blocks)]` now enforces a `SAFETY:` comment on every `unsafe` block (two missing comments in `arena::shared_fn` and `system::network::proc_net` were added).
+- `MemoStore` memo scopes are no longer re-entrant in a way that resurrected a stale TLS raw pointer after a nested scope (invalid pointer use under Stacked Borrows, caught by Miri); a nested `enter_memo_scope` now simply overwrites the active context and scope exit clears it. Production call sites never nested scopes, so behavior is unchanged. Unit tests were added for `MemoStore` hits/misses, pruning, and scope handling.
+- CI gained a Miri job that runs the arena, memo, and `SharedStr` unit tests under the nightly interpreter to mechanically check the crate's hand-written `unsafe` code.
 - Control socket (`control-ipc`): socket names no longer resolve into a world-writable directory when `$XDG_RUNTIME_DIR` is unset (fallback is `/run/user/<euid>`); the listener only replaces stale socket files owned by the current user (probed with `ECONNREFUSED`), rejects peers with a different UID via `SO_PEERCRED`, and drains newline-terminated commands across chunked writes.
 - DDC/CI: monitor luminance writes are skipped until the bus's monitor has reported its own maximum luminance (previous silent fallback maximum removed).
 - Two internal unit tests added for control-socket chunked-command accumulation and stale-socket replacement.

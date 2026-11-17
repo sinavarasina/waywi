@@ -81,6 +81,8 @@ impl<Arg, Out> FrameSharedFn<Arg, Out> {
                     let next = header.refs.get() - 1;
                     header.refs.set(next);
                     if next == 0 {
+                        // SAFETY: This is the final reference (`next == 0` above), so `F` has not
+                        // been dropped before; the slab keeps the storage alive for the arena.
                         unsafe {
                             std::ptr::drop_in_place(
                                 &raw mut (*ptr.cast::<SharedHeader<F>>().as_ptr()).func,
