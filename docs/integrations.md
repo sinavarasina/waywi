@@ -14,8 +14,6 @@ Optional Linux subsystems are selected at compile time via Cargo features. Missi
 | `image-gif` | No | `gif` | GIF decoder |
 | `image-webp` | No | `image-webp` | Static and animated WebP decoder |
 | `animation` | Yes | - | Frame-clock `SpriteSheet` / `Sprite` playback |
-| `allocator-mimalloc` | No | `mimalloc` | Process-wide mimalloc global allocator (mutually exclusive with `allocator-jemalloc`) |
-| `allocator-jemalloc` | No | `tikv-jemallocator` | Process-wide jemalloc global allocator (mutually exclusive with `allocator-mimalloc`); Linux/BSD/glibc targets |
 | `fractional-scale` | No | `wayland-protocols` | `wp_fractional_scale_v1` + `wp_viewporter` scaling |
 | `clipboard` | No | `wayland-protocols`, `wayland-protocols-wlr` | `ext-data-control-v1` / `zwlr-data-control-v1` clipboard |
 | `idle-notify` | No | `wayland-protocols` | `ext-idle-notify-v1` user/input idle monitor |

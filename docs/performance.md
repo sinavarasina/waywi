@@ -22,29 +22,9 @@ Benchmark harnesses live in `benches/` and run offline over `HeadlessRuntime`:
   - `hit_test_click_dispatch_32_targets`
   - `hit_test_click_dispatch_1000_targets`
 
-Run benchmarks or smoke-check benchmark compilation (`--all-features` is unavailable because the mutually exclusive `allocator-*` features guard each other):
+Run benchmarks or smoke-check benchmark compilation:
 
 ```bash
-cargo bench --features ci-all
-cargo bench --features ci-all -- --test
+cargo bench --all-features
+cargo bench --all-features -- --test
 ```
-
-## Allocators
-
-The global allocator is a compile-time choice of the final binary: `allocator-mimalloc` (mimalloc 0.1.x) or `allocator-jemalloc` (tikv-jemallocator 0.7), both opt-in, non-default, and mutually exclusive. Default stays the system allocator. The per-frame bump arena sits on top of whichever allocator is active, so it needs no changes.
-
-Measured on the `ci-all` feature set (Linux x86_64, criterion, `--sample-size 30 --warm-up-time 1 --measurement-time 3`), change vs. system allocator baseline:
-
-| Benchmark | mimalloc | jemalloc |
-| --- | --- | --- |
-| `render_50_rounded_rects_dirty_one` | -0.8% | -0.1% |
-| `render_50_rounded_rects_memo_hit` | **+16.5%** | +2.7% |
-| `render_1000_rounded_rects_dirty_one` | **-3.1%** | **-2.8%** |
-| `render_1000_rounded_rects_memo_hit` | +5.9% | **+12.6%** |
-| `mvu_dispatch_100_messages_zero_alloc_arena` | +1.3% (n.s.) | +0.9% (n.s.) |
-| `hit_test_click_dispatch_32_targets` | -0.3% (n.s.) | +1.5% (n.s.) |
-| `hit_test_click_dispatch_1000_targets` | +1.5% | +0.1% (n.s.) |
-
-(n.s. = not statistically significant, p > 0.05)
-
-Verdict: a wash for typical widget workloads. Allocation-heavy steady-state rendering (`*_dirty_one`) gains ~3% at best, while memo-hit paths regress up to 16%. The frame arena already removes per-frame allocations, so there is little left for a global allocator to win. Ship the default unless a specific binary profile shows a benefit; the features exist so binaries can opt in when their workload differs.

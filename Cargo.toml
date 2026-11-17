@@ -1,6 +1,6 @@
 [package]
 name = "waywi"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Varasina Farmadani <sina@sinanonym.my.id>"]
@@ -45,8 +45,6 @@ default = [
 ]
 renderer-software = ["dep:tiny-skia"]
 renderer-gpu = ["dep:femtovg", "dep:wgpu", "wayland-client/system", "wayland-client/dlopen"]
-allocator-mimalloc = ["dep:mimalloc"]
-allocator-jemalloc = ["dep:tikv-jemallocator"]
 text = ["dep:cosmic-text", "dep:fontdb"]
 image-png = ["dep:png"]
 image-svg = ["dep:resvg"]
@@ -66,32 +64,6 @@ pipewire = ["dep:pipewire"]
 pulseaudio = ["dep:libpulse-binding"]
 alsa = ["dep:alsa"]
 audio-playback = ["dep:rodio"]
-# Every library feature except the mutually exclusive `allocator-*` selection. Used by CI and
-# local verification; the allocator choice itself is exercised by explicitly enabling either
-# `allocator-mimalloc` or `allocator-jemalloc` on top of `ci-all`.
-ci-all = [
-    "renderer-software",
-    "renderer-gpu",
-    "text",
-    "image-png",
-    "image-svg",
-    "image-gif",
-    "image-webp",
-    "animation",
-    "fractional-scale",
-    "clipboard",
-    "idle-notify",
-    "control-ipc",
-    "hyprland-ipc",
-    "sway-ipc",
-    "dbus",
-    "global-shortcuts",
-    "accessibility",
-    "pipewire",
-    "pulseaudio",
-    "alsa",
-    "audio-playback",
-]
 
 [dependencies]
 bitflags = "2.11"
@@ -100,10 +72,8 @@ calloop = "0.14"
 calloop-wayland-source = "0.4"
 libc = "0.2"
 memmap2 = "0.9"
-mimalloc = { version = "0.1.52", optional = true }
 rustix = { version = "1.0", features = ["fs", "event", "mm", "net", "process"] }
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
-tikv-jemallocator = { version = "0.7", optional = true }
 wayland-client = "0.31"
 xkbcommon = "0.8"
 
