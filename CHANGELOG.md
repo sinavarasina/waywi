@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.6] - 2026-11-17
 
 ### Added
 - Default source (microphone) control in every backend: `set_source_volume_linear`, `set_source_muted`, `toggle_source_mute`, and `select_source` are no longer silently ignored. PulseAudio applies them via `set_source_volume`/`set_source_mute`/`set_default_source`; PipeWire drives the default source node and honors `select_source`; ALSA maps them to the hardware capture element (preferred `Capture`/`Mic`/`Internal Mic`/`Front Mic`/`Headset Mic`/`Input` selem, users can list and select capture elements) with `AudioSnapshot` filled from it. Sink monitors are excluded from PulseAudio source listings.
@@ -10,7 +10,6 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - The ALSA and PulseAudio backends no longer drop `SetSourceVolumeLinear`/`SetSourceMuted`/`ToggleSourceMute`/`SelectSource` commands, which also removes dead-code warnings in non-default feature combinations.
-
 
 ## [0.1.5] - 2026-11-17
 
