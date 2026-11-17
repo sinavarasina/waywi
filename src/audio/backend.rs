@@ -28,11 +28,37 @@ pub(crate) enum AudioCommand {
     SetSourceMuted(bool),
     ToggleSourceMute,
     SelectSource(u32),
+    /// Per-app stream commands are only observed by the PulseAudio and PipeWire backends; the
+    /// ALSA mixer has no per-application routing.
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     SetStreamVolumeLinear(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     SetStreamMuted(u32, bool),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     ToggleStreamMute(u32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     SetCaptureVolumeLinear(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     SetCaptureMuted(u32, bool),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     ToggleCaptureMute(u32),
     Shutdown,
 }
@@ -145,6 +171,10 @@ pub(crate) fn alsa_runtime_available() -> bool {
 /// Resolves the human-readable name of a per-app stream: PulseAudio/PipeWire `application.name`,
 /// falling back to `application.process.binary`, then the raw stream name, then `"unknown"`; blank
 /// candidates are skipped at each step.
+#[cfg_attr(
+    not(any(feature = "pulseaudio", feature = "pipewire")),
+    allow(dead_code)
+)]
 #[must_use]
 pub(crate) fn stream_display_name(
     app_name: Option<&str>,

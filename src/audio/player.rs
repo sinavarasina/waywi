@@ -300,9 +300,13 @@ use std::sync::Condvar;
 #[cfg(not(feature = "audio-playback"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Mixer state shared between the player driver and the native output threads.
+#[cfg(not(feature = "audio-playback"))]
+type SharedMixer = Arc<(Mutex<PolyphonicMixer>, Condvar)>;
+
 #[cfg(not(feature = "audio-playback"))]
 struct NativeDriver {
-    mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>,
+    mixer: SharedMixer,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -313,9 +317,7 @@ impl NativeDriver {
         let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let try_spawn = |name: &'static str,
-                         f: fn(Arc<(Mutex<PolyphonicMixer>, Condvar)>, Arc<AtomicBool>)|
-         -> Option<Self> {
+        let try_spawn = |name: &'static str, f: fn(SharedMixer, Arc<AtomicBool>)| -> Option<Self> {
             let m = Arc::clone(&mixer);
             let s = Arc::clone(&stop);
             thread::Builder::new()
@@ -401,11 +403,7 @@ impl PlaybackDriver for NativeDriver {
     not(feature = "audio-playback"),
     any(feature = "pulseaudio", feature = "alsa")
 ))]
-fn mix_next_chunk(
-    mixer: &Arc<(Mutex<PolyphonicMixer>, Condvar)>,
-    stop: &AtomicBool,
-    out: &mut [f32],
-) -> bool {
+fn mix_next_chunk(mixer: &SharedMixer, stop: &AtomicBool, out: &mut [f32]) -> bool {
     let mut g = mixer.0.lock().unwrap_or_else(|e| e.into_inner());
     g = mixer
         .1
@@ -418,7 +416,7 @@ fn mix_next_chunk(
 }
 
 #[cfg(all(not(feature = "audio-playback"), feature = "pipewire"))]
-fn run_pipewire_playback(mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>, stop: Arc<AtomicBool>) {
+fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     use pipewire as pw;
     use pw::spa;
     use spa::param::ParamType;
@@ -514,7 +512,7 @@ fn run_pipewire_playback(mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>, stop: Ar
 }
 
 #[cfg(all(not(feature = "audio-playback"), feature = "pulseaudio"))]
-fn run_pulse_playback(mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>, stop: Arc<AtomicBool>) {
+fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     use libpulse_binding as pa;
     use pa::mainloop::threaded::Mainloop;
     use pa::sample::{Format, Spec};
@@ -590,7 +588,7 @@ fn run_pulse_playback(mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>, stop: Arc<A
 }
 
 #[cfg(all(not(feature = "audio-playback"), feature = "alsa"))]
-fn run_alsa_playback(mixer: Arc<(Mutex<PolyphonicMixer>, Condvar)>, stop: Arc<AtomicBool>) {
+fn run_alsa_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     use alsa::pcm::{Access, Format, HwParams, PCM};
     use alsa::{Direction, ValueOr};
 
