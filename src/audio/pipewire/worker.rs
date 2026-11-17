@@ -18,8 +18,8 @@ use spa::param::ParamType;
 use spa::pod::Pod;
 use spa::sys as spa_sys;
 
-use crate::audio::backend::{AudioCommand, SharedAudioState};
-use crate::audio::types::{AudioDevice, AudioEvent, AudioSnapshot};
+use crate::audio::backend::{AudioCommand, SharedAudioState, stream_display_name};
+use crate::audio::types::{AudioCapture, AudioDevice, AudioEvent, AudioSnapshot, AudioStream};
 
 use super::pod::{
     build_mute_pod, build_route_mute_pod, build_route_volume_pod, build_volume_pod, escape_json,
@@ -39,6 +39,39 @@ struct AudioNodeRecord {
     muted: bool,
 }
 
+/// Direction of a per-application stream node (`Stream/Output/Audio` plays back,
+/// `Stream/Input/Audio` records).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamClass {
+    Playback,
+    Capture,
+}
+
+/// Classifies a PipeWire `media.class` value into a stream direction; only audio streams,
+/// matching either exact nodes or suffixed subclasses, are accepted.
+fn classify_media_class(class: &str) -> Option<StreamClass> {
+    if class.starts_with("Stream/Output/Audio") {
+        Some(StreamClass::Playback)
+    } else if class.starts_with("Stream/Input/Audio") {
+        Some(StreamClass::Capture)
+    } else {
+        None
+    }
+}
+
+/// Per-application stream node (`Stream/*/Audio`); volume and mute live on the node Props.
+#[derive(Debug, Clone)]
+struct AudioStreamRecord {
+    id: u32,
+    name: String,
+    binary: Option<String>,
+    target_id: Option<u32>,
+    channels: usize,
+    raw_volume: f32,
+    muted: bool,
+    playback: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DeviceRouteRecord {
     index: i32,
@@ -50,6 +83,7 @@ struct DeviceRouteRecord {
 struct WorkerState {
     sinks: BTreeMap<u32, AudioNodeRecord>,
     sources: BTreeMap<u32, AudioNodeRecord>,
+    streams: BTreeMap<u32, AudioStreamRecord>,
     default_sink_name: Option<String>,
     default_source_name: Option<String>,
     last_snapshot: Option<AudioSnapshot>,
@@ -101,11 +135,44 @@ fn summarize_nodes(
 }
 
 impl WorkerState {
+    fn stream_lists(&self) -> (Vec<AudioStream>, Vec<AudioCapture>) {
+        let mut streams = Vec::new();
+        let mut captures = Vec::new();
+        for rec in self.streams.values() {
+            let linear = raw_to_linear(rec.raw_volume);
+            let db = raw_to_db(rec.raw_volume);
+            if rec.playback {
+                streams.push(AudioStream {
+                    id: rec.id,
+                    name: rec.name.clone(),
+                    binary: rec.binary.clone(),
+                    sink_id: rec.target_id,
+                    linear,
+                    db,
+                    muted: rec.muted,
+                });
+            } else {
+                captures.push(AudioCapture {
+                    id: rec.id,
+                    name: rec.name.clone(),
+                    binary: rec.binary.clone(),
+                    source_id: rec.target_id,
+                    linear,
+                    db,
+                    muted: rec.muted,
+                });
+            }
+        }
+        (streams, captures)
+    }
+
     fn compute_snapshot(&self) -> Option<AudioSnapshot> {
         let (devices, linear, db, muted, default_sink) =
             summarize_nodes(&self.sinks, self.default_sink_name.as_deref());
         let (sources, source_linear, source_db, source_muted, default_source) =
             summarize_nodes(&self.sources, self.default_source_name.as_deref());
+
+        let (streams, captures) = self.stream_lists();
 
         Some(AudioSnapshot {
             linear,
@@ -118,6 +185,8 @@ impl WorkerState {
             source_muted,
             default_source,
             sources,
+            streams,
+            captures,
         })
     }
 
@@ -230,6 +299,53 @@ impl WorkerState {
             let json = format!("{{\"name\":\"{}\"}}", escape_json(&rec.name));
             meta.set_property(0, meta_key, Some("Spa:String:JSON"), Some(&json));
         }
+    }
+
+    /// Sends a Props update carrying either a volume or a mute value to a per-app stream node;
+    /// unknown stream IDs are no-ops.
+    fn set_stream_volume(&self, id: u32, level: f32) {
+        let Some(rec) = self.streams.get(&id) else {
+            return;
+        };
+        if let Some(bytes) = build_volume_pod(level, rec.channels.max(1))
+            && let Some(pod) = Pod::from_bytes(&bytes)
+            && let Some(node) = self.nodes.get(&id)
+        {
+            node.set_param(ParamType::Props, 0, pod);
+        }
+    }
+
+    fn set_stream_muted(&self, id: u32, muted: bool) {
+        if let Some(bytes) = build_mute_pod(muted)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+            && let Some(node) = self.nodes.get(&id)
+            && self.streams.contains_key(&id)
+        {
+            node.set_param(ParamType::Props, 0, pod);
+        }
+    }
+
+    fn insert_stream_record(
+        &mut self,
+        id: u32,
+        name: String,
+        binary: Option<String>,
+        target_id: Option<u32>,
+        playback: bool,
+    ) {
+        self.streams.insert(
+            id,
+            AudioStreamRecord {
+                id,
+                name,
+                binary,
+                target_id,
+                channels: 2,
+                raw_volume: 1.0,
+                muted: false,
+                playback,
+            },
+        );
     }
 }
 
@@ -352,6 +468,30 @@ fn run_single_pw_session(
         }
         AudioCommand::SelectSource(id) => {
             state_cmd.borrow().select_default_node(true, id);
+        }
+        AudioCommand::SetStreamVolumeLinear(id, level) => {
+            state_cmd.borrow().set_stream_volume(id, level);
+        }
+        AudioCommand::SetStreamMuted(id, muted) => {
+            state_cmd.borrow().set_stream_muted(id, muted);
+        }
+        AudioCommand::ToggleStreamMute(id) => {
+            let st = state_cmd.borrow();
+            if let Some(rec) = st.streams.get(&id) {
+                st.set_stream_muted(id, !rec.muted);
+            }
+        }
+        AudioCommand::SetCaptureVolumeLinear(id, level) => {
+            state_cmd.borrow().set_stream_volume(id, level);
+        }
+        AudioCommand::SetCaptureMuted(id, muted) => {
+            state_cmd.borrow().set_stream_muted(id, muted);
+        }
+        AudioCommand::ToggleCaptureMute(id) => {
+            let st = state_cmd.borrow();
+            if let Some(rec) = st.streams.get(&id) {
+                st.set_stream_muted(id, !rec.muted);
+            }
         }
         AudioCommand::Shutdown => {
             if let Some(ml) = main_loop_cmd.upgrade() {
@@ -651,6 +791,88 @@ fn run_single_pw_session(
                     entry.push(Box::new(listener));
                     entry.push(Box::new(proxy_listener));
                 }
+                ObjectType::Node
+                    if classify_media_class(props.get("media.class").unwrap_or_default())
+                        .is_some() =>
+                {
+                    let playback =
+                        classify_media_class(props.get("media.class").unwrap_or_default())
+                            == Some(StreamClass::Playback);
+                    let Ok(node): std::result::Result<Node, _> = registry.bind(obj) else {
+                        return;
+                    };
+                    let id = obj.id;
+                    let name = stream_display_name(
+                        props.get("application.name"),
+                        props.get("application.process.binary"),
+                        Some(props.get("node.name").unwrap_or("stream")),
+                    );
+                    let binary = props.get("application.process.binary").map(str::to_string);
+                    let target_id = props
+                        .get("node.target")
+                        .or_else(|| props.get("target.node"))
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<u32>().ok());
+
+                    {
+                        let mut st = state_global.borrow_mut();
+                        st.insert_stream_record(id, name, binary, target_id, playback);
+                        st.publish_if_changed(&shared_global);
+                    }
+
+                    let state_param = Rc::clone(&state_global);
+                    let shared_param = Arc::clone(&shared_global);
+                    let listener = node
+                        .add_listener_local()
+                        .param(move |_seq, param_id, _index, _next, param| {
+                            if param_id != ParamType::Props {
+                                return;
+                            }
+                            let Some(pod) = param else {
+                                return;
+                            };
+                            if let Some((channels, raw_vol, muted)) =
+                                parse_props_pod(pod.as_bytes())
+                            {
+                                let mut st = state_param.borrow_mut();
+                                if let Some(rec) = st.streams.get_mut(&id) {
+                                    if let Some(ch) = channels {
+                                        rec.channels = ch;
+                                    }
+                                    if let Some(vol) = raw_vol {
+                                        rec.raw_volume = vol;
+                                    }
+                                    if let Some(m) = muted {
+                                        rec.muted = m;
+                                    }
+                                }
+                                st.publish_if_changed(&shared_param);
+                            }
+                        })
+                        .register();
+
+                    node.subscribe_params(&[ParamType::Props]);
+                    node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
+
+                    let state_removed = Rc::downgrade(&state_global);
+                    let proxy_listener: ProxyListener = node
+                        .upcast_ref()
+                        .add_listener_local()
+                        .removed(move || {
+                            if let Some(st_rc) = state_removed.upgrade() {
+                                let mut st = st_rc.borrow_mut();
+                                st.nodes.remove(&id);
+                                st.listeners.remove(&id);
+                            }
+                        })
+                        .register();
+
+                    let mut st = state_global.borrow_mut();
+                    st.nodes.insert(id, node);
+                    let entry = st.listeners.entry(id).or_default();
+                    entry.push(Box::new(listener));
+                    entry.push(Box::new(proxy_listener));
+                }
                 _ => {}
             }
         })
@@ -658,6 +880,7 @@ fn run_single_pw_session(
             let mut st = state_remove.borrow_mut();
             let removed_sink = st.sinks.remove(&id).is_some();
             let removed_source = st.sources.remove(&id).is_some();
+            let removed_stream = st.streams.remove(&id).is_some();
             if st
                 .default_metadata
                 .as_ref()
@@ -674,7 +897,7 @@ fn run_single_pw_session(
                     guard.push_event(AudioEvent::DeviceRemoved(id));
                 }
                 st.publish_if_changed(&shared_remove);
-            } else if removed_source {
+            } else if removed_source || removed_stream {
                 st.publish_if_changed(&shared_remove);
             }
         })
@@ -687,7 +910,35 @@ fn run_single_pw_session(
     st.nodes.clear();
     st.devices.clear();
     st.device_routes.clear();
+    st.streams.clear();
     st.listeners.clear();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamClass;
+    use super::classify_media_class;
+
+    #[test]
+    fn classify_media_class_accepts_audio_playback_streams_only() {
+        assert_eq!(
+            classify_media_class("Stream/Output/Audio"),
+            Some(StreamClass::Playback)
+        );
+        assert_eq!(
+            classify_media_class("Stream/Input/Audio"),
+            Some(StreamClass::Capture)
+        );
+    }
+
+    #[test]
+    fn classify_media_class_rejects_non_audio_nodes() {
+        assert_eq!(classify_media_class("Audio/Sink"), None);
+        assert_eq!(classify_media_class("Audio/Source"), None);
+        assert_eq!(classify_media_class("Stream/Output/Video"), None);
+        assert_eq!(classify_media_class("Stream/Input/Video"), None);
+        assert_eq!(classify_media_class(""), None);
+    }
 }

@@ -17,7 +17,7 @@ use crate::error::{Result, WaywiError};
 use super::backend::{
     AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, update_snapshot,
 };
-use super::types::{AudioDevice, AudioEvent, AudioSnapshot};
+use super::types::{AudioCapture, AudioDevice, AudioEvent, AudioSnapshot, AudioStream};
 
 #[derive(Debug, Clone)]
 struct PulseSinkRecord {
@@ -30,11 +30,27 @@ struct PulseSinkRecord {
     muted: bool,
 }
 
+/// Per-application stream record shared by sink inputs (playback) and source outputs (capture);
+/// `target_id` is the sink / source index the stream is attached to.
+#[derive(Debug, Clone)]
+struct PulseStreamRecord {
+    id: u32,
+    name: String,
+    binary: Option<String>,
+    target_id: u32,
+    channels: u8,
+    volume_linear: f32,
+    db: Option<f32>,
+    muted: bool,
+}
+
 enum PulseWorkerMsg {
     StateChanged,
     Refresh,
     ServerInfo(Option<String>),
     SinkBatch { sinks: Vec<PulseSinkRecord> },
+    SinkInputBatch { inputs: Vec<PulseStreamRecord> },
+    SourceOutputBatch { outputs: Vec<PulseStreamRecord> },
     Cmd(AudioCommand),
 }
 
@@ -101,6 +117,8 @@ fn run_pulse_worker(
     let mut last_snapshot: Option<AudioSnapshot> = None;
     let mut default_sink_name: Option<String> = None;
     let mut sinks: BTreeMap<u32, PulseSinkRecord> = BTreeMap::new();
+    let mut sink_inputs: BTreeMap<u32, PulseStreamRecord> = BTreeMap::new();
+    let mut source_outputs: BTreeMap<u32, PulseStreamRecord> = BTreeMap::new();
 
     while !stop_flag.load(Ordering::Acquire) {
         let Ok(msg) = rx.recv() else {
@@ -128,8 +146,13 @@ fn run_pulse_worker(
                             ctx.set_subscribe_callback(Some(Box::new(move |_, _, _| {
                                 let _ = tx_sub.send(PulseWorkerMsg::Refresh);
                             })));
-                            let _op = ctx
-                                .subscribe(InterestMaskSet::SINK | InterestMaskSet::SERVER, |_| {});
+                            let _op = ctx.subscribe(
+                                InterestMaskSet::SINK
+                                    | InterestMaskSet::SERVER
+                                    | InterestMaskSet::SINK_INPUT
+                                    | InterestMaskSet::SOURCE_OUTPUT,
+                                |_| {},
+                            );
                             ml.unlock();
                         }
                         request_refresh(&mut ml, &ctx, &tx);
@@ -151,20 +174,70 @@ fn run_pulse_worker(
             }
             PulseWorkerMsg::ServerInfo(name) => {
                 default_sink_name = name;
-                publish_pulse_snapshot(&shared, &mut last_snapshot, &default_sink_name, &sinks);
+                publish_pulse_snapshot(
+                    &shared,
+                    &mut last_snapshot,
+                    &default_sink_name,
+                    &sinks,
+                    &sink_inputs,
+                    &source_outputs,
+                );
             }
             PulseWorkerMsg::SinkBatch { sinks: batch } => {
                 sinks.clear();
                 for rec in batch {
                     sinks.insert(rec.id, rec);
                 }
-                publish_pulse_snapshot(&shared, &mut last_snapshot, &default_sink_name, &sinks);
+                publish_pulse_snapshot(
+                    &shared,
+                    &mut last_snapshot,
+                    &default_sink_name,
+                    &sinks,
+                    &sink_inputs,
+                    &source_outputs,
+                );
+            }
+            PulseWorkerMsg::SinkInputBatch { inputs: batch } => {
+                sink_inputs.clear();
+                for rec in batch {
+                    sink_inputs.insert(rec.id, rec);
+                }
+                publish_pulse_snapshot(
+                    &shared,
+                    &mut last_snapshot,
+                    &default_sink_name,
+                    &sinks,
+                    &sink_inputs,
+                    &source_outputs,
+                );
+            }
+            PulseWorkerMsg::SourceOutputBatch { outputs: batch } => {
+                source_outputs.clear();
+                for rec in batch {
+                    source_outputs.insert(rec.id, rec);
+                }
+                publish_pulse_snapshot(
+                    &shared,
+                    &mut last_snapshot,
+                    &default_sink_name,
+                    &sinks,
+                    &sink_inputs,
+                    &source_outputs,
+                );
             }
             PulseWorkerMsg::Cmd(cmd) => {
                 if !ready {
                     continue;
                 }
-                apply_pulse_command(&mut ml, &mut ctx, cmd, &default_sink_name, &sinks);
+                apply_pulse_command(
+                    &mut ml,
+                    &mut ctx,
+                    cmd,
+                    &default_sink_name,
+                    &sinks,
+                    &sink_inputs,
+                    &source_outputs,
+                );
             }
         }
     }
@@ -201,14 +274,7 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                 .filter(|s| !s.is_empty())
                 .unwrap_or(name)
                 .to_owned();
-            let avg = sink.volume.avg();
-            let linear = VolumeLinear::from(avg).0.max(0.0) as f32;
-            let raw_db = VolumeDB::from(avg).0 as f32;
-            let db = if raw_db.is_finite() {
-                Some(raw_db)
-            } else {
-                None
-            };
+            let (linear, db) = pulse_volume_parts(&sink.volume);
             if let Ok(mut list) = collected_cb.lock() {
                 list.push(PulseSinkRecord {
                     id: sink.index,
@@ -230,6 +296,56 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
         ListResult::Error => {}
     });
 
+    let collected_inputs = Arc::new(Mutex::new(Vec::<PulseStreamRecord>::new()));
+    let collected_inputs_cb = Arc::clone(&collected_inputs);
+    let tx_inputs = tx.clone();
+    let _input_op = introspect.get_sink_input_info_list(move |res| match res {
+        ListResult::Item(info) => {
+            if let Ok(mut list) = collected_inputs_cb.lock() {
+                list.push(pulse_stream_record(
+                    info.index,
+                    &info.proplist,
+                    info.name.as_deref(),
+                    info.sink,
+                    &info.volume,
+                    info.mute,
+                ));
+            }
+        }
+        ListResult::End => {
+            if let Ok(mut list) = collected_inputs_cb.lock() {
+                let inputs = std::mem::take(&mut *list);
+                let _ = tx_inputs.send(PulseWorkerMsg::SinkInputBatch { inputs });
+            }
+        }
+        ListResult::Error => {}
+    });
+
+    let collected_outputs = Arc::new(Mutex::new(Vec::<PulseStreamRecord>::new()));
+    let collected_outputs_cb = Arc::clone(&collected_outputs);
+    let tx_outputs = tx.clone();
+    let _output_op = introspect.get_source_output_info_list(move |res| match res {
+        ListResult::Item(info) => {
+            if let Ok(mut list) = collected_outputs_cb.lock() {
+                list.push(pulse_stream_record(
+                    info.index,
+                    &info.proplist,
+                    info.name.as_deref(),
+                    info.source,
+                    &info.volume,
+                    info.mute,
+                ));
+            }
+        }
+        ListResult::End => {
+            if let Ok(mut list) = collected_outputs_cb.lock() {
+                let outputs = std::mem::take(&mut *list);
+                let _ = tx_outputs.send(PulseWorkerMsg::SourceOutputBatch { outputs });
+            }
+        }
+        ListResult::Error => {}
+    });
+
     ml.unlock();
 }
 
@@ -239,17 +355,20 @@ fn apply_pulse_command(
     cmd: AudioCommand,
     default_sink_name: &Option<String>,
     sinks: &BTreeMap<u32, PulseSinkRecord>,
+    sink_inputs: &BTreeMap<u32, PulseStreamRecord>,
+    source_outputs: &BTreeMap<u32, PulseStreamRecord>,
 ) {
     let target = resolve_target_sink(default_sink_name.as_deref(), sinks);
     ml.lock();
     match cmd {
         AudioCommand::SetVolumeLinear(linear) => {
             if let Some(sink) = target {
-                let mut cv = ChannelVolumes::default();
-                let vol = Volume::from(VolumeLinear(f64::from(linear.clamp(0.0, 1.5))));
-                cv.set(sink.channels.max(1), vol);
                 let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_volume_by_name(&sink.name, &cv, None);
+                let _op = introspect.set_sink_volume_by_name(
+                    &sink.name,
+                    &pulse_channel_volumes(sink.channels, linear),
+                    None,
+                );
             }
         }
         AudioCommand::SetMuted(muted) => {
@@ -269,6 +388,50 @@ fn apply_pulse_command(
                 let _op = ctx.set_default_sink(&sink.name, |_| {});
             }
         }
+        AudioCommand::SetStreamVolumeLinear(id, linear) => {
+            if let Some(rec) = sink_inputs.get(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_sink_input_volume(
+                    id,
+                    &pulse_channel_volumes(rec.channels, linear),
+                    None,
+                );
+            }
+        }
+        AudioCommand::SetStreamMuted(id, muted) => {
+            if sink_inputs.contains_key(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_sink_input_mute(id, muted, None);
+            }
+        }
+        AudioCommand::ToggleStreamMute(id) => {
+            if let Some(rec) = sink_inputs.get(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_sink_input_mute(id, !rec.muted, None);
+            }
+        }
+        AudioCommand::SetCaptureVolumeLinear(id, linear) => {
+            if let Some(rec) = source_outputs.get(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_source_output_volume(
+                    id,
+                    &pulse_channel_volumes(rec.channels, linear),
+                    None,
+                );
+            }
+        }
+        AudioCommand::SetCaptureMuted(id, muted) => {
+            if source_outputs.contains_key(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_source_output_mute(id, muted, None);
+            }
+        }
+        AudioCommand::ToggleCaptureMute(id) => {
+            if let Some(rec) = source_outputs.get(&id) {
+                let mut introspect = ctx.introspect();
+                let _op = introspect.set_source_output_mute(id, !rec.muted, None);
+            }
+        }
         AudioCommand::SetSourceVolumeLinear(_)
         | AudioCommand::SetSourceMuted(_)
         | AudioCommand::ToggleSourceMute
@@ -276,6 +439,13 @@ fn apply_pulse_command(
         | AudioCommand::Shutdown => {}
     }
     ml.unlock();
+}
+
+fn pulse_channel_volumes(channels: u8, linear: f32) -> ChannelVolumes {
+    let mut cv = ChannelVolumes::default();
+    let vol = Volume::from(VolumeLinear(f64::from(linear.clamp(0.0, 1.5))));
+    cv.set(channels.max(1), vol);
+    cv
 }
 
 fn resolve_target_sink<'a>(
@@ -287,11 +457,49 @@ fn resolve_target_sink<'a>(
         .or_else(|| sinks.values().next())
 }
 
+fn pulse_volume_parts(volume: &ChannelVolumes) -> (f32, Option<f32>) {
+    let avg = volume.avg();
+    let raw_db = VolumeDB::from(avg).0 as f32;
+    (
+        VolumeLinear::from(avg).0.max(0.0) as f32,
+        raw_db.is_finite().then_some(raw_db),
+    )
+}
+
+fn pulse_stream_record(
+    id: u32,
+    proplist: &pa::proplist::Proplist,
+    stream_name: Option<&str>,
+    target_id: u32,
+    volume: &ChannelVolumes,
+    muted: bool,
+) -> PulseStreamRecord {
+    let app_name = proplist.get_str("application.name");
+    let binary = proplist.get_str("application.process.binary");
+    let (volume_linear, db) = pulse_volume_parts(volume);
+    PulseStreamRecord {
+        id,
+        name: super::backend::stream_display_name(
+            app_name.as_deref(),
+            binary.as_deref(),
+            stream_name,
+        ),
+        binary,
+        target_id,
+        channels: volume.len().max(1),
+        volume_linear,
+        db,
+        muted,
+    }
+}
+
 fn publish_pulse_snapshot(
     shared: &Arc<Mutex<SharedAudioState>>,
     last_snapshot: &mut Option<AudioSnapshot>,
     default_sink_name: &Option<String>,
     sinks: &BTreeMap<u32, PulseSinkRecord>,
+    sink_inputs: &BTreeMap<u32, PulseStreamRecord>,
+    source_outputs: &BTreeMap<u32, PulseStreamRecord>,
 ) {
     let devices: Vec<AudioDevice> = sinks
         .values()
@@ -299,6 +507,31 @@ fn publish_pulse_snapshot(
             id: s.id,
             name: s.name.clone(),
             description: s.description.clone(),
+        })
+        .collect();
+
+    let streams: Vec<AudioStream> = sink_inputs
+        .values()
+        .map(|rec| AudioStream {
+            id: rec.id,
+            name: rec.name.clone(),
+            binary: rec.binary.clone(),
+            sink_id: Some(rec.target_id),
+            linear: rec.volume_linear,
+            db: rec.db,
+            muted: rec.muted,
+        })
+        .collect();
+    let captures: Vec<AudioCapture> = source_outputs
+        .values()
+        .map(|rec| AudioCapture {
+            id: rec.id,
+            name: rec.name.clone(),
+            binary: rec.binary.clone(),
+            source_id: Some(rec.target_id),
+            linear: rec.volume_linear,
+            db: rec.db,
+            muted: rec.muted,
         })
         .collect();
 
@@ -314,11 +547,15 @@ fn publish_pulse_snapshot(
                 description: sink.description.clone(),
             }),
             devices,
+            streams,
+            captures,
             ..AudioSnapshot::default()
         }
     } else {
         AudioSnapshot {
             devices,
+            streams,
+            captures,
             ..AudioSnapshot::default()
         }
     };

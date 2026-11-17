@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Per-application audio streams: `AudioSnapshot` now carries `streams` (playback, PulseAudio sink inputs / PipeWire `Stream/Output/Audio`) and `captures` (recording, source outputs / `Stream/Input/Audio`) with app name, binary, output binding, volume (linear + dB), and mute; `AudioStream`/`AudioCapture` types and `stream_percent`/`capture_percent` helpers were added. `AudioClient` gained matching controls (`set_stream_volume_linear`, `set_stream_muted`, `toggle_stream_mute`, and the `capture_*` set); unknown stream IDs are ignored so stale commands from ended streams stay harmless. Pipewire and PulseAudio backends implement streams; the ALSA fallback keeps an empty stream list (hardware mixer only).
+
+## [0.1.5] - 2026-11-17
+
 ### Removed
 - `allocator-mimalloc` and `allocator-jemalloc` (and the `ci-all` meta-feature that existed to work around their mutual exclusion). Measured impact on widget workloads was neutral-to-negative (memo-hit paths regressed up to 16%), while the frame arena already removes most per-frame allocations; the allocator choice returns to being fully owned by the final binary via `#[global_allocator]`, unaffected by waywi.
 

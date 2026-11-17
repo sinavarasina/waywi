@@ -157,6 +157,48 @@ impl AudioClient {
         self.send_command(AudioCommand::SelectSource(id))
     }
 
+    /// Sets the linear volume multiplier on a playback stream (clamped to `[0.0, 1.5]`).
+    ///
+    /// Unknown stream IDs are silently ignored: the stream may have ended between the snapshot
+    /// and this command.
+    pub fn set_stream_volume_linear(&self, id: u32, level: f32) -> Result<()> {
+        self.send_command(AudioCommand::SetStreamVolumeLinear(
+            id,
+            level.clamp(0.0, 1.5),
+        ))
+    }
+
+    /// Sets mute state on a playback stream; unknown stream IDs are ignored.
+    pub fn set_stream_muted(&self, id: u32, muted: bool) -> Result<()> {
+        self.send_command(AudioCommand::SetStreamMuted(id, muted))
+    }
+
+    /// Toggles mute state on a playback stream; unknown stream IDs are ignored.
+    pub fn toggle_stream_mute(&self, id: u32) -> Result<()> {
+        self.send_command(AudioCommand::ToggleStreamMute(id))
+    }
+
+    /// Sets the linear volume multiplier on a capture stream (clamped to `[0.0, 1.5]`).
+    ///
+    /// Unknown stream IDs are silently ignored: the stream may have ended between the snapshot
+    /// and this command.
+    pub fn set_capture_volume_linear(&self, id: u32, level: f32) -> Result<()> {
+        self.send_command(AudioCommand::SetCaptureVolumeLinear(
+            id,
+            level.clamp(0.0, 1.5),
+        ))
+    }
+
+    /// Sets mute state on a capture stream; unknown stream IDs are ignored.
+    pub fn set_capture_muted(&self, id: u32, muted: bool) -> Result<()> {
+        self.send_command(AudioCommand::SetCaptureMuted(id, muted))
+    }
+
+    /// Toggles mute state on a capture stream; unknown stream IDs are ignored.
+    pub fn toggle_capture_mute(&self, id: u32) -> Result<()> {
+        self.send_command(AudioCommand::ToggleCaptureMute(id))
+    }
+
     fn send_command(&self, cmd: AudioCommand) -> Result<()> {
         self.ensure_started();
         let guard = self

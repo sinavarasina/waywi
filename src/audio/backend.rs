@@ -15,6 +15,9 @@ use crate::error::Result;
 use super::types::{AudioEvent, AudioSnapshot};
 
 /// Commands sent from [`super::AudioClient`] to the active audio backend worker.
+///
+/// Per-app stream commands carry the stream ID directly (sink input / source output index on
+/// PulseAudio, node ID on PipeWire); unknown IDs are no-ops so stale UI commands stay harmless.
 #[derive(Debug, Clone)]
 pub(crate) enum AudioCommand {
     SetVolumeLinear(f32),
@@ -25,6 +28,12 @@ pub(crate) enum AudioCommand {
     SetSourceMuted(bool),
     ToggleSourceMute,
     SelectSource(u32),
+    SetStreamVolumeLinear(u32, f32),
+    SetStreamMuted(u32, bool),
+    ToggleStreamMute(u32),
+    SetCaptureVolumeLinear(u32, f32),
+    SetCaptureMuted(u32, bool),
+    ToggleCaptureMute(u32),
     Shutdown,
 }
 
@@ -133,6 +142,23 @@ pub(crate) fn alsa_runtime_available() -> bool {
     std::path::Path::new("/dev/snd").exists()
 }
 
+/// Resolves the human-readable name of a per-app stream: PulseAudio/PipeWire `application.name`,
+/// falling back to `application.process.binary`, then the raw stream name, then `"unknown"`; blank
+/// candidates are skipped at each step.
+#[must_use]
+pub(crate) fn stream_display_name(
+    app_name: Option<&str>,
+    binary: Option<&str>,
+    stream_name: Option<&str>,
+) -> String {
+    let candidate = app_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| binary.map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| stream_name.map(str::trim).filter(|s| !s.is_empty()));
+    candidate.unwrap_or("unknown").to_owned()
+}
+
 /// Selects the highest-priority audio backend enabled by Cargo features and live session sockets.
 #[must_use]
 pub(crate) fn default_backend() -> Box<dyn AudioBackend> {
@@ -166,5 +192,129 @@ pub(crate) fn default_backend() -> Box<dyn AudioBackend> {
     ))]
     {
         Box::new(super::alsa::AlsaBackend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioCommand, stream_display_name};
+
+    #[test]
+    fn stream_display_name_prefers_app_then_binary_then_stream_name() {
+        assert_eq!(
+            stream_display_name(Some("Firefox"), Some("firefox"), Some("Firefox input")),
+            "Firefox"
+        );
+        assert_eq!(
+            stream_display_name(None, Some("spotify"), Some("Spotify")),
+            "spotify"
+        );
+        assert_eq!(
+            stream_display_name(None, None, Some("PulseAudio volume control")),
+            "PulseAudio volume control"
+        );
+        assert_eq!(stream_display_name(None, None, None), "unknown");
+        assert_eq!(stream_display_name(Some("  "), None, Some("node")), "node");
+    }
+
+    #[test]
+    fn stream_commands_clone_with_values() {
+        let cmds = [
+            AudioCommand::SetStreamVolumeLinear(7, 0.5),
+            AudioCommand::SetStreamMuted(7, true),
+            AudioCommand::ToggleStreamMute(7),
+            AudioCommand::SetCaptureVolumeLinear(9, 1.5),
+            AudioCommand::SetCaptureMuted(9, true),
+            AudioCommand::ToggleCaptureMute(9),
+        ];
+        let cloned = cmds.clone();
+        assert!(matches!(
+            cloned[0],
+            AudioCommand::SetStreamVolumeLinear(id, v) if id == 7 && (v - 0.5).abs() < 1e-6
+        ));
+        assert!(matches!(
+            cloned[1],
+            AudioCommand::SetStreamMuted(id, m) if id == 7 && m
+        ));
+        assert!(matches!(cloned[2], AudioCommand::ToggleStreamMute(7)));
+        assert!(matches!(
+            cloned[3],
+            AudioCommand::SetCaptureVolumeLinear(id, v) if id == 9 && (v - 1.5).abs() < 1e-6
+        ));
+        assert!(matches!(
+            cloned[4],
+            AudioCommand::SetCaptureMuted(id, m) if id == 9 && m
+        ));
+        assert!(matches!(cloned[5], AudioCommand::ToggleCaptureMute(9)));
+    }
+}
+
+#[cfg(any(feature = "pulseaudio", feature = "alsa"))]
+#[cfg(test)]
+mod snapshot_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{SharedAudioState, update_snapshot};
+    use crate::audio::types::{AudioDevice, AudioEvent, AudioSnapshot, AudioStream};
+
+    fn snapshot_with_stream(id: u32, linear: f32) -> AudioSnapshot {
+        AudioSnapshot {
+            devices: vec![AudioDevice {
+                id: 1,
+                name: "alsa_output.pci".into(),
+                description: "Built-in".into(),
+            }],
+            default_sink: None,
+            streams: vec![AudioStream {
+                id,
+                name: "Firefox".into(),
+                binary: Some("firefox".into()),
+                sink_id: Some(1),
+                linear,
+                db: None,
+                muted: false,
+            }],
+            ..AudioSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn update_snapshot_emits_updated_on_stream_volume_change_only() {
+        let shared = Arc::new(Mutex::new(SharedAudioState::default()));
+        let mut last = None;
+
+        let first = snapshot_with_stream(3, 1.0);
+        update_snapshot(&shared, &mut last, first);
+        let guard = shared.lock().unwrap();
+        assert!(matches!(
+            guard.pending_events[0],
+            AudioEvent::DeviceAdded(_)
+        ));
+        assert!(matches!(
+            guard.pending_events.back(),
+            Some(AudioEvent::Updated(_))
+        ));
+        assert_eq!(guard.pending_events.len(), 2);
+        drop(guard);
+
+        let second = snapshot_with_stream(3, 0.5);
+        update_snapshot(&shared, &mut last, second);
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.pending_events.len(), 3);
+        match guard.pending_events.back() {
+            Some(AudioEvent::Updated(snap)) => assert!((snap.streams[0].linear - 0.5).abs() < 1e-6),
+            other => panic!("expected Updated event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_snapshot_skips_identical_stream_snapshots() {
+        let shared = Arc::new(Mutex::new(SharedAudioState::default()));
+        let mut last = None;
+
+        update_snapshot(&shared, &mut last, snapshot_with_stream(3, 1.0));
+        update_snapshot(&shared, &mut last, snapshot_with_stream(3, 1.0));
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.pending_events.len(), 2);
     }
 }

@@ -270,6 +270,12 @@ fn apply_alsa_command(selem: &Selem<'_>, cmd: AudioCommand) {
         | AudioCommand::SetSourceMuted(_)
         | AudioCommand::ToggleSourceMute
         | AudioCommand::SelectSource(_)
+        | AudioCommand::SetStreamVolumeLinear(..)
+        | AudioCommand::SetStreamMuted(..)
+        | AudioCommand::ToggleStreamMute(_)
+        | AudioCommand::SetCaptureVolumeLinear(..)
+        | AudioCommand::SetCaptureMuted(..)
+        | AudioCommand::ToggleCaptureMute(_)
         | AudioCommand::Shutdown => {}
     }
 }
