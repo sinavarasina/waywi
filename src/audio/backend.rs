@@ -168,6 +168,84 @@ pub(crate) fn alsa_runtime_available() -> bool {
     std::path::Path::new("/dev/snd").exists()
 }
 
+/// Normalized per-application stream metadata extracted identically across audio backends.
+#[cfg_attr(
+    not(any(feature = "pulseaudio", feature = "pipewire")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamMetadata {
+    pub(crate) name: String,
+    pub(crate) binary: Option<String>,
+    pub(crate) icon_name: Option<String>,
+    pub(crate) app_id: Option<String>,
+}
+
+impl StreamMetadata {
+    /// Lazily resolves display name, binary, icon hint, and app ID from a property lookup function
+    /// without evaluating fallback keys once a higher-priority non-empty value is found.
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    pub(crate) fn extract<S: AsRef<str>>(
+        stream_name: Option<&str>,
+        mut get_prop: impl FnMut(&str) -> Option<S>,
+    ) -> Self {
+        let app_name = get_prop("application.name");
+        let binary = first_non_empty_prop_by(&["application.process.binary"], &mut get_prop);
+        let name = stream_display_name(
+            app_name.as_ref().map(AsRef::as_ref),
+            binary.as_deref(),
+            stream_name,
+        );
+        let icon_name = first_non_empty_prop_by(
+            &["application.icon_name", "application.icon-name"],
+            &mut get_prop,
+        );
+        let app_id = first_non_empty_prop_by(
+            &["application.id", "pipewire.access.portal.app_id"],
+            &mut get_prop,
+        );
+        Self {
+            name,
+            binary,
+            icon_name,
+            app_id,
+        }
+    }
+}
+
+/// Returns the first trimmed, non-empty property string yielded by lazily querying `keys`.
+#[cfg_attr(
+    not(any(feature = "pulseaudio", feature = "pipewire")),
+    allow(dead_code)
+)]
+#[must_use]
+pub(crate) fn first_non_empty_prop_by<S: AsRef<str>>(
+    keys: &[&str],
+    mut get_prop: impl FnMut(&str) -> Option<S>,
+) -> Option<String> {
+    keys.iter().find_map(|&key| {
+        let val = get_prop(key)?;
+        let trimmed = val.as_ref().trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+/// Returns the first trimmed, non-empty property string from `candidates`.
+#[must_use]
+pub(crate) fn first_non_empty_prop<'a>(
+    candidates: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Resolves the human-readable name of a per-app stream: PulseAudio/PipeWire `application.name`,
 /// falling back to `application.process.binary`, then the raw stream name, then `"unknown"`; blank
 /// candidates are skipped at each step.
@@ -181,12 +259,7 @@ pub(crate) fn stream_display_name(
     binary: Option<&str>,
     stream_name: Option<&str>,
 ) -> String {
-    let candidate = app_name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| binary.map(str::trim).filter(|s| !s.is_empty()))
-        .or_else(|| stream_name.map(str::trim).filter(|s| !s.is_empty()));
-    candidate.unwrap_or("unknown").to_owned()
+    first_non_empty_prop([app_name, binary, stream_name]).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Selects the highest-priority audio backend enabled by Cargo features and live session sockets.
@@ -227,7 +300,7 @@ pub(crate) fn default_backend() -> Box<dyn AudioBackend> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioCommand, stream_display_name};
+    use super::{AudioCommand, StreamMetadata, first_non_empty_prop_by, stream_display_name};
 
     #[test]
     fn stream_display_name_prefers_app_then_binary_then_stream_name() {
@@ -245,6 +318,45 @@ mod tests {
         );
         assert_eq!(stream_display_name(None, None, None), "unknown");
         assert_eq!(stream_display_name(Some("  "), None, Some("node")), "node");
+    }
+
+    #[test]
+    fn stream_metadata_extract_short_circuits_and_normalizes_props() {
+        let mut queried: Vec<String> = Vec::new();
+        let meta = StreamMetadata::extract(Some("raw-node"), |key| {
+            queried.push(key.to_owned());
+            match key {
+                "application.name" => Some("  Mozilla Firefox  "),
+                "application.process.binary" => Some("firefox"),
+                "application.icon_name" => Some(" firefox "),
+                "application.id" => Some("org.mozilla.firefox"),
+                _ => unreachable!("fallback key `{key}` should not be queried once primary hit"),
+            }
+        });
+        assert_eq!(meta.name, "Mozilla Firefox");
+        assert_eq!(meta.binary.as_deref(), Some("firefox"));
+        assert_eq!(meta.icon_name.as_deref(), Some("firefox"));
+        assert_eq!(meta.app_id.as_deref(), Some("org.mozilla.firefox"));
+        assert_eq!(
+            queried,
+            vec![
+                "application.name",
+                "application.process.binary",
+                "application.icon_name",
+                "application.id",
+            ]
+        );
+
+        // Blank primary properties fall back cleanly to dashed / portal keys.
+        let fallback = first_non_empty_prop_by(
+            &["application.icon_name", "application.icon-name"],
+            |k| match k {
+                "application.icon_name" => Some("   "),
+                "application.icon-name" => Some("spotify-client"),
+                _ => None,
+            },
+        );
+        assert_eq!(fallback.as_deref(), Some("spotify-client"));
     }
 
     #[test]
@@ -299,6 +411,8 @@ mod snapshot_tests {
                 id,
                 name: "Firefox".into(),
                 binary: Some("firefox".into()),
+                icon_name: None,
+                app_id: None,
                 sink_id: Some(1),
                 linear,
                 db: None,

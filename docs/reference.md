@@ -179,7 +179,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 ## Audio (`audio`)
 
 - **Audio mixer (`pipewire`, `pulseaudio`, or `alsa`)**:
-  - `AudioDevice`, `AudioSnapshot` (`percent()`, `source_percent()`), `AudioEvent`.
+  - `AudioDevice`, `AudioStream` (`id`, `name`, `binary`, `icon_name`, `app_id`, `sink_id`, `linear`, `db`, `muted`), `AudioCapture` (`id`, `name`, `binary`, `icon_name`, `app_id`, `source_id`, `linear`, `db`, `muted`), `AudioSnapshot` (`percent()`, `source_percent()`), `AudioEvent`.
   - `Audio::subscribe(map)`, `Audio::subscribe_events(map)`.
   - `AudioClient` (`new`, `snapshot`, `set_volume_linear`, `set_muted`, `toggle_mute`, `select_device`, `set_source_volume_linear`, `set_source_muted`, `toggle_source_mute`, `select_source`).
 - **Audio playback (`audio-playback` or native backend)**:

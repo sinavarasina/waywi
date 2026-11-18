@@ -13,8 +13,14 @@ pub struct AudioDevice {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioStream {
     pub id: u32,
+    /// Human-readable application/stream name (`application.name` -> binary -> raw node name).
     pub name: String,
+    /// Executable binary name (`application.process.binary`), when reported.
     pub binary: Option<String>,
+    /// XDG / theme icon hint (`application.icon_name` or `application.icon-name`), when reported.
+    pub icon_name: Option<String>,
+    /// Application / Flatpak portal identifier (`application.id` or `pipewire.access.portal.app_id`), when reported.
+    pub app_id: Option<String>,
     pub sink_id: Option<u32>,
     pub linear: f32,
     pub db: Option<f32>,
@@ -26,8 +32,14 @@ pub struct AudioStream {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioCapture {
     pub id: u32,
+    /// Human-readable application/stream name (`application.name` -> binary -> raw node name).
     pub name: String,
+    /// Executable binary name (`application.process.binary`), when reported.
     pub binary: Option<String>,
+    /// XDG / theme icon hint (`application.icon_name` or `application.icon-name`), when reported.
+    pub icon_name: Option<String>,
+    /// Application / Flatpak portal identifier (`application.id` or `pipewire.access.portal.app_id`), when reported.
+    pub app_id: Option<String>,
     pub source_id: Option<u32>,
     pub linear: f32,
     pub db: Option<f32>,
@@ -140,6 +152,8 @@ mod tests {
                 id: 3,
                 name: "Firefox".into(),
                 binary: None,
+                icon_name: None,
+                app_id: None,
                 sink_id: None,
                 linear: 0.5,
                 db: None,
@@ -149,6 +163,8 @@ mod tests {
                 id: 5,
                 name: "Recorder".into(),
                 binary: Some("rec".into()),
+                icon_name: None,
+                app_id: None,
                 source_id: None,
                 linear: 0.75,
                 db: None,

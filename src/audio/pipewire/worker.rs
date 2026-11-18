@@ -18,7 +18,7 @@ use spa::param::ParamType;
 use spa::pod::Pod;
 use spa::sys as spa_sys;
 
-use crate::audio::backend::{AudioCommand, SharedAudioState, stream_display_name};
+use crate::audio::backend::{AudioCommand, SharedAudioState, StreamMetadata};
 use crate::audio::types::{AudioCapture, AudioDevice, AudioEvent, AudioSnapshot, AudioStream};
 
 use super::pod::{
@@ -65,6 +65,8 @@ struct AudioStreamRecord {
     id: u32,
     name: String,
     binary: Option<String>,
+    icon_name: Option<String>,
+    app_id: Option<String>,
     target_id: Option<u32>,
     channels: usize,
     raw_volume: f32,
@@ -146,6 +148,8 @@ impl WorkerState {
                     id: rec.id,
                     name: rec.name.clone(),
                     binary: rec.binary.clone(),
+                    icon_name: rec.icon_name.clone(),
+                    app_id: rec.app_id.clone(),
                     sink_id: rec.target_id,
                     linear,
                     db,
@@ -156,6 +160,8 @@ impl WorkerState {
                     id: rec.id,
                     name: rec.name.clone(),
                     binary: rec.binary.clone(),
+                    icon_name: rec.icon_name.clone(),
+                    app_id: rec.app_id.clone(),
                     source_id: rec.target_id,
                     linear,
                     db,
@@ -328,8 +334,7 @@ impl WorkerState {
     fn insert_stream_record(
         &mut self,
         id: u32,
-        name: String,
-        binary: Option<String>,
+        meta: StreamMetadata,
         target_id: Option<u32>,
         playback: bool,
     ) {
@@ -337,8 +342,10 @@ impl WorkerState {
             id,
             AudioStreamRecord {
                 id,
-                name,
-                binary,
+                name: meta.name,
+                binary: meta.binary,
+                icon_name: meta.icon_name,
+                app_id: meta.app_id,
                 target_id,
                 channels: 2,
                 raw_volume: 1.0,
@@ -802,28 +809,63 @@ fn run_single_pw_session(
                         return;
                     };
                     let id = obj.id;
-                    let name = stream_display_name(
-                        props.get("application.name"),
-                        props.get("application.process.binary"),
+                    let meta = StreamMetadata::extract(
                         Some(props.get("node.name").unwrap_or("stream")),
+                        |k| props.get(k),
                     );
-                    let binary = props.get("application.process.binary").map(str::to_string);
-                    let target_id = props
-                        .get("node.target")
-                        .or_else(|| props.get("target.node"))
-                        .and_then(|s| s.split_whitespace().next())
-                        .and_then(|s| s.parse::<u32>().ok());
+                    let target_id = parse_stream_target_id(props);
 
                     {
                         let mut st = state_global.borrow_mut();
-                        st.insert_stream_record(id, name, binary, target_id, playback);
+                        st.insert_stream_record(id, meta, target_id, playback);
                         st.publish_if_changed(&shared_global);
                     }
 
+                    let state_info = Rc::clone(&state_global);
+                    let shared_info = Arc::clone(&shared_global);
                     let state_param = Rc::clone(&state_global);
                     let shared_param = Arc::clone(&shared_global);
                     let listener = node
                         .add_listener_local()
+                        .info(move |info| {
+                            let Some(info_props) = info.props() else {
+                                return;
+                            };
+                            let next_meta =
+                                StreamMetadata::extract(info_props.get("node.name"), |k| {
+                                    info_props.get(k)
+                                });
+                            let next_target = parse_stream_target_id(info_props);
+                            let mut st = state_info.borrow_mut();
+                            let Some(rec) = st.streams.get_mut(&id) else {
+                                return;
+                            };
+                            let mut changed = false;
+                            if next_meta.name != "unknown" && rec.name != next_meta.name {
+                                rec.name = next_meta.name;
+                                changed = true;
+                            }
+                            if next_meta.binary.is_some() && rec.binary != next_meta.binary {
+                                rec.binary = next_meta.binary;
+                                changed = true;
+                            }
+                            if next_meta.icon_name.is_some() && rec.icon_name != next_meta.icon_name
+                            {
+                                rec.icon_name = next_meta.icon_name;
+                                changed = true;
+                            }
+                            if next_meta.app_id.is_some() && rec.app_id != next_meta.app_id {
+                                rec.app_id = next_meta.app_id;
+                                changed = true;
+                            }
+                            if next_target.is_some() && rec.target_id != next_target {
+                                rec.target_id = next_target;
+                                changed = true;
+                            }
+                            if changed {
+                                st.publish_if_changed(&shared_info);
+                            }
+                        })
                         .param(move |_seq, param_id, _index, _next, param| {
                             if param_id != ParamType::Props {
                                 return;
@@ -914,6 +956,14 @@ fn run_single_pw_session(
     st.listeners.clear();
 
     Ok(())
+}
+
+fn parse_stream_target_id(props: &spa::utils::dict::DictRef) -> Option<u32> {
+    props
+        .get("node.target")
+        .or_else(|| props.get("target.node"))
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u32>().ok())
 }
 
 #[cfg(test)]

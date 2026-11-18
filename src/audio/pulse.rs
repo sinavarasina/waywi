@@ -38,6 +38,8 @@ struct PulseStreamRecord {
     id: u32,
     name: String,
     binary: Option<String>,
+    icon_name: Option<String>,
+    app_id: Option<String>,
     target_id: u32,
     channels: u8,
     volume_linear: f32,
@@ -80,6 +82,8 @@ impl PulseRecordState {
                 id: rec.id,
                 name: rec.name.clone(),
                 binary: rec.binary.clone(),
+                icon_name: rec.icon_name.clone(),
+                app_id: rec.app_id.clone(),
                 sink_id: Some(rec.target_id),
                 linear: rec.volume_linear,
                 db: rec.db,
@@ -93,6 +97,8 @@ impl PulseRecordState {
                 id: rec.id,
                 name: rec.name.clone(),
                 binary: rec.binary.clone(),
+                icon_name: rec.icon_name.clone(),
+                app_id: rec.app_id.clone(),
                 source_id: Some(rec.target_id),
                 linear: rec.volume_linear,
                 db: rec.db,
@@ -598,17 +604,14 @@ fn pulse_stream_record(
     volume: &ChannelVolumes,
     muted: bool,
 ) -> PulseStreamRecord {
-    let app_name = proplist.get_str("application.name");
-    let binary = proplist.get_str("application.process.binary");
+    let meta = super::backend::StreamMetadata::extract(stream_name, |k| proplist.get_str(k));
     let (volume_linear, db) = pulse_volume_parts(volume);
     PulseStreamRecord {
         id,
-        name: super::backend::stream_display_name(
-            app_name.as_deref(),
-            binary.as_deref(),
-            stream_name,
-        ),
-        binary,
+        name: meta.name,
+        binary: meta.binary,
+        icon_name: meta.icon_name,
+        app_id: meta.app_id,
         target_id,
         channels: volume.len().max(1),
         volume_linear,
