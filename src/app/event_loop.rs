@@ -19,6 +19,8 @@ use crate::effect::{AsyncAssetWorker, BoxedMsgFactory, EffectCtx};
 use crate::error::{Result, WaywiError};
 use crate::geometry::{LogicalSize, Point, ScaleFactor};
 use crate::reconcile::{Reconciler, RetainedSurfaceKey};
+#[cfg(feature = "text")]
+use crate::render::RenderBackend;
 use crate::render::{ActiveRenderer, MemoStore, RendererPreference};
 use crate::system::SystemProviders;
 use crate::timer::TimerScheduler;
@@ -204,6 +206,15 @@ impl<M: Clone + 'static> LoopRuntime<M> {
                             entries: Vec<(String, Vec<u8>)>| {
             wl.set_clipboard_selection(sel, entries, qh_ref)
         };
+        #[cfg(feature = "text")]
+        let frame_seq = self.reconciler.frame_seq;
+        #[cfg(feature = "text")]
+        let mut measure_cursor = |content: &crate::text::SharedStr,
+                                  style: crate::text::TextMeasureStyle<'_>,
+                                  cursor_byte: usize| {
+            self.renderer
+                .measure_text_cursor(content, style, cursor_byte, frame_seq)
+        };
         let res = {
             let mut ctx = EffectCtx {
                 quit_requested: &mut self.quit_requested,
@@ -231,6 +242,8 @@ impl<M: Clone + 'static> LoopRuntime<M> {
                 dbus: &self.dbus_client,
                 #[cfg(feature = "clipboard")]
                 clipboard_writer: Some(&mut set_clip),
+                #[cfg(feature = "text")]
+                text_cursor_measurer: &mut measure_cursor,
             };
             f(&mut ctx)
         };

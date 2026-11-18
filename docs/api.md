@@ -24,7 +24,7 @@ Implement `Application`:
 
 - Surfaces: `Surface::floating` (widget bounds), `Surface::panel` (edge-anchored with `.exclusive_zone(...)`), `Surface::overlay` (full-output layer), `Surface::window` (`xdg_toplevel`), `Surface::memo`.
 - Containers & primitives: `Row`, `Column`, `Group`, `Clip`, `Rect`, `Text`, `Image`, `Sprite`, `Canvas`, `Element::memo`.
-- Event hooks: `.on_click(...)`, `.on_hover(...)`, `.on_leave(...)`, `.on_scroll(...)`, `.on_pointer_down(...)`, `.on_pointer_up(...)`, `.on_pointer_move(...)`, `.on_key(...)`, plus optional `.on_click_sound(...)` / `.on_hover_sound(...)`.
+- Event hooks: `.on_click(...)`, `.on_hover(...)`, `.on_leave(...)`, `.on_scroll(...)`, `.on_pointer_down(...)`, `.on_pointer_up(...)`, `.on_pointer_move(...)`, `.on_key(...)`, `.ime(...)` / `.on_ime(...)`, plus optional `.on_click_sound(...)` / `.on_hover_sound(...)`, and headless `TextInputState` / `ScrollState` controllers (pairable with `ctx.measure_text_cursor(...)` for proportional cursor placement).
 - Accessibility hooks: `.accessible_role(...)`, `.accessible_label(...)`, `.accessible_description(...)`, `.accessible_value(...)`, `.accessible_hidden(...)`.
 - Composition: components use `.map(...)` on elements, surfaces, and subscriptions to lift child messages.
 

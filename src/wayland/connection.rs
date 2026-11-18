@@ -49,6 +49,8 @@ pub(crate) struct WaylandState {
     pub(crate) idle: crate::wayland::idle::WaylandIdleState,
     #[cfg(feature = "clipboard")]
     pub(crate) clipboard: crate::wayland::clipboard::WaylandClipboardState,
+    #[cfg(feature = "ime")]
+    pub(crate) ime: crate::wayland::ime::WaylandImeState,
 
     pub(crate) outputs: Vec<OutputInfo>,
     pub(crate) output_handles: HashMap<crate::display::OutputId, wl_output::WlOutput>,
@@ -101,6 +103,8 @@ impl WaylandState {
         let idle = crate::wayland::idle::WaylandIdleState::bind(&globals, &qh);
         #[cfg(feature = "clipboard")]
         let clipboard = crate::wayland::clipboard::WaylandClipboardState::bind(&globals, &qh);
+        #[cfg(feature = "ime")]
+        let ime = crate::wayland::ime::WaylandImeState::bind(&globals, &qh);
 
         let output_state = OutputState::new(&globals, &qh);
         let seat_state = SeatState::new(&globals, &qh);
@@ -122,6 +126,8 @@ impl WaylandState {
             idle,
             #[cfg(feature = "clipboard")]
             clipboard,
+            #[cfg(feature = "ime")]
+            ime,
             outputs: Vec::new(),
             output_handles: HashMap::new(),
             surfaces: HashMap::new(),
@@ -147,6 +153,13 @@ impl WaylandState {
         queue.roundtrip(&mut state).map_err(|e| {
             WaywiError::WaylandConnection(format!("second wayland roundtrip failed: {e}"))
         })?;
+        #[cfg(feature = "ime")]
+        {
+            let seats: Vec<_> = state.seat_state.seats().collect();
+            for seat in seats {
+                state.ime.add_seat(&seat, &qh);
+            }
+        }
         state.refresh_outputs();
 
         Ok((state, queue, qh))
@@ -218,6 +231,10 @@ impl WaylandState {
         caps.set(Capability::Clipboard, self.clipboard.is_supported());
         #[cfg(not(feature = "clipboard"))]
         caps.set(Capability::Clipboard, false);
+        #[cfg(feature = "ime")]
+        caps.set(Capability::TextInput, self.ime.is_supported());
+        #[cfg(not(feature = "ime"))]
+        caps.set(Capability::TextInput, false);
         #[cfg(feature = "pipewire")]
         caps.set(
             Capability::PipeWire,
@@ -348,6 +365,20 @@ impl WaylandState {
         Ok(())
     }
 
+    #[cfg(feature = "ime")]
+    pub(crate) fn sync_ime_for_surface(
+        &mut self,
+        key: RetainedSurfaceKey,
+        cfg: &crate::input::ImeConfig,
+    ) {
+        let Some(wl_id) = self.surfaces.get(&key).map(|s| s.wl_surface_id.clone()) else {
+            return;
+        };
+        if self.ime.sync_surface(&wl_id, cfg) {
+            self.commit_if_configured(key);
+        }
+    }
+
     pub(crate) fn update_surface_spec(
         &mut self,
         key: RetainedSurfaceKey,
@@ -362,7 +393,14 @@ impl WaylandState {
                 SurfaceRole::Xdg(window) => apply_xdg_spec(window, spec),
             }
             surf.spec = spec.clone();
+            let wl_id = surf.wl_surface_id.clone();
             surf.role.wl_surface().commit();
+            #[cfg(feature = "ime")]
+            if self.ime.sync_surface(&wl_id, &spec.ime) {
+                self.commit_if_configured(key);
+            }
+            #[cfg(not(feature = "ime"))]
+            let _ = wl_id;
         }
         Ok(())
     }
@@ -370,6 +408,8 @@ impl WaylandState {
     pub(crate) fn destroy_surface(&mut self, key: RetainedSurfaceKey) {
         if let Some(mut surf) = self.surfaces.remove(&key) {
             self.surface_by_obj.remove(&surf.wl_surface_id);
+            #[cfg(feature = "ime")]
+            self.ime.clear_surface(&surf.wl_surface_id);
             if self.focused_keyboard_surface == Some(key) {
                 self.focused_keyboard_surface = None;
             }

@@ -126,6 +126,18 @@ impl RenderBackend for GpuRenderer {
         }
     }
 
+    #[cfg(feature = "text")]
+    fn measure_text_cursor(
+        &mut self,
+        content: &SharedStr,
+        style: TextMeasureStyle<'_>,
+        cursor_byte: usize,
+        frame_seq: u64,
+    ) -> crate::text::TextCursorMetrics {
+        self.text_engine
+            .measure_text_cursor(content, style, cursor_byte, frame_seq)
+    }
+
     fn render_argb8888(
         &mut self,
         dst_argb: &mut [u8],

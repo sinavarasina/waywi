@@ -62,6 +62,8 @@ pub enum Capability {
     Clipboard,
     /// Wayland `ext-idle-notify-v1` user idle monitor (`idle-notify` feature + compositor support).
     IdleNotify,
+    /// Wayland `zwp_text_input_manager_v3` IME composition and preedit support (`ime` feature + compositor support).
+    TextInput,
     /// Active seat XKB keyboard layout inspection.
     KeyboardLayout,
 }

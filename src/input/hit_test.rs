@@ -55,14 +55,21 @@ impl<M: 'static> HitTestNode<M> {
     }
 }
 
-/// Hit-tests surface-local `point` against retained nodes, returning the topmost hit node and
-/// element-local coordinates.
-pub(crate) fn hit_test<M: 'static>(
+/// Hit-tests surface-local `point` against retained nodes matching `predicate`, returning the
+/// topmost hit node and element-local coordinates.
+pub(crate) fn hit_test_where<M: 'static, F>(
     nodes: &[HitTestNode<M>],
     point: Point,
-) -> Option<(&HitTestNode<M>, Point)> {
+    mut predicate: F,
+) -> Option<(&HitTestNode<M>, Point)>
+where
+    F: FnMut(&HitTestNode<M>) -> bool,
+{
     let mut best: Option<((i32, usize), &HitTestNode<M>, Point)> = None;
     for node in nodes {
+        if !predicate(node) {
+            continue;
+        }
         if let Some(local) = node.contains_surface_point(point) {
             let rank = (node.z_index, node.paint_order);
             if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
@@ -71,4 +78,21 @@ pub(crate) fn hit_test<M: 'static>(
         }
     }
     best.map(|(_, node, local)| (node, local))
+}
+
+/// Hit-tests surface-local `point` against retained nodes, returning the topmost hit node and
+/// element-local coordinates.
+pub(crate) fn hit_test<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    hit_test_where(nodes, point, |_| true)
+}
+
+/// Hit-tests surface-local `point` against retained nodes that bind `on_scroll`.
+pub(crate) fn hit_test_scroll<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    hit_test_where(nodes, point, |n| n.handlers.on_scroll.is_some())
 }

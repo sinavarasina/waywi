@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::app::subscription_mgr::LoopInbox;
 use crate::geometry::{LogicalPx, Point};
-use crate::input::{Key, KeyEvent, Modifiers, MouseButton, ScrollEvent, hit_test};
+use crate::input::{Key, KeyEvent, Modifiers, MouseButton, ScrollEvent};
 use crate::reconcile::{PointerDispatch, RetainedSurfaceKey};
 use crate::wayland::{WaylandEvent, WaylandState};
 
@@ -112,14 +112,12 @@ fn dispatch_touch_tap<M: Clone + 'static>(
 fn dispatch_scroll<M: Clone + 'static>(
     rt: &LoopRuntime<M>,
     key: RetainedSurfaceKey,
-    mut event: ScrollEvent,
+    event: ScrollEvent,
 ) {
     if let Some(surf) = rt.reconciler.surfaces.get(&key)
-        && let Some((node, local)) = hit_test(&surf.hit_nodes, event.position)
-        && let Some(ref on_scroll) = node.handlers.on_scroll
+        && let Some(msg) = surf.dispatch_scroll_at(event)
     {
-        event.local_position = local;
-        push_message(&rt.inbox, on_scroll.call(event));
+        push_message(&rt.inbox, msg);
     }
 }
 
@@ -324,6 +322,20 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
             #[cfg(feature = "clipboard")]
             WaylandEvent::Clipboard(clip_ev) => {
                 dispatch_clipboard_event(rt, clip_ev);
+            }
+            #[cfg(feature = "ime")]
+            WaylandEvent::Ime { key, event } => {
+                if matches!(event, crate::input::ImeEvent::Enter)
+                    && let Some(surf) = rt.reconciler.surfaces.get(&key)
+                {
+                    wl.sync_ime_for_surface(key, &surf.spec.ime);
+                }
+                if let Some(surf) = rt.reconciler.surfaces.get(&key)
+                    && let Some(ref on_ime) = surf.on_ime
+                    && let Some(msg) = on_ime.call(event)
+                {
+                    push_message(&rt.inbox, msg);
+                }
             }
         }
     }

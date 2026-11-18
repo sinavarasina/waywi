@@ -108,6 +108,21 @@ impl RenderBackend for ActiveRenderer {
         }
     }
 
+    #[cfg(feature = "text")]
+    fn measure_text_cursor(
+        &mut self,
+        content: &SharedStr,
+        style: TextMeasureStyle<'_>,
+        cursor_byte: usize,
+        frame_seq: u64,
+    ) -> crate::text::TextCursorMetrics {
+        match self {
+            Self::Software(r) => r.measure_text_cursor(content, style, cursor_byte, frame_seq),
+            #[cfg(feature = "renderer-gpu")]
+            Self::Gpu(r) => r.measure_text_cursor(content, style, cursor_byte, frame_seq),
+        }
+    }
+
     fn render_argb8888(
         &mut self,
         dst_argb: &mut [u8],

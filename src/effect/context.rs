@@ -14,6 +14,13 @@ use super::worker::{AsyncAssetWorker, BoxedAssetCallback, BoxedMsgFactory};
 pub(crate) type ClipboardSetter<'a> =
     &'a mut dyn FnMut(crate::clipboard::ClipboardSelection, Vec<(String, Vec<u8>)>) -> Result<()>;
 
+#[cfg(feature = "text")]
+pub(crate) type TextCursorMeasurer<'a> = &'a mut dyn FnMut(
+    &crate::text::SharedStr,
+    crate::text::TextMeasureStyle<'_>,
+    usize,
+) -> crate::text::TextCursorMetrics;
+
 /// Runtime context passed into `Application::init` and `Application::update`.
 ///
 /// Gives controlled, feature- and capability-honest access to app shutdown, output discovery,
@@ -46,6 +53,8 @@ pub struct EffectCtx<'a> {
     pub(crate) dbus: &'a crate::dbus::DbusClient,
     #[cfg(feature = "clipboard")]
     pub(crate) clipboard_writer: Option<ClipboardSetter<'a>>,
+    #[cfg(feature = "text")]
+    pub(crate) text_cursor_measurer: TextCursorMeasurer<'a>,
 }
 
 impl<'a> EffectCtx<'a> {
@@ -421,6 +430,40 @@ impl<'a> EffectCtx<'a> {
             return Err(WaywiError::UnsupportedCapability(Capability::Clipboard));
         };
         writer(selection, entries)
+    }
+
+    #[cfg(feature = "text")]
+    /// Measures shaped text bounds and exact cursor `(x, y)` coordinates at `cursor_byte`
+    /// using the default typography line height (`1.25`) and left alignment matching [`crate::text::Text::new`].
+    pub fn measure_text_cursor(
+        &mut self,
+        text: &str,
+        font: &crate::text::Font,
+        font_size: crate::geometry::LogicalPx,
+        cursor_byte: usize,
+    ) -> crate::text::TextCursorMetrics {
+        let style = crate::text::TextMeasureStyle {
+            font_size,
+            line_height_multiplier: 1.25,
+            max_width: None,
+            font,
+            align: crate::text::TextAlign::Left,
+        };
+        let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
+        (self.text_cursor_measurer)(&shared, style, cursor_byte)
+    }
+
+    /// Measures shaped text bounds and exact cursor `(x, y)` coordinates with full [`crate::text::TextLayoutOptions`].
+    #[cfg(feature = "text")]
+    pub fn measure_text_cursor_with(
+        &mut self,
+        text: &str,
+        options: &crate::text::TextLayoutOptions,
+        cursor_byte: usize,
+    ) -> crate::text::TextCursorMetrics {
+        let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
+        let style = crate::text::TextMeasureStyle::from_options(options);
+        (self.text_cursor_measurer)(&shared, style, cursor_byte)
     }
 
     fn write_clipboard_entries(

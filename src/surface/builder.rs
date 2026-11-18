@@ -2,7 +2,7 @@ use crate::accessibility::{AccessibleProps, AccessibleRole};
 use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
 use crate::geometry::{Edges, Length, LogicalPx, Size};
-use crate::input::{ElementKey, KeyEvent, PointerEvent};
+use crate::input::{ElementKey, ImeConfig, ImeEvent, KeyEvent, PointerEvent};
 use crate::render::{Color, Element, check_memo, set_memo_surface_hash};
 use crate::text::SharedStr;
 
@@ -32,6 +32,8 @@ pub struct Surface<M = ()> {
     pub(crate) children: FrameVec<Element<M>>,
     pub(crate) on_close: Option<M>,
     pub(crate) on_key: Option<FrameSharedFn<KeyEvent, Option<M>>>,
+    pub(crate) ime: ImeConfig,
+    pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) memo_hit: bool,
@@ -85,6 +87,8 @@ impl<M: 'static> Surface<M> {
             children: FrameVec::new(),
             on_close: None,
             on_key: None,
+            ime: ImeConfig::disabled(),
+            on_ime: None,
             on_pointer_move: None,
             on_pointer_up: None,
             memo_hit: false,
@@ -250,6 +254,21 @@ impl<M: 'static> Surface<M> {
         self
     }
 
+    /// Configures Wayland IME (`zwp_text_input_v3`) state and hints for this surface.
+    pub fn ime(mut self, config: ImeConfig) -> Self {
+        self.ime = config;
+        self
+    }
+
+    /// Subscribes to Wayland IME events (`Enter`, `Leave`, atomic `Update`) for this surface.
+    pub fn on_ime<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(ImeEvent) -> Option<M> + 'static,
+    {
+        self.on_ime = Some(FrameSharedFn::new(handler));
+        self
+    }
+
     pub fn on_pointer_move<F>(mut self, handler: F) -> Self
     where
         F: Fn(PointerEvent) -> Option<M> + 'static,
@@ -287,6 +306,7 @@ impl<M: 'static> Surface<M> {
             mapped_children.push(child.map_with(&mapper));
         }
         let on_key = map_opt(self.on_key, &mapper);
+        let on_ime = map_opt(self.on_ime, &mapper);
         let on_pointer_move = map_opt(self.on_pointer_move, &mapper);
         let on_pointer_up = map_opt(self.on_pointer_up, &mapper);
         Surface {
@@ -308,6 +328,8 @@ impl<M: 'static> Surface<M> {
             children: mapped_children,
             on_close: self.on_close.map(|m| mapper.call(m)),
             on_key,
+            ime: self.ime,
+            on_ime,
             on_pointer_move,
             on_pointer_up,
             memo_hit: self.memo_hit,

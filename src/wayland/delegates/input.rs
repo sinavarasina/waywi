@@ -19,7 +19,12 @@ impl SeatHandler for WaylandState {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        #[cfg(feature = "ime")]
+        self.ime.add_seat(&seat, qh);
+        #[cfg(not(feature = "ime"))]
+        let _ = (qh, seat);
+    }
 
     fn new_capability(
         &mut self,
@@ -81,7 +86,11 @@ impl SeatHandler for WaylandState {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        #[cfg(feature = "ime")]
+        self.ime.remove_seat(&seat);
+        #[cfg(not(feature = "ime"))]
+        let _ = seat;
     }
 }
 

@@ -22,8 +22,10 @@ pub use crate::geometry::{
 pub use crate::idle::{Idle, IdleEvent};
 pub use crate::image::{Image, ImageAsset, ImageFit};
 pub use crate::input::{
-    ElementKey, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout, KeyboardLayoutInfo,
-    Modifiers, MouseButton, PointerEvent, ScrollEvent, TouchEvent,
+    ElementKey, ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit,
+    ImeSurroundingText, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout,
+    KeyboardLayoutInfo, Modifiers, MouseButton, PointerEvent, ScrollEvent, ScrollState,
+    TextInputOutcome, TextInputState, TouchEvent,
 };
 pub use crate::render::{
     Align, Border, Canvas, Clip, Color, Column, CornerRadius, Element, Group, Painter, PathBuilder,
@@ -42,7 +44,9 @@ pub use crate::system::{
     PrivacyAccessSource, PrivacySnapshot, RateUnit, SnapshotState, System, TimeFormat,
     TimeSnapshot,
 };
-pub use crate::text::{Font, FontStyle, FontWeight, SharedStr, Text, TextAlign};
+pub use crate::text::{
+    Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextCursorMetrics, TextLayoutOptions,
+};
 pub use crate::timer::Timer;
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]

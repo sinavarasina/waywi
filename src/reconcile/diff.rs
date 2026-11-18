@@ -237,6 +237,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             title: surf.title,
             namespace: surf.namespace,
             a11y: surf.a11y,
+            ime: surf.ime,
         };
 
         let prev_opt = self.surfaces.remove(&rk);
@@ -257,6 +258,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.keyboard_interactivity != spec.keyboard_interactivity
                 || prev.spec.title != spec.title
                 || prev.spec.logical_size != spec.logical_size
+                || prev.spec.ime != spec.ime
                 || prev.scale != scale;
             full_redraw = prev.spec.background != spec.background
                 || prev.spec.logical_size != spec.logical_size
@@ -322,6 +324,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             hovered_node,
             on_close: surf.on_close,
             on_key: surf.on_key,
+            on_ime: surf.on_ime,
             on_pointer_move: surf.on_pointer_move,
             on_pointer_up: surf.on_pointer_up,
             dirty_logical_rects: dirty_rects,

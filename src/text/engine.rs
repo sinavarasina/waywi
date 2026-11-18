@@ -155,6 +155,84 @@ impl TextEngine {
         self.ensure_shaped(key, params, frame_seq).logical_size
     }
 
+    /// Measures shaped text bounds together with the exact proportional `(x, y)` coordinates of
+    /// `cursor_byte` (clamped safely to a UTF-8 char boundary).
+    pub(crate) fn measure_text_cursor(
+        &mut self,
+        content: &SharedStr,
+        style: super::TextMeasureStyle<'_>,
+        cursor_byte: usize,
+        frame_seq: u64,
+    ) -> super::TextCursorMetrics {
+        let default_lh = compute_line_height_px(style.font_size, style.line_height_multiplier, 1.0);
+        let text = content.as_str();
+        if text.is_empty() {
+            let x = match style.align {
+                TextAlign::Left => 0.0,
+                TextAlign::Center => style.max_width.map_or(0.0, |w| w.0.max(0.0) * 0.5),
+                TextAlign::Right => style.max_width.map_or(0.0, |w| w.0.max(0.0)),
+            };
+            return super::TextCursorMetrics {
+                size: LogicalSize::new(LogicalPx::ZERO, LogicalPx(default_lh.ceil())),
+                cursor_x: LogicalPx(x),
+                cursor_y: LogicalPx::ZERO,
+                line_height: LogicalPx(default_lh),
+            };
+        }
+
+        let params = TextDrawParams {
+            content,
+            style,
+            wrap_to_width: style.max_width.is_some(),
+            scale: crate::geometry::ScaleFactor::ONE,
+        };
+        let key = Self::make_key(params);
+        let shaped = self.ensure_shaped(key, params, frame_seq);
+        let size = shaped.logical_size;
+
+        let clamped = crate::input::text_input::snap_char_boundary(text, cursor_byte);
+        let prefix = &text[..clamped];
+        let line_i = prefix.bytes().filter(|&b| b == b'\n').count();
+        let line_start = prefix.rfind('\n').map_or(0, |pos| pos + 1);
+        let local_byte = clamped - line_start;
+
+        let mut exact: Option<(f32, f32, f32)> = None;
+        let mut line_fallback: Option<(f32, f32, f32)> = None;
+        let mut last_run_line = None;
+
+        for run in shaped.buffer.layout_runs() {
+            last_run_line = Some((run.line_i, run.line_top, run.line_height));
+            if run.line_i != line_i {
+                continue;
+            }
+            let c_idx = local_byte.min(run.text.len());
+            let cursor = cosmic_text::Cursor::new(line_i, c_idx);
+            if let Some(x) = run.cursor_position(&cursor) {
+                exact = Some((x, run.line_top, run.line_height));
+                break;
+            }
+            line_fallback = Some((run.line_w, run.line_top, run.line_height));
+        }
+
+        let (cx, cy, lh) = if let Some(hit) = exact {
+            hit
+        } else if let Some(fb) = line_fallback {
+            fb
+        } else {
+            let y = last_run_line.map_or((line_i as f32) * default_lh, |(li, top, height)| {
+                top + ((line_i.saturating_sub(li)) as f32) * height
+            });
+            (0.0, y, default_lh)
+        };
+
+        super::TextCursorMetrics {
+            size,
+            cursor_x: LogicalPx(cx),
+            cursor_y: LogicalPx(cy),
+            line_height: LogicalPx(lh),
+        }
+    }
+
     fn make_key(params: TextDrawParams<'_>) -> TextShapeKey {
         let s = params.style;
         TextShapeKey {
@@ -189,7 +267,7 @@ impl TextEngine {
         let inserted_key = key.clone();
         self.buffer_cache.entry(key).or_insert_with(|| {
             let fs_px = (s.font_size.0.max(1.0) * scale).max(1.0);
-            let lh_px = (fs_px * s.line_height_multiplier.max(0.5)).max(1.0);
+            let lh_px = compute_line_height_px(s.font_size, s.line_height_multiplier, scale);
             let metrics = cosmic_text::Metrics::new(fs_px, lh_px);
             let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
 
@@ -363,6 +441,13 @@ impl TextEngine {
     }
 }
 
+#[cfg(feature = "text")]
+#[inline]
+fn compute_line_height_px(font_size: LogicalPx, multiplier: f32, scale: f32) -> f32 {
+    let fs_px = (font_size.0.max(1.0) * scale).max(1.0);
+    (fs_px * multiplier.max(0.5)).max(1.0)
+}
+
 #[cfg(all(test, feature = "text"))]
 mod tests {
     use super::*;
@@ -414,5 +499,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn proportional_cursor_x_tracks_glyph_widths_middle_and_utf8() {
+        let mut engine = TextEngine::new();
+        let font = Font::sans();
+        let style = TextMeasureStyle {
+            font_size: LogicalPx(16.0),
+            line_height_multiplier: 1.25,
+            max_width: None,
+            font: &font,
+            align: TextAlign::Left,
+        };
+
+        let m_empty = engine.measure_text_cursor(&SharedStr::EMPTY, style, 0, 1);
+        assert_eq!(m_empty.cursor_x, LogicalPx::ZERO);
+        assert_eq!(m_empty.cursor_y, LogicalPx::ZERO);
+        assert!(m_empty.line_height.0 > 16.0);
+
+        let narrow = engine.measure_text_cursor(&SharedStr::from("iii"), style, 3, 2);
+        let wide = engine.measure_text_cursor(&SharedStr::from("WWW"), style, 3, 3);
+        assert!(
+            narrow.cursor_x.0 > 0.0 && narrow.cursor_x.0 < wide.cursor_x.0,
+            "proportional sans font must measure `iii` ({:?}) narrower than `WWW` ({:?})",
+            narrow.cursor_x,
+            wide.cursor_x
+        );
+
+        let mixed = SharedStr::from("iiWW");
+        let start = engine.measure_text_cursor(&mixed, style, 0, 4);
+        let mid = engine.measure_text_cursor(&mixed, style, 2, 4);
+        let end = engine.measure_text_cursor(&mixed, style, 4, 4);
+        assert_eq!(start.cursor_x, LogicalPx::ZERO);
+        assert!(mid.cursor_x.0 > 0.0 && mid.cursor_x.0 < end.cursor_x.0);
+        // First half ("ii") must take strictly less than half the width of "iiWW".
+        assert!(mid.cursor_x.0 < end.cursor_x.0 * 0.5);
+
+        // Unaligned byte offset into multi-byte UTF-8 and multiline newline increments cursor_y.
+        let multi = SharedStr::from("a\n日本");
+        let line1 = engine.measure_text_cursor(&multi, style, 3, 5); // lands inside '日' -> snaps to line 1 col 0
+        let line1_end = engine.measure_text_cursor(&multi, style, multi.len(), 5);
+        assert!(line1.cursor_y.0 >= line1.line_height.0 - 0.01);
+        assert_eq!(line1.cursor_x, LogicalPx::ZERO);
+        assert!(line1_end.cursor_x.0 > 0.0);
     }
 }

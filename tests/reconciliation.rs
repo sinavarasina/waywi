@@ -693,3 +693,165 @@ fn floating_surface_resizes_dynamically_with_px_and_auto_sizes() {
         Some(LogicalSize::new(156.logical_px(), 76.logical_px()))
     );
 }
+
+#[test]
+fn headless_runtime_routes_ime_events_and_reconciles_ime_config() {
+    #[derive(Default)]
+    struct ImeState {
+        input: TextInputState,
+        focused: bool,
+    }
+
+    #[derive(Clone)]
+    enum ImeMsg {
+        Ime(ImeEvent),
+        Key(KeyEvent),
+    }
+
+    struct ImeApp;
+
+    impl Application for ImeApp {
+        type State = ImeState;
+        type Message = ImeMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            Ok(ImeState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                ImeMsg::Ime(ev) => {
+                    match &ev {
+                        ImeEvent::Enter => state.focused = true,
+                        ImeEvent::Leave => state.focused = false,
+                        ImeEvent::Update { .. } => {}
+                    }
+                    state.input.handle_ime(&ev);
+                }
+                ImeMsg::Key(ev) => {
+                    state.input.handle_key(&ev);
+                }
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            let cursor_x = (state.input.before_cursor().chars().count() as f32 * 8.0).logical_px();
+            s.push(
+                Surface::floating("ime-input", Output::Primary)
+                    .size(Size::px(240.logical_px(), 44.logical_px()))
+                    .ime(
+                        ImeConfig::enabled()
+                            .from_text_input(&state.input)
+                            .cursor_rect(GeoRect::new(
+                                cursor_x,
+                                8.logical_px(),
+                                2.logical_px(),
+                                20.logical_px(),
+                            ))
+                            .content_purpose(ImeContentPurpose::Normal),
+                    )
+                    .on_ime(|ev| Some(ImeMsg::Ime(ev)))
+                    .on_key(|ev| Some(ImeMsg::Key(ev))),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<ImeApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo {
+            id: OutputId(1),
+            logical_size: LogicalSize::new(1920.logical_px(), 1080.logical_px()),
+            ..OutputInfo::default()
+        }],
+    )
+    .unwrap();
+    rt.step().unwrap();
+
+    assert!(
+        rt.surface_ime_config("ime-input")
+            .is_some_and(|c| c.enabled)
+    );
+
+    // IME Enter -> Preedit -> Commit -> Surrounding text synced cleanly to SurfaceSpec.
+    assert!(rt.simulate_ime("ime-input", ImeEvent::Enter));
+    rt.step().unwrap();
+    assert!(rt.state().focused);
+
+    assert!(rt.simulate_ime(
+        "ime-input",
+        ImeEvent::Update {
+            delete_before: 0,
+            delete_after: 0,
+            commit: None,
+            preedit: Some(ImePreedit {
+                text: "nihon".into(),
+                cursor_begin: Some(0),
+                cursor_end: Some(5),
+            }),
+        }
+    ));
+    rt.step().unwrap();
+    assert_eq!(rt.state().input.display_segments(), ("", "nihon", ""));
+    // Preedit must NOT leak into surrounding plain text sent back to compositor!
+    assert_eq!(
+        rt.surface_ime_config("ime-input")
+            .and_then(|c| c.surrounding_text.as_ref())
+            .map(|s| s.text.as_str()),
+        Some("")
+    );
+
+    assert!(rt.simulate_ime(
+        "ime-input",
+        ImeEvent::Update {
+            delete_before: 0,
+            delete_after: 0,
+            commit: Some("日本".into()),
+            preedit: None,
+        }
+    ));
+    rt.step().unwrap();
+    assert_eq!(rt.state().input.text(), "日本");
+    let cfg = rt.surface_ime_config("ime-input").unwrap();
+    assert_eq!(
+        cfg.surrounding_text
+            .as_ref()
+            .map(|s| (s.text.as_str(), s.cursor)),
+        Some(("日本", "日本".len()))
+    );
+    assert_eq!(
+        cfg.cursor_rect,
+        Some(GeoRect::new(
+            16.logical_px(),
+            8.logical_px(),
+            2.logical_px(),
+            20.logical_px()
+        ))
+    );
+    let seq_after_ime = cfg.external_change_seq;
+
+    // External backspace bumps external_change_seq so compositor receives ChangeCause::Other.
+    assert!(rt.key_surface(
+        "ime-input",
+        KeyEvent {
+            key: Key::Backspace,
+            modifiers: Modifiers::empty(),
+            repeat: false,
+            utf8: None,
+        }
+    ));
+    rt.step().unwrap();
+    assert_eq!(rt.state().input.text(), "日");
+    assert!(
+        rt.surface_ime_config("ime-input")
+            .unwrap()
+            .external_change_seq
+            > seq_after_ime
+    );
+}

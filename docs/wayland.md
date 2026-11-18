@@ -25,4 +25,5 @@ If a layer-shell surface is used where `zwlr_layer_shell_v1` is absent, `App` re
 - **Keyboard focus**: `KeyboardInteractivity::{None, OnDemand, Exclusive}`.
 - **Clipboard (`clipboard`)**: Supports `ext-data-control-v1` (preferred) and `zwlr-data-control-v1` with bounded pipe reads.
 - **Idle (`idle-notify`)**: Uses `ext-idle-notify-v1` for user and input idle transitions.
+- **IME (`ime`)**: Uses per-seat `zwp_text_input_manager_v3` / `zwp_text_input_v3` double-buffered composition (`preedit_string`, `commit_string`, `delete_surrounding_text`, `done`), surrounding-text sync (`<= 4000` UTF-8 bytes), cursor rectangle placement hints, and text-change cause tracking.
 - **Keyboard layout**: Tracks XKB layout names and active group transitions via `xkbcommon`.

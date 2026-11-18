@@ -28,8 +28,8 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `RendererPreference` (`render::backend`): `Auto`, `Software`, `Gpu`.
 - `HeadlessRuntime<A: Application>` (`app::headless`):
   - Constructors: `new(capabilities, outputs)`, `new_with_renderer(...)`.
-  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `simulate_surface_configure(...)`.
-  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `arena_heap_fallbacks()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
+  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_surface_configure(...)`.
+  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `arena_heap_fallbacks()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
 
 ## Effects (`effect`)
 
@@ -41,13 +41,14 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - **Compositors**: `hyprland()` (`hyprland-ipc`), `sway()` (`sway-ipc`), `compositor() -> Result<CompositorClient<'_>>`.
 - **D-Bus & hardware**: `dbus()` (`dbus`), `set_backlight_percent(device_name, percent)`, `set_ddc_brightness(i2c_bus, percent)`, `privacy_snapshot() -> PrivacySnapshot`.
 - **Clipboard (`clipboard`)**: `set_clipboard_text(text)`, `set_clipboard_primary_text(text)`, `set_clipboard(selection, entries)`.
+- **Text cursor layout (`text`)**: `measure_text_cursor(text, font, font_size, cursor_byte)`, `measure_text_cursor_with(text, options, cursor_byte)`.
 
 ## Errors & Capabilities (`error`, `capabilities`)
 
 - `Result<T>`: `std::result::Result<T, WaywiError>`.
 - `ErrorKind`: `NotAvailable`, `NotSupported`, `TemporarilyUnavailable`, `PermissionDenied`, `OperationFailed`, `InvalidState`, `Timeout`, `Shutdown`.
 - `WaywiError` (`.kind(&self) -> ErrorKind`): `WaylandConnection`, `UnsupportedCapability(Capability)`, `OutputUnavailable`, `SurfaceError`, `RenderError`, `AssetDecode`, `UnsupportedAssetFormat`, `ProviderUnavailable`, `PermissionDenied`, `IpcError`, `DbusError`, `AudioError`, `InvalidGeometry`, `InvalidState`, `Timeout`, `Io(std::io::Error)`, `Shutdown`, `Custom`.
-- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `KeyboardLayout`.
+- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `TextInput`, `KeyboardLayout`.
 - `Capabilities`: `new()`, `from_compile_features()`, `has(cap)`, `set(cap, enabled)`, `require(cap) -> Result<()>`, `iter()`.
 
 ## Geometry & Units (`geometry`)
@@ -82,7 +83,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`.
 - `Surface<M>` (`surface::builder`):
   - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::memo(key, dep, build)`.
-  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
+  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
 - `Surfaces<M>` (`surface::collection`): `new()`, `push(surface)`, `extend(surfaces)`, `len()`, `is_empty()`, `map(f)`.
 - `OutputId(pub u64)` (`new`, `get`), `Output` (`primary()`, `named(name)`, `id(OutputId)`, `all()`), `OutputInfo`, `Transform`, `resolve_outputs`, `select_primary_output`.
 
@@ -112,6 +113,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `Font`: `sans`, `monospace`, `family`, `weight`, `style`.
   - `TextAlign`: `Left`, `Center`, `Right`.
   - `Text<M>`: `new`, `font_size`, `line_height`, `color`, `font`, `align`, `map`.
+  - `TextCursorMetrics` (`size`, `cursor_x`, `cursor_y`, `line_height`) and `TextLayoutOptions` (`new`, `line_height`, `max_width`, `align`).
   - `SharedStr`: `EMPTY`, `from_static`, `from_str_inline_or_arc`, `format_inline`, `as_str`, `is_inline`, `is_static`.
 - **Images & Assets (`image`, `asset::types`)**:
   - `AssetId(pub u64)` (`new`, `get`), `ImageAsset`, `DecodedImage`, `DecodedGifFrame`, `ImageFormat` (`Png`, `Svg`, `Gif`, `Webp`).
@@ -131,6 +133,8 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `PointerEvent`, `ScrollEvent`, `TouchEvent`.
 - `Modifiers` bitflags: `CTRL` (`CONTROL`), `ALT`, `SHIFT`, `SUPER` (`LOGO`).
 - `Key` (`from_keysym`), `KeyChord::new(modifiers, key)`, `KeyEvent::matches(chord)`.
+- Wayland IME (`input::ime`, `ime` feature for compositor protocol): `MAX_SURROUNDING_BYTES`, `ImeContentHint` (`COMPLETION`, `SPELLCHECK`, `AUTO_CAPITALIZATION`, `LOWERCASE`, `UPPERCASE`, `TITLECASE`, `HIDDEN_TEXT`, `SENSITIVE_DATA`, `LATIN`, `MULTILINE`, `ON_SCREEN_INPUT_PROVIDED`, `NO_EMOJI`, `PREEDIT_SHOWN`), `ImeContentPurpose` (`Normal`, `Alpha`, `Digits`, `Number`, `Phone`, `Url`, `Email`, `Name`, `Password`, `Pin`, `Date`, `Time`, `Datetime`, `Terminal`; `to_wire_u32`), `ImeSurroundingText` (`from_slice`), `ImeConfig` (`disabled`, `enabled`, `from_text_input`, `surrounding_text`, `cursor_rect`, `content_hint`, `content_purpose`, `external_change_seq`), `ImePreedit`, `ImeEvent` (`Enter`, `Leave`, `Update`).
+- Headless input & scroll controllers (`text_input`, `scroll`): `TextInputOutcome` (`Edited`, `CursorMoved`, `Submitted`, `Cancelled`, `Unchanged`; `text_changed`, `needs_redraw`), `TextInputState` (`new`, `with_text`, `with_max_chars`, `text`, `is_empty`, `len_chars`, `cursor_bytes`, `cursor_chars`, `anchor_bytes`, `external_change_seq`, `before_cursor`, `after_cursor`, `selection_range`, `selected_text`, `preedit`, `has_preedit`, `display_segments`, `display_text`, `display_cursor_bytes`, `masked`, `set_text`, `clear`, `select_all`, `set_cursor_bytes`, `insert_str`, `backspace`, `delete_forward`, `delete_word_backward`, `delete_word_forward`, `move_left`, `move_right`, `move_word_left`, `move_word_right`, `move_home`, `move_end`, `handle_key`, `handle_ime`), `ScrollState` (`new`, `offset`, `viewport`, `content`, `max_offset`, `can_scroll`, `progress`, `set_bounds`, `set_offset`, `scroll_by`, `apply_scroll`, `apply_scroll_x`, `ensure_visible`, `visible_range`, `thumb_metrics`).
 - `KeyboardLayout::subscribe(map)` and `KeyboardLayoutInfo` (`from_layouts`, `short_label`, `short_label_from_name`).
 - `AccessibleRole` (`accessibility::props`): `Generic`, `Window`, `Panel`, `Group`, `Button`, `Label`, `Image`, `Canvas`, `Row`, `Column`, `List`, `ListItem`, `Switch`, `CheckBox`, `Slider`, `ProgressIndicator`, `Status`. Additional AccessKit types re-exported when `accessibility` is enabled.
 - `Clipboard` (`clipboard`): `Clipboard::subscribe(map)`, `Clipboard::subscribe_selection(selection, map)`, `select_preferred_mime(mimes)`; `ClipboardSelection` (`Clipboard`, `Primary`), `ClipboardSnapshot`, `ClipboardEvent` (`Changed`, `Error`).

@@ -49,6 +49,16 @@ pub(crate) trait RenderBackend {
         frame_seq: u64,
     ) -> LogicalSize;
 
+    /// Measures shaped text bounds together with exact proportional cursor coordinates.
+    #[cfg(feature = "text")]
+    fn measure_text_cursor(
+        &mut self,
+        content: &SharedStr,
+        style: TextMeasureStyle<'_>,
+        cursor_byte: usize,
+        frame_seq: u64,
+    ) -> crate::text::TextCursorMetrics;
+
     /// Renders `scene` into an `ARGB8888` pre-multiplied pixel buffer across `dirty_rects`.
     fn render_argb8888(
         &mut self,

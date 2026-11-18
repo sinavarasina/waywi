@@ -4,6 +4,8 @@ pub(crate) mod connection;
 pub(crate) mod delegates;
 #[cfg(feature = "idle-notify")]
 pub(crate) mod idle;
+#[cfg(feature = "ime")]
+pub(crate) mod ime;
 pub(crate) mod layer_shell;
 pub(crate) mod output;
 pub(crate) mod seat;

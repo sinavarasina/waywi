@@ -6,7 +6,10 @@ use crate::display::OutputId;
 use crate::geometry::{
     BufferRect, Edges, LogicalPx, LogicalSize, Point, Rect as GeoRect, ScaleFactor,
 };
-use crate::input::{HitTestNode, KeyEvent, Modifiers, MouseButton, NodeId, PointerEvent, hit_test};
+use crate::input::{
+    HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, NodeId, PointerEvent,
+    ScrollEvent, hit_test, hit_test_scroll,
+};
 use crate::render::{Color, DrawCommand, RetainedNode};
 use crate::surface::{Anchor, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind};
 use crate::text::SharedStr;
@@ -34,6 +37,7 @@ pub(crate) struct SurfaceSpec {
     pub(crate) title: SharedStr,
     pub(crate) namespace: SharedStr,
     pub(crate) a11y: AccessibleProps,
+    pub(crate) ime: ImeConfig,
 }
 
 /// Retained state for one live visible surface.
@@ -46,6 +50,7 @@ pub(crate) struct RetainedSurface<M> {
     pub(crate) hovered_node: Option<NodeId>,
     pub(crate) on_close: Option<M>,
     pub(crate) on_key: Option<FrameSharedFn<KeyEvent, Option<M>>>,
+    pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) dirty_logical_rects: Vec<GeoRect>,
@@ -155,6 +160,14 @@ impl<M: 'static> RetainedSurface<M> {
             ))]
             click_sound: None,
         }
+    }
+
+    /// Dispatches a pointer scroll event against the topmost matching `on_scroll` handler.
+    pub(crate) fn dispatch_scroll_at(&self, mut event: ScrollEvent) -> Option<M> {
+        let (node, local) = hit_test_scroll(&self.hit_nodes, event.position)?;
+        let on_scroll = node.handlers.on_scroll.as_ref()?;
+        event.local_position = local;
+        Some(on_scroll.call(event))
     }
 
     /// Updates hover state at `pos` and optionally evaluates node/surface `on_pointer_move`.

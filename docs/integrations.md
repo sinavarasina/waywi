@@ -17,6 +17,7 @@ Optional Linux subsystems are selected at compile time via Cargo features. Missi
 | `fractional-scale` | No | `wayland-protocols` | `wp_fractional_scale_v1` + `wp_viewporter` scaling |
 | `clipboard` | No | `wayland-protocols`, `wayland-protocols-wlr` | `ext-data-control-v1` / `zwlr-data-control-v1` clipboard |
 | `idle-notify` | No | `wayland-protocols` | `ext-idle-notify-v1` user/input idle monitor |
+| `ime` | No | `wayland-protocols` | `zwp_text_input_manager_v3` / `zwp_text_input_v3` IME composition support |
 | `control-ipc` | No | `calloop/signals` | Unix control socket (under `$XDG_RUNTIME_DIR`, falling back to `/run/user/<uid>`; same-user peers only) and `SIGUSR1`/`SIGUSR2` |
 | `hyprland-ipc` | No | `serde`, `serde_json` | Hyprland command socket and `socket2` event stream |
 | `sway-ipc` | No | `serde`, `serde_json` | Sway `i3-ipc` binary client and event stream |

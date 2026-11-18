@@ -85,6 +85,18 @@ impl RenderBackend for SoftwareRenderer {
         }
     }
 
+    #[cfg(feature = "text")]
+    fn measure_text_cursor(
+        &mut self,
+        content: &SharedStr,
+        style: TextMeasureStyle<'_>,
+        cursor_byte: usize,
+        frame_seq: u64,
+    ) -> crate::text::TextCursorMetrics {
+        self.text_engine
+            .measure_text_cursor(content, style, cursor_byte, frame_seq)
+    }
+
     /// Renders `scene` across `dirty_rects` into a `wl_shm` little-endian `Argb8888`
     /// (`[B, G, R, A]`) buffer.
     fn render_argb8888(

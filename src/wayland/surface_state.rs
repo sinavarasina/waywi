@@ -145,4 +145,9 @@ pub(crate) enum WaylandEvent {
     },
     #[cfg(feature = "clipboard")]
     Clipboard(crate::clipboard::ClipboardEvent),
+    #[cfg(feature = "ime")]
+    Ime {
+        key: RetainedSurfaceKey,
+        event: crate::input::ImeEvent,
+    },
 }

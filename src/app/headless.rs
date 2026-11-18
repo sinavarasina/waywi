@@ -8,7 +8,7 @@ use crate::display::OutputInfo;
 use crate::effect::{AsyncAssetWorker, EffectCtx};
 use crate::error::Result;
 use crate::geometry::{LogicalPx, LogicalSize, Point, ScaleFactor};
-use crate::input::{Modifiers, MouseButton};
+use crate::input::{ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, ScrollEvent};
 use crate::reconcile::{PointerDispatch, ReconcileTargets, Reconciler, RetainedSurfaceKey};
 use crate::render::{
     ActiveRenderer, MemoStore, RenderBackend, RendererPreference, enter_memo_scope,
@@ -72,7 +72,8 @@ impl<A: Application> HeadlessRuntime<A> {
         outputs: Vec<OutputInfo>,
         renderer_pref: RendererPreference,
     ) -> Result<Self> {
-        let renderer = ActiveRenderer::from_preference(renderer_pref, None);
+        #[allow(unused_mut)]
+        let mut renderer = ActiveRenderer::from_preference(renderer_pref, None);
         capabilities.set(
             crate::capabilities::Capability::GpuRenderer,
             renderer.is_gpu_active(),
@@ -99,6 +100,13 @@ impl<A: Application> HeadlessRuntime<A> {
         let sway = None;
         #[cfg(feature = "dbus")]
         let dbus = crate::dbus::DbusClient::new();
+
+        #[cfg(feature = "text")]
+        let mut measure_cursor = |content: &crate::text::SharedStr,
+                                  style: crate::text::TextMeasureStyle<'_>,
+                                  cursor_byte: usize| {
+            renderer.measure_text_cursor(content, style, cursor_byte, 0)
+        };
 
         let state = {
             let mut ctx = EffectCtx {
@@ -127,6 +135,8 @@ impl<A: Application> HeadlessRuntime<A> {
                 dbus: &dbus,
                 #[cfg(feature = "clipboard")]
                 clipboard_writer: None,
+                #[cfg(feature = "text")]
+                text_cursor_measurer: &mut measure_cursor,
             };
             A::init(&mut ctx)?
         };
@@ -198,6 +208,15 @@ impl<A: Application> HeadlessRuntime<A> {
         while let Some(msg) = self.inbox.pop_front() {
             let mut pending_after = Vec::new();
             let mut reloaded_assets = Vec::new();
+            #[cfg(feature = "text")]
+            let frame_seq = self.reconciler.frame_seq;
+            #[cfg(feature = "text")]
+            let mut measure_cursor = |content: &crate::text::SharedStr,
+                                      style: crate::text::TextMeasureStyle<'_>,
+                                      cursor_byte: usize| {
+                self.renderer
+                    .measure_text_cursor(content, style, cursor_byte, frame_seq)
+            };
             let mut ctx = EffectCtx {
                 quit_requested: &mut self.quit_requested,
                 capabilities: &self.capabilities,
@@ -224,6 +243,8 @@ impl<A: Application> HeadlessRuntime<A> {
                 dbus: &self.dbus,
                 #[cfg(feature = "clipboard")]
                 clipboard_writer: None,
+                #[cfg(feature = "text")]
+                text_cursor_measurer: &mut measure_cursor,
             };
             A::update(&mut self.state, msg, &mut ctx)?;
             for (delay, factory) in pending_after {
@@ -455,6 +476,82 @@ impl<A: Application> HeadlessRuntime<A> {
             .surface_by_key(surface_key)
             .map(|surf| surf.dispatch_pointer_up_at(pos, button, Modifiers::empty()));
         dispatch.is_some_and(|d| self.enqueue_pointer_dispatch(d))
+    }
+
+    /// Simulates a pointer scroll/wheel event on a surface point with `(delta_x, delta_y)` and
+    /// `(discrete_x, discrete_y)`, triggering the topmost matching `on_scroll` handler.
+    pub fn scroll_surface_point(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        x: f32,
+        y: f32,
+        delta: (f32, f32),
+        discrete: (i32, i32),
+    ) -> bool {
+        let pos = Point::new(LogicalPx(x), LogicalPx(y));
+        let msg = self.surface_by_key(surface_key).and_then(|surf| {
+            surf.dispatch_scroll_at(ScrollEvent {
+                position: pos,
+                local_position: Point::ZERO,
+                delta_x: delta.0,
+                delta_y: delta.1,
+                discrete_x: discrete.0,
+                discrete_y: discrete.1,
+                modifiers: Modifiers::empty(),
+            })
+        });
+        if let Some(m) = msg {
+            self.inbox.push_back(m);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Simulates a keyboard key event targeting the surface's `on_key` handler.
+    pub fn key_surface(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: KeyEvent,
+    ) -> bool {
+        let msg = self
+            .surface_by_key(surface_key)
+            .and_then(|surf| surf.on_key.as_ref())
+            .and_then(|on_key| on_key.call(event));
+        if let Some(m) = msg {
+            self.inbox.push_back(m);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Simulates a Wayland IME event (`Enter`, `Leave`, `Update`) targeting the surface's `on_ime`
+    /// handler.
+    pub fn simulate_ime(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: ImeEvent,
+    ) -> bool {
+        let msg = self
+            .surface_by_key(surface_key)
+            .and_then(|surf| surf.on_ime.as_ref())
+            .and_then(|on_ime| on_ime.call(event));
+        if let Some(m) = msg {
+            self.inbox.push_back(m);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the currently reconciled [`ImeConfig`] for a retained surface, if present.
+    #[must_use]
+    pub fn surface_ime_config(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<&ImeConfig> {
+        self.surface_by_key(surface_key).map(|surf| &surf.spec.ime)
     }
 
     #[must_use]

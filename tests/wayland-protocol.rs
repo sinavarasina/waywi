@@ -1,9 +1,17 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+#[cfg(feature = "ime")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use wayland_client::Connection;
+#[cfg(feature = "ime")]
+use wayland_protocols::wp::text_input::zv3::server::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
+#[cfg(feature = "ime")]
+use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::backend::ClientData;
 use wayland_server::protocol::{
     wl_buffer, wl_compositor, wl_output, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
@@ -15,9 +23,24 @@ use waywi::capabilities::Capability;
 use waywi::display::Output;
 use waywi::effect::EffectCtx;
 use waywi::error::{Result, WaywiError};
+#[cfg(feature = "ime")]
+use waywi::geometry::GeoRect;
 use waywi::geometry::{LogicalPxExt, ScaleFactor, Size};
+#[cfg(feature = "ime")]
+use waywi::input::{ImeConfig, ImeContentPurpose, ImeEvent, TextInputState};
 use waywi::surface::{Surface, Surfaces};
 use waywi::{App, Application};
+
+#[cfg(feature = "ime")]
+#[derive(Default)]
+struct MockImeTrace {
+    enabled_commits: usize,
+    disabled_commits: usize,
+    cursor_rects: Vec<(i32, i32, i32, i32)>,
+    surrounding_updates: Vec<(String, i32, i32)>,
+    content_purposes: Vec<u32>,
+    sent_batches: bool,
+}
 
 struct DummyClientData;
 impl ClientData for DummyClientData {
@@ -32,6 +55,19 @@ impl ClientData for DummyClientData {
 
 struct MockCompositor {
     wl_surfaces_created: usize,
+    last_wl_surface: Option<wl_surface::WlSurface>,
+    #[cfg(feature = "ime")]
+    text_inputs: Vec<zwp_text_input_v3::ZwpTextInputV3>,
+    #[cfg(feature = "ime")]
+    pending_enabled: Option<bool>,
+    #[cfg(feature = "ime")]
+    pending_cursor_rect: Option<(i32, i32, i32, i32)>,
+    #[cfg(feature = "ime")]
+    pending_surrounding: Option<(String, i32, i32)>,
+    #[cfg(feature = "ime")]
+    pending_purpose: Option<u32>,
+    #[cfg(feature = "ime")]
+    ime_trace: Arc<Mutex<MockImeTrace>>,
 }
 
 impl GlobalDispatch<wl_compositor::WlCompositor, ()> for MockCompositor {
@@ -60,7 +96,8 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for MockCompositor {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 state.wl_surfaces_created += 1;
-                data_init.init(id, ());
+                let surf = data_init.init(id, ());
+                state.last_wl_surface = Some(surf);
             }
             wl_compositor::Request::CreateRegion { id } => {
                 data_init.init(id, ());
@@ -304,10 +341,213 @@ impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for MockComposito
     }
 }
 
+#[cfg(feature = "ime")]
+impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<xdg_wm_base::XdgWmBase>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+#[cfg(feature = "ime")]
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &xdg_wm_base::XdgWmBase,
+        request: xdg_wm_base::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_wm_base::Request::GetXdgSurface { id, surface: _ } => {
+                data_init.init(id, ());
+            }
+            xdg_wm_base::Request::Pong { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "ime")]
+impl Dispatch<xdg_surface::XdgSurface, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &xdg_surface::XdgSurface,
+        request: xdg_surface::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_surface::Request::GetToplevel { id } => {
+                let toplevel = data_init.init(id, ());
+                toplevel.configure(320, 64, Vec::new());
+                resource.configure(1);
+            }
+            xdg_surface::Request::AckConfigure { .. } => {
+                if let Some(ref wl_surf) = state.last_wl_surface {
+                    for ti in &state.text_inputs {
+                        ti.enter(wl_surf);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "ime")]
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &xdg_toplevel::XdgToplevel,
+        _request: xdg_toplevel::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "ime")]
+impl GlobalDispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+#[cfg(feature = "ime")]
+impl Dispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+        request: zwp_text_input_manager_v3::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwp_text_input_manager_v3::Request::GetTextInput { id, seat: _ } = request {
+            let ti = data_init.init(id, ());
+            state.text_inputs.push(ti);
+        }
+    }
+}
+
+#[cfg(feature = "ime")]
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &zwp_text_input_v3::ZwpTextInputV3,
+        request: zwp_text_input_v3::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zwp_text_input_v3::Request::Enable => {
+                state.pending_enabled = Some(true);
+            }
+            zwp_text_input_v3::Request::Disable => {
+                state.pending_enabled = Some(false);
+            }
+            zwp_text_input_v3::Request::SetCursorRectangle {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.pending_cursor_rect = Some((x, y, width, height));
+            }
+            zwp_text_input_v3::Request::SetSurroundingText {
+                text,
+                cursor,
+                anchor,
+            } => {
+                state.pending_surrounding = Some((text, cursor, anchor));
+            }
+            zwp_text_input_v3::Request::SetContentType {
+                hint: _,
+                purpose: wayland_server::WEnum::Value(p),
+            } => {
+                state.pending_purpose = Some(p as u32);
+            }
+            zwp_text_input_v3::Request::Commit => {
+                let mut trace = state.ime_trace.lock().unwrap();
+                match state.pending_enabled {
+                    Some(true) => trace.enabled_commits += 1,
+                    Some(false) => trace.disabled_commits += 1,
+                    None => {}
+                }
+                if let Some(rect) = state.pending_cursor_rect.take() {
+                    trace.cursor_rects.push(rect);
+                }
+                if let Some(sur) = state.pending_surrounding.take() {
+                    trace.surrounding_updates.push(sur);
+                }
+                if let Some(p) = state.pending_purpose.take() {
+                    trace.content_purposes.push(p);
+                }
+                if state.pending_enabled == Some(true) && !trace.sent_batches {
+                    trace.sent_batches = true;
+                    // Batch 1: double-buffered preedit only committed on done(1).
+                    resource.preedit_string(Some("にほん".into()), 0, 9);
+                    resource.done(1);
+                    // Batch 2: omits preedit_string (clears preedit per spec) and commits "日本".
+                    resource.commit_string(Some("日本".into()));
+                    resource.done(1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn spawn_mock_compositor() -> (Connection, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let (conn, stop, handle, _) = spawn_mock_compositor_with(false);
+    (conn, stop, handle)
+}
+
+#[cfg(feature = "ime")]
+type OptTrace = Option<Arc<Mutex<MockImeTrace>>>;
+#[cfg(not(feature = "ime"))]
+type OptTrace = Option<()>;
+
+fn spawn_mock_compositor_with(
+    enable_shell_and_ime: bool,
+) -> (
+    Connection,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+    OptTrace,
+) {
     let (server_sock, client_sock) = UnixStream::pair().expect("socketpair");
     let stop = Arc::new(AtomicBool::new(false));
     let stop_srv = Arc::clone(&stop);
+    #[cfg(feature = "ime")]
+    let ime_trace = enable_shell_and_ime.then(|| Arc::new(Mutex::new(MockImeTrace::default())));
+    #[cfg(not(feature = "ime"))]
+    let ime_trace: OptTrace = None;
+    #[cfg(feature = "ime")]
+    let ime_trace_srv = ime_trace.as_ref().map(Arc::clone);
 
     let handle = std::thread::spawn(move || {
         let mut display: Display<MockCompositor> = Display::new().expect("wayland Display");
@@ -316,11 +556,35 @@ fn spawn_mock_compositor() -> (Connection, Arc<AtomicBool>, std::thread::JoinHan
         dh.create_global::<MockCompositor, wl_shm::WlShm, _>(1, ());
         dh.create_global::<MockCompositor, wl_output::WlOutput, _>(4, ());
         dh.create_global::<MockCompositor, wl_seat::WlSeat, _>(7, ());
+        #[cfg(feature = "ime")]
+        if enable_shell_and_ime {
+            dh.create_global::<MockCompositor, xdg_wm_base::XdgWmBase, _>(2, ());
+            dh.create_global::<MockCompositor, zwp_text_input_manager_v3::ZwpTextInputManagerV3, _>(
+                1,
+                (),
+            );
+        }
+        #[cfg(not(feature = "ime"))]
+        let _ = enable_shell_and_ime;
         dh.insert_client(server_sock, Arc::new(DummyClientData))
             .expect("insert_client");
 
         let mut state = MockCompositor {
             wl_surfaces_created: 0,
+            last_wl_surface: None,
+            #[cfg(feature = "ime")]
+            text_inputs: Vec::new(),
+            #[cfg(feature = "ime")]
+            pending_enabled: None,
+            #[cfg(feature = "ime")]
+            pending_cursor_rect: None,
+            #[cfg(feature = "ime")]
+            pending_surrounding: None,
+            #[cfg(feature = "ime")]
+            pending_purpose: None,
+            #[cfg(feature = "ime")]
+            ime_trace: ime_trace_srv
+                .unwrap_or_else(|| Arc::new(Mutex::new(MockImeTrace::default()))),
         };
         while !stop_srv.load(Ordering::Relaxed) {
             let _ = display.dispatch_clients(&mut state);
@@ -330,7 +594,7 @@ fn spawn_mock_compositor() -> (Connection, Arc<AtomicBool>, std::thread::JoinHan
     });
 
     let conn = Connection::from_socket(client_sock).expect("Connection::from_socket");
-    (conn, stop, handle)
+    (conn, stop, handle, ime_trace)
 }
 
 #[test]
@@ -428,4 +692,123 @@ fn missing_xdg_shell_for_window_fails_honestly() {
         res,
         Err(WaywiError::UnsupportedCapability(Capability::XdgShell))
     ));
+}
+
+#[cfg(feature = "ime")]
+#[test]
+fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
+    #[derive(Default)]
+    struct ImeProtoState {
+        input: TextInputState,
+        events: Vec<ImeEvent>,
+        final_text: Option<String>,
+    }
+
+    #[derive(Clone)]
+    enum ImeProtoMsg {
+        Ime(ImeEvent),
+        Quit,
+    }
+
+    static OBSERVED_TEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    static OBSERVED_EVENTS: std::sync::Mutex<Vec<ImeEvent>> = std::sync::Mutex::new(Vec::new());
+
+    struct ImeProtoApp;
+
+    impl Application for ImeProtoApp {
+        type State = ImeProtoState;
+        type Message = ImeProtoMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            assert!(ctx.capabilities().has(Capability::Wayland));
+            assert!(ctx.capabilities().has(Capability::XdgShell));
+            assert!(ctx.capabilities().has(Capability::TextInput));
+            Ok(ImeProtoState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                ImeProtoMsg::Ime(ev) => {
+                    state.events.push(ev.clone());
+                    state.input.handle_ime(&ev);
+                    if state.input.text() == "日本" {
+                        state.final_text = Some(state.input.text().to_owned());
+                        // Give the view -> Wayland update + socket flush one tick before exit.
+                        ctx.after(Duration::from_millis(40), || ImeProtoMsg::Quit);
+                    }
+                }
+                ImeProtoMsg::Quit => {
+                    *OBSERVED_TEXT.lock().unwrap() = state.final_text.clone();
+                    *OBSERVED_EVENTS.lock().unwrap() = state.events.clone();
+                    ctx.quit();
+                }
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            let cursor_x = 10 + (state.input.before_cursor().chars().count() as i32 * 8);
+            s.push(
+                Surface::window("ime-win")
+                    .size(Size::px(320.logical_px(), 64.logical_px()))
+                    .ime(
+                        ImeConfig::enabled()
+                            .from_text_input(&state.input)
+                            .content_purpose(ImeContentPurpose::Email)
+                            .cursor_rect(GeoRect::new(
+                                (cursor_x as f32).logical_px(),
+                                20.logical_px(),
+                                2.logical_px(),
+                                18.logical_px(),
+                            )),
+                    )
+                    .on_ime(|ev| Some(ImeProtoMsg::Ime(ev))),
+            );
+            s
+        }
+    }
+
+    let (conn, stop, srv, trace_opt) = spawn_mock_compositor_with(true);
+    let trace = trace_opt.expect("trace present");
+    let res = App::new().run_on_connection::<ImeProtoApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "ImeProtoApp failed: {res:?}");
+
+    assert_eq!(OBSERVED_TEXT.lock().unwrap().as_deref(), Some("日本"));
+    let events = OBSERVED_EVENTS.lock().unwrap();
+    assert!(matches!(events.first(), Some(ImeEvent::Enter)));
+    assert!(events.iter().any(|ev| matches!(
+        ev,
+        ImeEvent::Update {
+            commit: None,
+            preedit: Some(p),
+            ..
+        } if p.text == "にほん"
+    )));
+    assert!(events.iter().any(|ev| matches!(
+        ev,
+        ImeEvent::Update {
+            commit: Some(c),
+            preedit: None,
+            ..
+        } if c == "日本"
+    )));
+
+    let recorded = trace.lock().unwrap();
+    assert!(recorded.enabled_commits >= 2);
+    assert!(recorded.content_purposes.contains(&6)); // ContentPurpose::Email
+    assert!(recorded.cursor_rects.contains(&(10, 20, 2, 18)));
+    assert!(recorded.cursor_rects.contains(&(26, 20, 2, 18)));
+    assert!(
+        recorded
+            .surrounding_updates
+            .iter()
+            .any(|(txt, cur, anc)| txt == "日本" && *cur == 6 && *anc == 6)
+    );
 }
