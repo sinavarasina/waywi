@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use waywi::capabilities::{Capabilities, Capability};
-use waywi::desktop::{XdgIconLookup, parse_desktop_entry, scan_desktop_entries_in};
+use waywi::desktop::{
+    XdgIconLookup, filter_launcher_entries, parse_desktop_entry, scan_desktop_entries_in,
+    search_desktop_entries, spawn_detached_in,
+};
 use waywi::input::KeyboardLayoutInfo;
 use waywi::system::cpu::CpuCounters;
 use waywi::system::disk::{DiskSampler, parse_proc_diskstats, parse_proc_mounts};
@@ -526,24 +529,68 @@ fn desktop_entry_icon_lookup_keyboard_layout_and_sfx_preset_contracts() {
     std::fs::write(&expected_icon, b"RIFF....WEBP").unwrap();
 
     let desktop_file = apps_dir.join("org.waywi.Demo.desktop");
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let try_bin = bin_dir.join("waywi-demo-check");
+    std::fs::write(&try_bin, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&try_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&try_bin, perms).unwrap();
+    }
+
     std::fs::write(
         &desktop_file,
-        "[Desktop Entry]\nType=Application\nName=WayWi Demo\nExec=/usr/bin/waywi-demo --flag %u %i\nIcon=waywi-demo\nStartupWMClass=WayWiDemo\n",
+        format!(
+            "[Desktop Entry]\nType=Application\nName=WayWi Demo\nExec=/usr/bin/waywi-demo --flag %u %i\nTryExec={}\nPath={}\nIcon=waywi-demo\nKeywords=demo;launcher;\nStartupWMClass=WayWiDemo\n",
+            try_bin.display(),
+            work_dir.display()
+        ),
+    )
+    .unwrap();
+    let term_file = apps_dir.join("org.waywi.TermTool.desktop");
+    std::fs::write(
+        &term_file,
+        "[Desktop Entry]\nType=Application\nName=Term Tool\nExec=htop -C\nTerminal=true\nTryExec=/definitely/missing/waywi-binary\n",
     )
     .unwrap();
 
     let scanned = scan_desktop_entries_in(std::slice::from_ref(&apps_dir));
-    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned.len(), 2);
+    assert_eq!(filter_launcher_entries(&scanned).len(), 1);
+    let hits = search_desktop_entries(&scanned, "launcher");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].entry.id, "org.waywi.Demo.desktop");
+
     let parsed = parse_desktop_entry(
         &std::fs::read_to_string(&desktop_file).unwrap(),
         "org.waywi.Demo.desktop",
         &desktop_file,
     )
     .expect("valid desktop entry");
+    assert!(parsed.try_exec_available());
+    assert_eq!(parsed.working_dir.as_deref(), Some(work_dir.as_path()));
     assert_eq!(
         parsed.exec_argv().unwrap(),
         vec!["/usr/bin/waywi-demo", "--flag", "--icon", "waywi-demo"]
     );
+
+    let term_parsed = parse_desktop_entry(
+        &std::fs::read_to_string(&term_file).unwrap(),
+        "org.waywi.TermTool.desktop",
+        &term_file,
+    )
+    .expect("valid terminal desktop entry");
+    assert!(!term_parsed.try_exec_available());
+    assert_eq!(
+        term_parsed.terminal_argv(Some("alacritty")).unwrap(),
+        vec!["alacritty", "-e", "htop", "-C"]
+    );
+    assert!(spawn_detached_in("true", &[], Some(&work_dir)).is_ok());
 
     let mut lookup = XdgIconLookup::with_dirs(vec![icons_dir], "CustomTheme");
     assert_eq!(lookup.resolve("waywi-demo", 48), Some(expected_icon));

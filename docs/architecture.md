@@ -40,7 +40,7 @@ Submodules follow the `<name>.rs` + `<name>/` convention (no `mod.rs`):
 - `src/timer.rs`, `src/subscription.rs`: keyed `Timer` specs and `Subscription` / `Subscriptions`.
 - `src/wayland.rs`, `src/wayland/`: SCTK delegates, `SurfaceShmPool`, layer-shell, xdg-shell, output, seat, clipboard, and idle protocols.
 - `src/system.rs`, `src/system/`: Linux `/proc` and `/sys` telemetry (`cpu`, `memory`, `time`, `gpu`, `disk`, `network`, `battery`, `sensors`, `os`, `brightness`, `privacy`, `units`).
-- `src/desktop.rs`, `src/desktop/`: XDG `.desktop` parser/launcher, icon theme lookup (`XdgIconLookup`), and detached process spawning.
+- `src/desktop.rs`, `src/desktop/`: XDG `.desktop` parser, launcher filtering/search, icon theme lookup (`XdgIconLookup`), and detached process spawning.
 - `src/accessibility.rs`, `src/accessibility/`: accessible metadata props and optional `accesskit_unix` bridge.
 - `src/audio.rs`, `src/audio/`: mixer `client`, sound decoding/themes/presets (`sound`), polyphonic `player` (`AudioPlayer`), and subscriptions (`types`).
 - `src/compositor.rs`, `src/dbus.rs`, `src/control.rs`, `src/clipboard.rs`, `src/idle.rs`: feature-gated desktop and system integrations.

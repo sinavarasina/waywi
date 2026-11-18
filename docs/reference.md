@@ -167,10 +167,10 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 
 ## Desktop Utilities (`desktop`)
 
-- `DesktopEntry`: `exec_argv()`, `should_show_in_launcher()`, `launch()`, `launch_detached()`.
-- Entry discovery: `default_application_dirs()`, `scan_desktop_entries()`, `scan_desktop_entries_in(dirs)`, `find_desktop_entry(id_or_wm_class)`, `parse_desktop_entry(contents, id, path)`.
+- `DesktopEntry`: `exec_argv()`, `try_exec_available()`, `should_show_in_launcher()`, `terminal_argv(terminal)`, `launch()`, `launch_detached()`, `launch_with_terminal(terminal)`.
+- Entry discovery & search: `default_application_dirs()`, `scan_desktop_entries()`, `scan_desktop_entries_in(dirs)`, `filter_launcher_entries(entries)`, `DesktopSearchMatch`, `search_desktop_entries(entries, query)`, `search_desktop_entries_with_weights(entries, query, launch_counts)`, `find_desktop_entry(id_or_wm_class)`, `parse_desktop_entry(contents, id, path)`.
 - Icons (`desktop::icons`): `IconDirSpec`, `IconThemeInfo`, `XdgIconLookup` (`new`, `with_dirs`, `resolve`), `resolve_icon_path`, `default_icon_dirs`, `detect_active_icon_theme`, `parse_icon_theme_index`.
-- Process execution: `spawn_detached(program, args)`, `spawn_shell_detached(command)`.
+- Process execution: `spawn_detached(program, args)`, `spawn_detached_in(program, args, working_dir)`, `spawn_shell_detached(command)`.
 
 ## Audio (`audio`)
 

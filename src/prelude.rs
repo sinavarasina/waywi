@@ -7,8 +7,9 @@ pub use crate::capabilities::{Capabilities, Capability};
 #[cfg(feature = "clipboard")]
 pub use crate::clipboard::{Clipboard, ClipboardEvent, ClipboardSelection, ClipboardSnapshot};
 pub use crate::desktop::{
-    DesktopEntry, XdgIconLookup, resolve_icon_path, scan_desktop_entries, spawn_detached,
-    spawn_shell_detached,
+    DesktopEntry, DesktopSearchMatch, XdgIconLookup, filter_launcher_entries, resolve_icon_path,
+    scan_desktop_entries, search_desktop_entries, search_desktop_entries_with_weights,
+    spawn_detached, spawn_detached_in, spawn_shell_detached,
 };
 pub use crate::display::{Output, OutputId, OutputInfo};
 pub use crate::effect::EffectCtx;
