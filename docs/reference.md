@@ -200,9 +200,9 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `Sway::subscribe(map)`.
   - `SwayClient`: `from_env`, `with_socket`, `with_timeout`, `socket_path`, `workspaces`, `outputs`, `tree`, `version`, `switch_workspace`, `next_keyboard_layout`, `switch_keyboard_layout`, `raw_command`, `encode_frame`, `stream::parse_event_frame`.
 - **Control IPC (`control-ipc`)**:
-  - `Signal` (`Usr1`, `Usr2`), `Control::signal(signal, msg)`, `Control::socket(socket_name_or_path, map)`.
-  - `control::socket::{resolve_socket_path, send_command}`.
-  - Socket names resolve under `$XDG_RUNTIME_DIR` (fallback `/run/user/<euid>`; explicit paths preserved). The listener only replaces stale socket files owned by the current user after an `ECONNREFUSED` probe, and drains newline-terminated commands from same-UID peers only.
+  - `Signal` (`Usr1`, `Usr2`), `Control::signal(signal, msg)`, `Control::socket(socket_name_or_path, map)`, `Control::socket_requests(socket_name_or_path, map)`.
+  - `ControlRequest` (`command`, `into_command`, `can_reply`, `reply`), `control::socket::{resolve_socket_path, send_command, send_command_with_reply}`.
+  - Socket names resolve under `$XDG_RUNTIME_DIR` (fallback `/run/user/<euid>`; explicit paths preserved). The listener only replaces stale socket files owned by the current user after an `ECONNREFUSED` probe, reads newline-terminated commands non-blocking from same-UID peers (`4096`-byte input cap, `64` KiB reply cap, `16` pending clients with FIFO eviction and `2s` deadline), and optionally sends one-shot replies cleanly.
 
 ## D-Bus Subsystems (`dbus`)
 

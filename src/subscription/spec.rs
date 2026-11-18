@@ -207,6 +207,12 @@ pub(crate) enum SubscriptionSpec<M> {
         socket_path: PathBuf,
         map: FrameSharedFn<String, Option<M>>,
     },
+    #[cfg(feature = "control-ipc")]
+    ControlSocketRequest {
+        key: SubscriptionKey,
+        socket_path: PathBuf,
+        map: FrameSharedFn<crate::control::ControlRequest, Option<M>>,
+    },
 }
 
 /// Background stream or timer subscription returned from `subscriptions(state)`.
@@ -300,6 +306,19 @@ impl<M: 'static> Subscription<M> {
                             key,
                             socket_path,
                             map: FrameSharedFn::new(move |cmd| map.call(cmd).map(|msg| m.call(msg))),
+                        }
+                    }
+                    #[cfg(feature = "control-ipc")]
+                    SubscriptionSpec::ControlSocketRequest {
+                        key,
+                        socket_path,
+                        map,
+                    } => {
+                        let m = mapper.clone();
+                        SubscriptionSpec::ControlSocketRequest {
+                            key,
+                            socket_path,
+                            map: FrameSharedFn::new(move |req| map.call(req).map(|msg| m.call(msg))),
                         }
                     }
                     $(

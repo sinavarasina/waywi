@@ -207,9 +207,14 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
             }
         });
         let cmds: Vec<_> = rt.inbox.borrow_mut().control_commands.drain(..).collect();
-        push_mapped(&rt.inbox, cmds, |cmd, messages| {
+        push_mapped(&rt.inbox, cmds, |req, messages| {
             for (_, map) in &rt.sub_mgr.control_socket_subs {
-                if let Some(msg) = map.call(cmd.clone()) {
+                if let Some(msg) = map.call(req.command().to_owned()) {
+                    messages.push_back(msg);
+                }
+            }
+            for (_, map) in &rt.sub_mgr.control_request_subs {
+                if let Some(msg) = map.call(req.clone()) {
                     messages.push_back(msg);
                 }
             }

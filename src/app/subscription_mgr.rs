@@ -110,7 +110,7 @@ pub(crate) struct LoopInbox<M> {
     #[cfg(feature = "control-ipc")]
     pub(crate) control_signals: VecDeque<crate::control::Signal>,
     #[cfg(feature = "control-ipc")]
-    pub(crate) control_commands: VecDeque<String>,
+    pub(crate) control_commands: VecDeque<crate::control::ControlRequest>,
 }
 
 impl<M> Default for LoopInbox<M> {
@@ -288,7 +288,12 @@ pub(crate) struct SubscriptionManager<M> {
     #[cfg(feature = "control-ipc")]
     pub(crate) control_socket_subs: Vec<(PathBuf, FrameSharedFn<String, Option<M>>)>,
     #[cfg(feature = "control-ipc")]
-    socket_listener_token: Option<(PathBuf, calloop::RegistrationToken)>,
+    pub(crate) control_request_subs: Vec<(
+        PathBuf,
+        FrameSharedFn<crate::control::ControlRequest, Option<M>>,
+    )>,
+    #[cfg(feature = "control-ipc")]
+    control_socket: Option<crate::control::ControlSocketRegistration>,
 }
 
 impl<M: Clone + 'static> SubscriptionManager<M> {
@@ -380,7 +385,9 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             #[cfg(feature = "control-ipc")]
             control_socket_subs: Vec::new(),
             #[cfg(feature = "control-ipc")]
-            socket_listener_token: None,
+            control_request_subs: Vec::new(),
+            #[cfg(feature = "control-ipc")]
+            control_socket: None,
         }
     }
 
@@ -440,6 +447,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
         {
             self.control_signal_subs.clear();
             self.control_socket_subs.clear();
+            self.control_request_subs.clear();
         }
 
         for spec in specs {
@@ -568,6 +576,13 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                     socket_path, map, ..
                 } => {
                     self.control_socket_subs
+                        .push((socket_path.clone(), map.clone()));
+                }
+                #[cfg(feature = "control-ipc")]
+                SubscriptionSpec::ControlSocketRequest {
+                    socket_path, map, ..
+                } => {
+                    self.control_request_subs
                         .push((socket_path.clone(), map.clone()));
                 }
                 _ => {}
@@ -963,42 +978,40 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             let target_socket = clients
                 .control_socket_override
                 .map(PathBuf::from)
-                .or_else(|| self.control_socket_subs.first().map(|(p, _)| p.clone()));
+                .or_else(|| self.control_socket_subs.first().map(|(p, _)| p.clone()))
+                .or_else(|| self.control_request_subs.first().map(|(p, _)| p.clone()));
+            let reply_enabled = !self.control_request_subs.is_empty();
             match target_socket {
                 Some(path) => {
                     let needs_rebind = self
-                        .socket_listener_token
+                        .control_socket
                         .as_ref()
-                        .is_none_or(|(p, _)| *p != path);
+                        .is_none_or(|reg| reg.path() != path);
                     if needs_rebind {
-                        if let Some((old_path, old_tok)) = self.socket_listener_token.take() {
-                            loop_handle.remove(old_tok);
-                            let _ = std::fs::remove_file(old_path);
+                        if let Some(old) = self.control_socket.take() {
+                            old.remove(loop_handle);
                         }
-                        if let Ok(listener) = crate::control::bind_control_listener(&path) {
-                            use calloop::generic::Generic;
-                            use calloop::{Interest, Mode, PostAction};
-                            let inbox_cl = Rc::clone(inbox);
-                            let src = Generic::new(listener, Interest::READ, Mode::Level);
-                            if let Ok(token) = loop_handle.insert_source(src, move |_, fd, _| {
-                                let cmds = crate::control::accept_commands(fd);
-                                if !cmds.is_empty() {
-                                    let mut g = inbox_cl.borrow_mut();
-                                    for c in cmds {
-                                        g.control_commands.push_back(c);
-                                    }
+                        let inbox_cl = Rc::clone(inbox);
+                        if let Ok(reg) = crate::control::ControlSocketRegistration::bind_and_insert(
+                            path,
+                            loop_handle,
+                            reply_enabled,
+                            move |reqs| {
+                                let mut g = inbox_cl.borrow_mut();
+                                for req in reqs {
+                                    g.control_commands.push_back(req);
                                 }
-                                Ok(PostAction::Continue)
-                            }) {
-                                self.socket_listener_token = Some((path, token));
-                            }
+                            },
+                        ) {
+                            self.control_socket = Some(reg);
                         }
+                    } else if let Some(ref reg) = self.control_socket {
+                        reg.set_reply_enabled(reply_enabled);
                     }
                 }
                 None => {
-                    if let Some((old_path, old_tok)) = self.socket_listener_token.take() {
-                        loop_handle.remove(old_tok);
-                        let _ = std::fs::remove_file(old_path);
+                    if let Some(old) = self.control_socket.take() {
+                        old.remove(loop_handle);
                     }
                 }
             }
@@ -1062,9 +1075,8 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             if let Some(token) = self.signal_source_token.take() {
                 loop_handle.remove(token);
             }
-            if let Some((path, token)) = self.socket_listener_token.take() {
-                loop_handle.remove(token);
-                let _ = std::fs::remove_file(path);
+            if let Some(reg) = self.control_socket.take() {
+                reg.remove(loop_handle);
             }
         }
     }

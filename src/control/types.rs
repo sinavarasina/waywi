@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::arena::FrameSharedFn;
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
-use super::socket::resolve_socket_path;
+use super::socket::{ControlRequest, resolve_socket_path};
 
 /// Supported POSIX signals for lightweight external compositor-keybind triggers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +42,23 @@ impl Control {
         let resolved = resolve_socket_path(socket_name_or_path.as_ref());
         Subscription {
             spec: SubscriptionSpec::ControlSocket {
+                key: resolved.clone().into_subscription_key(),
+                socket_path: resolved,
+                map: FrameSharedFn::new(map),
+            },
+        }
+    }
+
+    /// Listens on a single-instance control Unix socket and yields [`ControlRequest`] values so
+    /// the application can send one-shot replies back to [`send_command_with_reply`](super::send_command_with_reply)
+    /// callers (one newline-delimited request and response per connection).
+    pub fn socket_requests<M: 'static>(
+        socket_name_or_path: impl AsRef<Path>,
+        map: impl Fn(ControlRequest) -> Option<M> + 'static,
+    ) -> Subscription<M> {
+        let resolved = resolve_socket_path(socket_name_or_path.as_ref());
+        Subscription {
+            spec: SubscriptionSpec::ControlSocketRequest {
                 key: resolved.clone().into_subscription_key(),
                 socket_path: resolved,
                 map: FrameSharedFn::new(map),

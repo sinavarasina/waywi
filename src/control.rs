@@ -3,6 +3,6 @@
 pub mod socket;
 pub mod types;
 
-pub(crate) use socket::{accept_commands, bind_control_listener};
-pub use socket::{resolve_socket_path, send_command};
+pub(crate) use socket::ControlSocketRegistration;
+pub use socket::{ControlRequest, resolve_socket_path, send_command, send_command_with_reply};
 pub use types::{Control, Signal};

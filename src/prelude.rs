@@ -60,7 +60,7 @@ pub use crate::audio::{Audio, AudioClient, AudioDevice, AudioEvent, AudioSnapsho
 pub use crate::audio::{AudioPlayer, SoundAsset, SoundData, SoundPreset};
 
 #[cfg(feature = "control-ipc")]
-pub use crate::control::{Control, Signal};
+pub use crate::control::{Control, ControlRequest, Signal};
 
 #[cfg(feature = "hyprland-ipc")]
 pub use crate::hyprland::{
