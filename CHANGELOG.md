@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-11-19
+
+### Added
+- **Desktop launcher & entry helpers (`desktop`)**: `TryExec` executability checks in `should_show_in_launcher()` / `filter_launcher_entries()`, `Path=` working directory support (`working_dir`, `spawn_detached_in`), `Terminal=true` resolution and execution (`terminal_argv`, `launch_with_terminal`), and scored entry search helpers (`DesktopSearchMatch`, `search_desktop_entries`, `search_desktop_entries_with_weights`).
+- **Headless input & scroll controllers (`input`)**: UI-agnostic `TextInputState` / `TextInputOutcome` (UTF-8 char-boundary editing, selection, word operations, masking, and IME composition handling) and `ScrollState` (offset clamping, wheel vs smooth delta handling, `ensure_visible`, `visible_range`, and `thumb_metrics`), plus `HeadlessRuntime::{scroll_surface_point, key_surface, simulate_ime, surface_ime_config}`.
+- **Wayland IME (`ime` feature, `zwp_text_input_v3`)**: Per-seat `zwp_text_input_manager_v3` / `zwp_text_input_v3` double-buffered composition (`preedit_string`, `commit_string`, `delete_surrounding_text`, `done`), `4000`-byte UTF-8 surrounding-text windowing (`ImeSurroundingText`), `ImeConfig`, `ImeEvent`, `Surface::{ime, on_ime}`, `Capability::TextInput`, and `wayland-server` `socketpair` roundtrip tests.
+- **Proportional text cursor measurement (`text`)**: `TextCursorMetrics`, `TextLayoutOptions`, and `EffectCtx::{measure_text_cursor, measure_text_cursor_with}` backed by `TextEngine`'s shared shaped buffer cache, along with `TextInputState::display_cursor_bytes` and software pixel cursor-line rendering tests.
+- **Audio stream app metadata (`audio`)**: `icon_name` (`application.icon_name` / `application.icon-name`) and `app_id` (`application.id` / `pipewire.access.portal.app_id`) fields on `AudioStream` and `AudioCapture`, shared lazy `StreamMetadata::extract` / `first_non_empty_prop_by` helpers, and PipeWire `Node::info` stream metadata/target updates.
+- **Two-way control socket requests (`control-ipc`)**: `Control::socket_requests`, `ControlRequest` (`command`, `into_command`, `can_reply`, `reply`), and `send_command_with_reply` for one-shot replies with non-blocking `Interest::WRITE` fallback and automatic write-half EOF on drop.
+
+### Changed
+- **Non-blocking control socket (`control-ipc`)**: Replaced the blocking `100ms` per-client read loop with non-blocking per-client `calloop` `Generic` sources and an on-demand `2s` deadline timer (dispatched immediately on `\n` while keeping connections open until `EOF` or `4096` bytes, and evicting the oldest pending connection FIFO above `16` concurrent peers).
+- Updated `docs/api.md`, `docs/architecture.md`, `docs/integrations.md`, `docs/reference.md`, and `docs/wayland.md` to match all new APIs and feature flags.
+
+### Fixed
+- Scroll hit-testing (`hit_test_scroll` / `RetainedSurface::dispatch_scroll_at`) now targets the topmost node binding `on_scroll` instead of stopping on clickable child items without scroll handlers; verified end-to-end with `Clip`, `Transform::translate`, `HeadlessRuntime`, and `SoftwareRenderer`.
+
 ## [0.1.6] - 2026-11-17
 
 ### Added
