@@ -1,4 +1,9 @@
 #[cfg(feature = "text")]
+use std::collections::HashMap;
+#[cfg(feature = "text")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "text")]
 use super::font::{Font, FontStyle, TextAlign};
 #[cfg(feature = "text")]
 use super::shared_str::SharedStr;
@@ -24,13 +29,13 @@ pub(crate) struct TextRasterTarget<'a> {
     pub(crate) clip: crate::geometry::BufferRect,
 }
 
-/// Shared `cosmic-text` font system and glyph cache with lazy system fallback discovery.
+/// Shared `cosmic-text` font system and glyph cache backed by a process-cached Fontconfig
+/// `fontdb::Database`.
 #[cfg(feature = "text")]
 pub(crate) struct TextEngine {
     font_system: cosmic_text::FontSystem,
     swash_cache: cosmic_text::SwashCache,
-    fallback_loaded: bool,
-    buffer_cache: std::collections::HashMap<TextShapeKey, CachedTextBuffer>,
+    buffer_cache: HashMap<TextShapeKey, CachedTextBuffer>,
 }
 
 #[cfg(feature = "text")]
@@ -54,21 +59,22 @@ struct CachedTextBuffer {
 }
 
 #[cfg(feature = "text")]
-impl TextEngine {
-    /// Initializes a lightweight `FontSystem` loading only primary UI font files initially to
-    /// avoid a 5–15 MB upfront system font scan.
-    pub(crate) fn new() -> Self {
-        let mut db = fontdb::Database::new();
-        let loaded_primary = Self::try_load_primary_fonts(&mut db);
-        let fallback_loaded = if !loaded_primary {
+fn shared_system_font_db() -> fontdb::Database {
+    static SYSTEM_FONT_DB: OnceLock<fontdb::Database> = OnceLock::new();
+    SYSTEM_FONT_DB
+        .get_or_init(|| {
+            let mut db = fontdb::Database::new();
             db.load_system_fonts();
-            true
-        } else {
-            false
-        };
-        db.set_sans_serif_family("DejaVu Sans");
-        db.set_monospace_family("DejaVu Sans Mono");
+            db
+        })
+        .clone()
+}
 
+#[cfg(feature = "text")]
+impl TextEngine {
+    /// Initializes a `FontSystem` from the process-cached system Fontconfig database.
+    pub(crate) fn new() -> Self {
+        let db = shared_system_font_db();
         let locale = std::env::var("LANG")
             .unwrap_or_else(|_| "en-US".to_owned())
             .split('.')
@@ -80,62 +86,7 @@ impl TextEngine {
         Self {
             font_system,
             swash_cache: cosmic_text::SwashCache::new(),
-            fallback_loaded,
-            buffer_cache: std::collections::HashMap::new(),
-        }
-    }
-
-    fn try_load_primary_fonts(db: &mut fontdb::Database) -> bool {
-        const CANDIDATES: &[&str] = &[
-            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
-            "/usr/share/fonts/cantarell/Cantarell-VF.otf",
-            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ];
-
-        let mut loaded_any = false;
-        for path in CANDIDATES {
-            let p = std::path::Path::new(path);
-            if p.exists() && db.load_font_file(p).is_ok() {
-                loaded_any = true;
-            }
-        }
-        loaded_any
-    }
-
-    fn load_system_fonts_and_invalidate(&mut self) {
-        if self.fallback_loaded {
-            return;
-        }
-        self.font_system.db_mut().load_system_fonts();
-        self.fallback_loaded = true;
-        // Clear any shapes measured before system fonts joined `fontdb` so measure and draw share
-        // identical font metrics within and across frames.
-        self.buffer_cache.clear();
-    }
-
-    fn ensure_requested_font_loaded(&mut self, font: &Font) {
-        if self.fallback_loaded {
-            return;
-        }
-        if let Some(ref fam) = font.family {
-            let target = fam.as_str();
-            let found = self.font_system.db().faces().any(|f| {
-                f.families
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(target))
-            });
-            if !found {
-                self.load_system_fonts_and_invalidate();
-            }
+            buffer_cache: HashMap::new(),
         }
     }
 
@@ -254,18 +205,14 @@ impl TextEngine {
         frame_seq: u64,
     ) -> &mut CachedTextBuffer {
         let s = params.style;
-        self.ensure_requested_font_loaded(s.font);
         if self.buffer_cache.len() >= 1024 && !self.buffer_cache.contains_key(&key) {
             self.buffer_cache
                 .retain(|_, v| frame_seq.saturating_sub(v.last_used_frame) < 120);
         }
 
         let font_system = &mut self.font_system;
-        let fallback_loaded = &mut self.fallback_loaded;
-        let mut fallback_triggered = false;
         let scale = params.scale.as_f32();
-        let inserted_key = key.clone();
-        self.buffer_cache.entry(key).or_insert_with(|| {
+        let entry = self.buffer_cache.entry(key).or_insert_with(|| {
             let fs_px = (s.font_size.0.max(1.0) * scale).max(1.0);
             let lh_px = compute_line_height_px(s.font_size, s.line_height_multiplier, scale);
             let metrics = cosmic_text::Metrics::new(fs_px, lh_px);
@@ -280,7 +227,14 @@ impl TextEngine {
             buffer.set_size(width_px, None);
 
             let family = match (&s.font.family, s.font.monospace) {
-                (Some(name), _) => cosmic_text::Family::Name(name.as_str()),
+                (Some(name), _) => match name.as_str() {
+                    "sans-serif" | "sans serif" => cosmic_text::Family::SansSerif,
+                    "monospace" => cosmic_text::Family::Monospace,
+                    "serif" => cosmic_text::Family::Serif,
+                    "cursive" => cosmic_text::Family::Cursive,
+                    "fantasy" => cosmic_text::Family::Fantasy,
+                    other => cosmic_text::Family::Name(other),
+                },
                 (None, true) => cosmic_text::Family::Monospace,
                 (None, false) => cosmic_text::Family::SansSerif,
             };
@@ -304,25 +258,6 @@ impl TextEngine {
             );
             buffer.shape_until_scroll(font_system, false);
 
-            if !*fallback_loaded
-                && buffer.layout_runs().any(|run| {
-                    run.glyphs
-                        .iter()
-                        .any(|g| g.glyph_id == 0 && g.end > g.start)
-                })
-            {
-                font_system.db_mut().load_system_fonts();
-                *fallback_loaded = true;
-                fallback_triggered = true;
-                buffer.set_text(
-                    params.content.as_str(),
-                    &attrs,
-                    cosmic_text::Shaping::Advanced,
-                    c_align,
-                );
-                buffer.shape_until_scroll(font_system, false);
-            }
-
             let mut max_w = 0.0_f32;
             let mut line_count = 0_usize;
             for run in buffer.layout_runs() {
@@ -341,18 +276,6 @@ impl TextEngine {
                 last_used_frame: frame_seq,
             }
         });
-        if fallback_triggered {
-            // Invalidate pre-fallback shapes while preserving the newly-shaped buffer.
-            let latest = self.buffer_cache.remove(&inserted_key);
-            self.buffer_cache.clear();
-            if let Some(buf) = latest {
-                self.buffer_cache.insert(inserted_key.clone(), buf);
-            }
-        }
-        let entry = self
-            .buffer_cache
-            .get_mut(&inserted_key)
-            .expect("shaped buffer cached");
         entry.last_used_frame = frame_seq;
         entry
     }
@@ -381,7 +304,6 @@ impl TextEngine {
             font_system,
             swash_cache,
             buffer_cache,
-            ..
         } = self;
         let cached = buffer_cache.get_mut(&key).expect("shaped buffer cached");
         let base_alpha = (f32::from(color.a) * opacity.clamp(0.0, 1.0)).round() as u8;
@@ -457,8 +379,8 @@ mod tests {
     #[test]
     fn unconstrained_auto_text_does_not_wrap_across_scales_or_font_loads() {
         let mut engine = TextEngine::new();
-        let font = Font::family("MesloLGS Nerd Font");
-        for sample in ["[4]:", "foot", "waywi-waybar — zsh"] {
+        let font = Font::monospace();
+        for sample in ["[1]:", "terminal", "workspace — editor"] {
             let content = SharedStr::from(sample);
             let measured = engine.measure_text(
                 &content,

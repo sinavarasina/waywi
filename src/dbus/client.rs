@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+use zbus::zvariant::{
+    Array, Dict, ObjectPath, OwnedValue, Signature, Structure, StructureBuilder, Value,
+};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
@@ -93,10 +95,11 @@ impl DbusActionLane {
 }
 
 /// Optional structured return metadata from a completed background D-Bus action.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct DbusActionPayload {
     pub(crate) reply_object_path: Option<String>,
     pub(crate) count: Option<usize>,
+    pub(crate) reply: Vec<DbusValue>,
 }
 
 impl DbusActionPayload {
@@ -104,6 +107,7 @@ impl DbusActionPayload {
         Self {
             reply_object_path: Some(path),
             count: None,
+            reply: Vec::new(),
         }
     }
 
@@ -111,6 +115,15 @@ impl DbusActionPayload {
         Self {
             reply_object_path: None,
             count: Some(count),
+            reply: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_reply(reply: Vec<DbusValue>) -> Self {
+        Self {
+            reply_object_path: None,
+            count: None,
+            reply,
         }
     }
 }
@@ -123,7 +136,7 @@ impl From<()> for DbusActionPayload {
 
 /// Asynchronous completion or error outcome emitted when a non-blocking [`DbusClient`] lane
 /// action finishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DbusActionResult {
     /// Subsystem lane that executed the action.
     pub lane: DbusActionLane,
@@ -141,6 +154,8 @@ pub struct DbusActionResult {
     /// Optional item count returned by the operation (such as the number of deleted saved Wi-Fi
     /// profiles from [`DbusClient::nm_forget_wifi_ssid`]).
     pub count: Option<usize>,
+    /// Decoded D-Bus reply body values returned by generic [`DbusClient::call_method`] calls.
+    pub reply: Vec<DbusValue>,
     /// `None` when the D-Bus call succeeded within its timeout, or `Some(message)` when the
     /// D-Bus call failed or timed out at runtime.
     pub error: Option<String>,
@@ -484,6 +499,7 @@ fn run_lane_thread(
                     target: item.target,
                     reply_object_path: None,
                     count: None,
+                    reply: Vec::new(),
                     error: Some(err_msg),
                 }
             }
@@ -494,6 +510,7 @@ fn run_lane_thread(
                 target: item.target,
                 reply_object_path: payload.reply_object_path,
                 count: payload.count,
+                reply: payload.reply,
                 error: None,
             },
             LaneExecOutcome::Finished(Err(err)) => DbusActionResult {
@@ -503,6 +520,7 @@ fn run_lane_thread(
                 target: item.target,
                 reply_object_path: None,
                 count: None,
+                reply: Vec::new(),
                 error: Some(err.to_string()),
             },
         };
@@ -877,6 +895,121 @@ impl DbusClient {
         self.call_lane_method_unit(lane, bus, destination, path, interface, method)
     }
 
+    /// Enqueues a generic D-Bus method call with typed [`DbusValue`] arguments on the appropriate
+    /// domain lane.
+    ///
+    /// Arguments are validated and encoded synchronously before enqueuing so invalid values (such
+    /// as malformed [`DbusValue::ObjectPath`]) fail immediately. Decoded reply arguments are
+    /// delivered asynchronously via [`DbusActionResult::reply`] on [`Dbus::action_results`].
+    pub fn call_method(
+        &self,
+        bus: DbusBus,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        method: &str,
+        args: &[DbusValue],
+    ) -> Result<()> {
+        let lane = classify_target_lane(destination, interface);
+        let dest = validate_bus_name(destination, "destination")?;
+        let path_owned = validate_object_path(path, "object path")?;
+        let iface = validate_bus_name(interface, "interface")?;
+        let method_owned = validate_bus_name(method, "method")?;
+        let encoded_args = encode_dbus_args(args)?;
+        let op = format!("{iface}.{method_owned}");
+        let target = path_owned.clone();
+        self.submit_lane_action(
+            LaneActionSpec::fast(lane, bus, op, target),
+            move |conn| async move {
+                let msg = if encoded_args.is_empty() {
+                    conn.call_method(
+                        Some(dest.as_str()),
+                        path_owned.as_str(),
+                        Some(iface.as_str()),
+                        method_owned.as_str(),
+                        &(),
+                    )
+                    .await
+                } else {
+                    let body = args_to_structure(encoded_args)?;
+                    conn.call_method(
+                        Some(dest.as_str()),
+                        path_owned.as_str(),
+                        Some(iface.as_str()),
+                        method_owned.as_str(),
+                        &body,
+                    )
+                    .await
+                }
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("{iface}.{method_owned} failed: {e}"))
+                })?;
+                Ok(DbusActionPayload::with_reply(decode_message_body(&msg)))
+            },
+        )
+    }
+
+    /// Invokes a generic D-Bus method synchronously with typed [`DbusValue`] arguments and returns
+    /// all decoded reply body values (`vec![]` when the method returns no values).
+    pub fn call_method_blocking(
+        &self,
+        bus: DbusBus,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        method: &str,
+        args: &[DbusValue],
+    ) -> Result<Vec<DbusValue>> {
+        let dest = validate_bus_name(destination, "destination")?;
+        let path_owned = validate_object_path(path, "object path")?;
+        let iface = validate_bus_name(interface, "interface")?;
+        let method_owned = validate_bus_name(method, "method")?;
+        let encoded_args = encode_dbus_args(args)?;
+        let conn = self.connection(bus)?;
+        let msg = if encoded_args.is_empty() {
+            conn.call_method(
+                Some(dest.as_str()),
+                path_owned.as_str(),
+                Some(iface.as_str()),
+                method_owned.as_str(),
+                &(),
+            )
+        } else {
+            let body = args_to_structure(encoded_args)?;
+            conn.call_method(
+                Some(dest.as_str()),
+                path_owned.as_str(),
+                Some(iface.as_str()),
+                method_owned.as_str(),
+                &body,
+            )
+        }
+        .map_err(|e| WaywiError::DbusError(format!("{iface}.{method_owned} failed: {e}")))?;
+        Ok(decode_message_body(&msg))
+    }
+
+    /// Enqueues a D-Bus property write via `org.freedesktop.DBus.Properties.Set` using a typed
+    /// [`DbusValue`].
+    pub fn set_property_value(
+        &self,
+        bus: DbusBus,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        property: &str,
+        value: &DbusValue,
+    ) -> Result<()> {
+        let owned = dbus_value_to_owned(value.unwrap_variant())?;
+        self.set_property(
+            bus,
+            destination,
+            path,
+            interface,
+            property,
+            Value::from(owned),
+        )
+    }
+
     pub(crate) fn call_lane_method_unit(
         &self,
         lane: DbusActionLane,
@@ -979,18 +1112,18 @@ pub(super) fn owned_value_to_dbus(val: &OwnedValue) -> DbusValue {
 pub(super) fn value_to_dbus(val: &Value<'_>) -> DbusValue {
     match val {
         Value::Str(s) => DbusValue::String(s.to_string()),
-        Value::ObjectPath(p) => DbusValue::String(p.to_string()),
+        Value::ObjectPath(p) => DbusValue::ObjectPath(p.to_string()),
         Value::Bool(b) => DbusValue::Bool(*b),
         Value::I16(v) => DbusValue::I64(i64::from(*v)),
-        Value::I32(v) => DbusValue::I64(i64::from(*v)),
+        Value::I32(v) => DbusValue::I32(*v),
         Value::I64(v) => DbusValue::I64(*v),
         Value::U8(v) => DbusValue::U64(u64::from(*v)),
         Value::U16(v) => DbusValue::U64(u64::from(*v)),
-        Value::U32(v) => DbusValue::U64(u64::from(*v)),
+        Value::U32(v) => DbusValue::U32(*v),
         Value::U64(v) => DbusValue::U64(*v),
         Value::F64(v) => DbusValue::F64(*v),
         Value::Array(arr) => DbusValue::Array(arr.iter().map(value_to_dbus).collect()),
-        Value::Structure(st) => DbusValue::Array(st.fields().iter().map(value_to_dbus).collect()),
+        Value::Structure(st) => DbusValue::Struct(st.fields().iter().map(value_to_dbus).collect()),
         Value::Dict(dict) => {
             let mut map = HashMap::new();
             for (k, v) in dict.iter() {
@@ -1002,6 +1135,126 @@ pub(super) fn value_to_dbus(val: &Value<'_>) -> DbusValue {
         }
         Value::Value(inner) => value_to_dbus(inner),
         other => DbusValue::String(format!("{other:?}")),
+    }
+}
+
+pub(super) fn decode_message_body(msg: &zbus::Message) -> Vec<DbusValue> {
+    if matches!(msg.header().signature(), Signature::Unit) {
+        return Vec::new();
+    }
+    msg.body()
+        .deserialize::<Structure<'_>>()
+        .ok()
+        .map(|st| st.fields().iter().map(value_to_dbus).collect())
+        .unwrap_or_default()
+}
+
+fn encode_dbus_args(args: &[DbusValue]) -> Result<Vec<OwnedValue>> {
+    args.iter().map(dbus_value_to_owned).collect()
+}
+
+fn args_to_structure(args: Vec<OwnedValue>) -> Result<Structure<'static>> {
+    let mut builder = StructureBuilder::new();
+    for arg in args {
+        builder.push_value(Value::from(arg));
+    }
+    builder
+        .build()
+        .map_err(|e| WaywiError::DbusError(format!("failed to build D-Bus argument body: {e}")))
+}
+
+fn dbus_value_to_owned(val: &DbusValue) -> Result<OwnedValue> {
+    let zv = dbus_value_to_zvariant(val)?;
+    OwnedValue::try_from(zv)
+        .map_err(|e| WaywiError::DbusError(format!("failed to encode D-Bus value: {e}")))
+}
+
+fn dbus_value_to_zvariant(val: &DbusValue) -> Result<Value<'static>> {
+    match val {
+        DbusValue::String(s) => Ok(Value::from(s.clone())),
+        DbusValue::ObjectPath(p) => {
+            let path = ObjectPath::try_from(p.clone()).map_err(|e| {
+                WaywiError::DbusError(format!("invalid D-Bus object path `{p}`: {e}"))
+            })?;
+            Ok(Value::from(path))
+        }
+        DbusValue::Bool(b) => Ok(Value::from(*b)),
+        DbusValue::I32(v) => Ok(Value::from(*v)),
+        DbusValue::U32(v) => Ok(Value::from(*v)),
+        DbusValue::I64(v) => Ok(Value::from(*v)),
+        DbusValue::U64(v) => Ok(Value::from(*v)),
+        DbusValue::F64(v) => Ok(Value::from(*v)),
+        DbusValue::Variant(inner) => {
+            let encoded = dbus_value_to_zvariant(inner)?;
+            Ok(Value::Value(Box::new(encoded)))
+        }
+        DbusValue::Struct(fields) => {
+            if fields.is_empty() {
+                return Err(WaywiError::DbusError(
+                    "D-Bus struct must contain at least one field".to_owned(),
+                ));
+            }
+            let mut builder = StructureBuilder::new();
+            for field in fields {
+                builder.push_value(dbus_value_to_zvariant(field)?);
+            }
+            let structure = builder.build().map_err(|e| {
+                WaywiError::DbusError(format!("failed to encode D-Bus struct: {e}"))
+            })?;
+            Ok(Value::Structure(structure))
+        }
+        DbusValue::Array(items) => {
+            if items.is_empty() {
+                Ok(Value::Array(Array::new(&Signature::Variant)))
+            } else {
+                let mut converted = Vec::with_capacity(items.len());
+                for item in items {
+                    converted.push(dbus_value_to_zvariant(item)?);
+                }
+                let first_sig = converted[0].value_signature().clone();
+                let homogeneous = converted
+                    .iter()
+                    .skip(1)
+                    .all(|v| v.value_signature() == &first_sig);
+                if homogeneous {
+                    let mut arr = Array::new(&first_sig);
+                    for item in converted {
+                        arr.append(item).map_err(|e| {
+                            WaywiError::DbusError(format!("failed to encode D-Bus array: {e}"))
+                        })?;
+                    }
+                    Ok(Value::Array(arr))
+                } else {
+                    let mut arr = Array::new(&Signature::Variant);
+                    for item in converted {
+                        let wrapped = match item {
+                            Value::Value(_) => item,
+                            other => Value::Value(Box::new(other)),
+                        };
+                        arr.append(wrapped).map_err(|e| {
+                            WaywiError::DbusError(format!(
+                                "failed to encode D-Bus variant array: {e}"
+                            ))
+                        })?;
+                    }
+                    Ok(Value::Array(arr))
+                }
+            }
+        }
+        DbusValue::Dict(map) => {
+            let mut dict = Dict::new(&Signature::Str, &Signature::Variant);
+            for (k, v) in map {
+                let inner = dbus_value_to_zvariant(v)?;
+                let wrapped = match inner {
+                    Value::Value(_) => inner,
+                    other => Value::Value(Box::new(other)),
+                };
+                dict.append(Value::from(k.clone()), wrapped).map_err(|e| {
+                    WaywiError::DbusError(format!("failed to encode D-Bus dict entry `{k}`: {e}"))
+                })?;
+            }
+            Ok(Value::Dict(dict))
+        }
     }
 }
 
@@ -1038,11 +1291,12 @@ mod tests {
             lane: DbusActionLane::NetworkManager,
             bus: DbusBus::System,
             operation: "NetworkManager.AddAndActivateConnection".to_owned(),
-            target: "ITERA_WiFi".to_owned(),
+            target: "Example_WiFi".to_owned(),
             reply_object_path: Some(
                 "/org/freedesktop/NetworkManager/ActiveConnection/9".to_owned(),
             ),
             count: None,
+            reply: Vec::new(),
             error: None,
         });
         assert!(outbox.last_result().is_some_and(|r| r.is_ok()));
@@ -1055,6 +1309,7 @@ mod tests {
             target: "/org/bluez/hci0/dev_11_22_33_44_55_66".to_owned(),
             reply_object_path: None,
             count: None,
+            reply: Vec::new(),
             error: Some("Device1.Connect failed: Host is down".to_owned()),
         });
         assert!(outbox.last_result().is_some_and(|r| r.is_err()));
@@ -1075,5 +1330,142 @@ mod tests {
         );
         timer.shutdown();
         assert!(matches!(outcome, LaneExecOutcome::TimedOut));
+    }
+
+    #[test]
+    fn encodes_and_decodes_dbus_message_bodies_with_exact_wire_signatures() {
+        // 0 args -> Unit signature
+        let empty_msg = zbus::Message::method_call("/org/example/Obj", "Ping")
+            .unwrap()
+            .interface("org.example.Iface")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        assert_eq!(empty_msg.header().signature().to_string_no_parens(), "");
+        assert!(decode_message_body(&empty_msg).is_empty());
+
+        // Single i32 argument (e.g. GameMode RegisterGame(i))
+        let single_args = encode_dbus_args(&[DbusValue::I32(42195)]).unwrap();
+        let single_body = args_to_structure(single_args).unwrap();
+        let single_msg =
+            zbus::Message::method_call("/com/feralinteractive/GameMode", "RegisterGame")
+                .unwrap()
+                .interface("com.feralinteractive.GameMode")
+                .unwrap()
+                .build(&single_body)
+                .unwrap();
+        assert_eq!(single_msg.header().signature().to_string_no_parens(), "i");
+        assert_eq!(
+            decode_message_body(&single_msg),
+            vec![DbusValue::I32(42195)]
+        );
+
+        // Multi-argument call with object path, string array, and a{sv} dict
+        let mut props = HashMap::new();
+        props.insert("weight".to_owned(), DbusValue::U32(90));
+        props.insert("active".to_owned(), DbusValue::Bool(true));
+        let multi_input = vec![
+            DbusValue::ObjectPath("/org/example/Unit".to_owned()),
+            DbusValue::String("app-example.scope".to_owned()),
+            DbusValue::Array(vec![
+                DbusValue::String("alpha".to_owned()),
+                DbusValue::String("beta".to_owned()),
+            ]),
+            DbusValue::Dict(props.clone()),
+        ];
+        let encoded = encode_dbus_args(&multi_input).unwrap();
+        let body = args_to_structure(encoded).unwrap();
+        let multi_msg = zbus::Message::method_call("/org/example/Service", "ApplyConfig")
+            .unwrap()
+            .interface("org.example.Service")
+            .unwrap()
+            .build(&body)
+            .unwrap();
+        assert_eq!(
+            multi_msg.header().signature().to_string_no_parens(),
+            "osasa{sv}"
+        );
+        assert_eq!(decode_message_body(&multi_msg), multi_input);
+
+        // Heterogeneous array falls back to `av`
+        let mixed = vec![DbusValue::Array(vec![
+            DbusValue::I32(7),
+            DbusValue::String("ok".to_owned()),
+        ])];
+        let mixed_body = args_to_structure(encode_dbus_args(&mixed).unwrap()).unwrap();
+        let mixed_msg = zbus::Message::method_call("/org/example/Obj", "Mixed")
+            .unwrap()
+            .interface("org.example.Iface")
+            .unwrap()
+            .build(&mixed_body)
+            .unwrap();
+        assert_eq!(mixed_msg.header().signature().to_string_no_parens(), "av");
+        assert_eq!(decode_message_body(&mixed_msg), mixed);
+
+        // systemd1.Manager.SetUnitProperties signature: `sba(sv)`
+        let systemd_props = vec![
+            DbusValue::String("app-example.scope".to_owned()),
+            DbusValue::Bool(true),
+            DbusValue::Array(vec![
+                DbusValue::Struct(vec![
+                    DbusValue::String("MemoryLow".to_owned()),
+                    DbusValue::variant(DbusValue::U64(4 * 1024 * 1024 * 1024)),
+                ]),
+                DbusValue::Struct(vec![
+                    DbusValue::String("CPUWeight".to_owned()),
+                    DbusValue::variant(DbusValue::U64(200)),
+                ]),
+            ]),
+        ];
+        let systemd_body = args_to_structure(encode_dbus_args(&systemd_props).unwrap()).unwrap();
+        let systemd_msg =
+            zbus::Message::method_call("/org/freedesktop/systemd1", "SetUnitProperties")
+                .unwrap()
+                .interface("org.freedesktop.systemd1.Manager")
+                .unwrap()
+                .build(&systemd_body)
+                .unwrap();
+        assert_eq!(
+            systemd_msg.header().signature().to_string_no_parens(),
+            "sba(sv)"
+        );
+        assert_eq!(
+            decode_message_body(&systemd_msg),
+            vec![
+                DbusValue::String("app-example.scope".to_owned()),
+                DbusValue::Bool(true),
+                DbusValue::Array(vec![
+                    DbusValue::Struct(vec![
+                        DbusValue::String("MemoryLow".to_owned()),
+                        DbusValue::U64(4 * 1024 * 1024 * 1024),
+                    ]),
+                    DbusValue::Struct(vec![
+                        DbusValue::String("CPUWeight".to_owned()),
+                        DbusValue::U64(200),
+                    ]),
+                ]),
+            ]
+        );
+
+        // Nested struct/variant + explicit Variant inside Dict does not double-wrap `v`
+        let mut dict_with_variant = HashMap::new();
+        dict_with_variant.insert(
+            "mode".to_owned(),
+            DbusValue::variant(DbusValue::String("replace".to_owned())),
+        );
+        let dict_body =
+            args_to_structure(encode_dbus_args(&[DbusValue::Dict(dict_with_variant)]).unwrap())
+                .unwrap();
+        let dict_msg = zbus::Message::method_call("/org/example/Obj", "Opts")
+            .unwrap()
+            .interface("org.example.Iface")
+            .unwrap()
+            .build(&dict_body)
+            .unwrap();
+        assert_eq!(dict_msg.header().signature().to_string_no_parens(), "a{sv}");
+
+        // Invalid object path and empty struct rejected synchronously before enqueuing
+        assert!(encode_dbus_args(&[DbusValue::ObjectPath("not/a/valid/path".to_owned())]).is_err());
+        assert!(encode_dbus_args(&[DbusValue::Struct(Vec::new())]).is_err());
     }
 }

@@ -31,7 +31,10 @@ pub use memory::{MemoryPsi, MemorySnapshot};
 pub use network::{
     NetInterfaceKind, NetInterfaceSnapshot, NetLinkState, NetworkSampler, NetworkSnapshot,
 };
-pub use os::{LoadAverage, OsInfo, UptimeSnapshot};
+pub use os::{
+    LoadAverage, OsInfo, ProcessCgroupInfo, UptimeSnapshot, parse_process_cgroup,
+    read_process_cgroup,
+};
 pub use privacy::{
     PrivacyAccessEntry, PrivacyAccessKind, PrivacyAccessSource, PrivacyMonitor, PrivacySnapshot,
 };

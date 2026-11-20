@@ -79,7 +79,7 @@ impl<'a> CompositorClient<'a> {
         if let Some(h) = self.hyprland {
             return match target {
                 WorkspaceTarget::Id(id) => h.switch_workspace(crate::hyprland::WorkspaceId(id)),
-                WorkspaceTarget::Name(name) => h.dispatch("workspace", &format!("name:{name}")),
+                WorkspaceTarget::Name(name) => h.switch_workspace_name(&name),
             };
         }
         #[cfg(feature = "sway-ipc")]

@@ -1401,9 +1401,9 @@ mod tests {
     #[test]
     fn builds_wifi_connection_settings_for_wpa2_wpa3_sae_owe_and_open() {
         let wpa = build_wifi_connection_settings(
-            "ITERA_Staff",
+            "Corp_Staff",
             NmWifiSecurity::WpaPsk,
-            Some("rahasia123"),
+            Some("secret123"),
             false,
         );
         assert!(wpa.contains_key("connection"));
@@ -1414,9 +1414,9 @@ mod tests {
         );
 
         let sae = build_wifi_connection_settings(
-            "ITERA_WiFi6",
+            "Home_WiFi6",
             NmWifiSecurity::Wpa3Sae,
-            Some("rahasia_sae"),
+            Some("secret_sae"),
             false,
         );
         assert_eq!(
@@ -1424,21 +1424,20 @@ mod tests {
             Some(&Value::from("sae"))
         );
 
-        let owe =
-            build_wifi_connection_settings("ITERA_Public_OWE", NmWifiSecurity::Owe, None, false);
+        let owe = build_wifi_connection_settings("Public_OWE", NmWifiSecurity::Owe, None, false);
         assert_eq!(
             owe["802-11-wireless-security"].get("key-mgmt"),
             Some(&Value::from("owe"))
         );
 
-        let open = build_wifi_connection_settings("ITERA_Guest", NmWifiSecurity::Open, None, true);
+        let open = build_wifi_connection_settings("Guest_Open", NmWifiSecurity::Open, None, true);
         assert!(!open.contains_key("802-11-wireless-security"));
 
         let mut raw_settings: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
         let mut conn_sec = HashMap::new();
         conn_sec.insert(
             "id".into(),
-            OwnedValue::try_from(Value::from("ITERA_Staff")).unwrap(),
+            OwnedValue::try_from(Value::from("Corp_Staff")).unwrap(),
         );
         conn_sec.insert(
             "uuid".into(),
@@ -1455,7 +1454,7 @@ mod tests {
         let mut wifi_sec = HashMap::new();
         wifi_sec.insert(
             "ssid".into(),
-            OwnedValue::try_from(Value::from(b"ITERA_Staff".to_vec())).unwrap(),
+            OwnedValue::try_from(Value::from(b"Corp_Staff".to_vec())).unwrap(),
         );
         raw_settings.insert("connection".into(), conn_sec);
         raw_settings.insert("802-11-wireless".into(), wifi_sec);
@@ -1465,8 +1464,8 @@ mod tests {
             &raw_settings,
         )
         .expect("saved profile parsed");
-        assert_eq!(saved.id, "ITERA_Staff");
-        assert_eq!(saved.ssid.as_deref(), Some("ITERA_Staff"));
+        assert_eq!(saved.id, "Corp_Staff");
+        assert_eq!(saved.ssid.as_deref(), Some("Corp_Staff"));
         assert_eq!(saved.timestamp, 1_700_000_000);
     }
 }

@@ -173,9 +173,30 @@ fn dbus_value_conversions_are_safe() {
         DbusValue::String("Playing".into()).as_str(),
         Some("Playing")
     );
+    assert_eq!(
+        DbusValue::ObjectPath("/org/example/Obj".into()).as_object_path(),
+        Some("/org/example/Obj")
+    );
+    assert_eq!(
+        DbusValue::ObjectPath("/org/example/Obj".into()).as_str(),
+        Some("/org/example/Obj")
+    );
     assert_eq!(DbusValue::Bool(true).as_bool(), Some(true));
+    assert_eq!(DbusValue::I32(-7).as_i32(), Some(-7));
+    assert_eq!(DbusValue::I32(-7).as_i64(), Some(-7));
+    assert_eq!(DbusValue::I32(-7).as_u32(), None);
+    assert_eq!(DbusValue::U32(42).as_u32(), Some(42));
+    assert_eq!(DbusValue::U32(42).as_u64(), Some(42));
     assert_eq!(DbusValue::U64(42).as_i64(), Some(42));
     assert_eq!(DbusValue::I64(-1).as_u64(), None);
+    let prop = DbusValue::Struct(vec![
+        DbusValue::String("CPUWeight".into()),
+        DbusValue::variant(DbusValue::U64(200)),
+    ]);
+    let fields = prop.as_struct().expect("struct fields");
+    assert_eq!(fields[0].as_str(), Some("CPUWeight"));
+    assert_eq!(fields[1].as_u64(), Some(200));
+    assert_eq!(fields[1].as_variant(), Some(&DbusValue::U64(200)));
 
     let mpris = MprisSnapshot {
         service_name: "org.mpris.MediaPlayer2.playerctld".into(),

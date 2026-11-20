@@ -982,7 +982,7 @@ mod tests {
             path.clone(),
             &lh,
             MAX_PENDING_CONTROL_CLIENTS,
-            Duration::from_millis(80),
+            Duration::from_millis(250),
             false,
             move |reqs| {
                 rec_cb
@@ -996,27 +996,35 @@ mod tests {
         let mut silent_clients: Vec<UnixStream> = Vec::with_capacity(20);
         for _ in 0..20 {
             silent_clients.push(UnixStream::connect(&path).unwrap());
-            el.dispatch(Some(Duration::from_millis(2)), &mut ())
+            el.dispatch(Some(Duration::from_millis(10)), &mut ())
                 .unwrap();
         }
+        el.dispatch(Some(Duration::ZERO), &mut ()).unwrap();
         assert_eq!(reg.pending_count(), MAX_PENDING_CONTROL_CLIENTS);
         assert!(reg.has_active_timer());
 
         // Oldest 4 silent clients (0..4) were evicted by FIFO and already received EOF.
-        for old in &mut silent_clients[..4] {
-            old.set_nonblocking(true).unwrap();
+        // Use a short blocking read timeout instead of a single non-blocking poll so concurrent
+        // `fork -> exec` in parallel tests cannot transiently pin the server FD before `CLOEXEC`.
+        for (idx, old) in silent_clients[..4].iter_mut().enumerate() {
+            old.set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
             let mut b = [0u8; 1];
-            assert!(matches!(old.read(&mut b), Ok(0)));
+            let res = old.read(&mut b);
+            assert!(
+                matches!(res, Ok(0)),
+                "evicted silent client {idx} expected Ok(0), got {res:?}"
+            );
         }
 
         // Even while 16 pending slots are full (< deadline), a split-write 17th client still gets
         // accepted via FIFO eviction and delivers its command without blocking.
         let mut split17 = UnixStream::connect(&path).unwrap();
-        el.dispatch(Some(Duration::from_millis(2)), &mut ())
+        el.dispatch(Some(Duration::from_millis(10)), &mut ())
             .unwrap();
         split17.write_all(b"while-full\n").unwrap();
         drop(split17);
-        let full_end = Instant::now() + Duration::from_millis(60);
+        let full_end = Instant::now() + Duration::from_millis(100);
         while received.borrow().is_empty() && Instant::now() < full_end {
             el.dispatch(Some(Duration::from_millis(5)), &mut ())
                 .unwrap();
@@ -1024,16 +1032,16 @@ mod tests {
         assert_eq!(*received.borrow(), vec!["while-full".to_owned()]);
         received.borrow_mut().clear();
 
-        // Wait past the 80ms deadline without dispatching, then connect a fresh silent client:
+        // Wait past the 250ms deadline without dispatching, then connect a fresh silent client:
         // listener evicts expired clients cleanly (cancelling stale timer) so pending_count <= 1.
-        std::thread::sleep(Duration::from_millis(95));
+        std::thread::sleep(Duration::from_millis(270));
         let _fresh_silent = UnixStream::connect(&path).unwrap();
-        el.dispatch(Some(Duration::from_millis(5)), &mut ())
+        el.dispatch(Some(Duration::from_millis(10)), &mut ())
             .unwrap();
         assert!(reg.pending_count() <= 1);
 
         // Wait past the deadline for remaining entries -> all silent clients are evicted with EOF.
-        let wait_end = Instant::now() + Duration::from_millis(250);
+        let wait_end = Instant::now() + Duration::from_millis(450);
         while (reg.pending_count() > 0 || reg.has_active_timer()) && Instant::now() < wait_end {
             el.dispatch(Some(Duration::from_millis(15)), &mut ())
                 .unwrap();

@@ -6,6 +6,7 @@ pub use client::{HyprlandClient, apply_workspace_event};
 pub(crate) use stream::HyprlandListenerHandle;
 pub use stream::parse_event_line;
 pub use types::{
-    ClientInfo, Hyprland, HyprlandEvent, HyprlandSockets, MonitorInfo, WorkspaceId, WorkspaceInfo,
-    WorkspaceRefJson,
+    ClientInfo, CursorPos, Hyprland, HyprlandDevices, HyprlandEvent, HyprlandKeyboard,
+    HyprlandMouse, HyprlandOption, HyprlandOptionValue, HyprlandSockets, HyprlandVersion,
+    MonitorInfo, WorkspaceId, WorkspaceInfo, WorkspaceRefJson,
 };

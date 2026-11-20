@@ -1020,7 +1020,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
 
     pub(crate) fn cleanup(&mut self, loop_handle: &LoopHandle<'static, WaylandState>) {
         let _ = loop_handle;
-        #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc", feature = "dbus"))]
+        #[cfg(feature = "dbus")]
         macro_rules! stop_worker {
             ($($slot:expr),+ $(,)?) => {
                 $(

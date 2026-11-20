@@ -284,18 +284,35 @@ mod pw_monitor {
 
     pub(super) fn run_pipewire_privacy_thread(
         shared: Arc<Mutex<Vec<PrivacyAccessEntry>>>,
-        stop: Arc<AtomicBool>,
+        stop_rx: pw::channel::Receiver<()>,
     ) {
         pw::init();
         let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else {
             return;
         };
+        let ml_stop = mainloop.downgrade();
+        let _stop_listener = stop_rx.attach(mainloop.loop_(), move |()| {
+            if let Some(ml) = ml_stop.upgrade() {
+                ml.quit();
+            }
+        });
         let Ok(ctx) = pw::context::ContextRc::new(&mainloop, None) else {
             return;
         };
         let Ok(core) = ctx.connect_rc(None) else {
             return;
         };
+        let ml_err = mainloop.downgrade();
+        let _core_listener = core
+            .add_listener_local()
+            .error(move |id, _seq, _res, _msg| {
+                if id == 0
+                    && let Some(ml) = ml_err.upgrade()
+                {
+                    ml.quit();
+                }
+            })
+            .register();
         let Ok(registry) = core.get_registry_rc() else {
             return;
         };
@@ -399,12 +416,7 @@ mod pw_monitor {
             })
             .register();
 
-        let loop_ref = mainloop.loop_();
-        while !stop.load(Ordering::Acquire) {
-            let _ = loop_ref.iterate(pw::loop_::Timeout::Finite(
-                std::time::Duration::from_millis(80),
-            ));
-        }
+        mainloop.run();
     }
 }
 
@@ -413,7 +425,7 @@ pub struct PrivacyMonitor {
     #[cfg(feature = "pipewire")]
     pw_entries: Arc<Mutex<Vec<PrivacyAccessEntry>>>,
     #[cfg(feature = "pipewire")]
-    pw_stop: Arc<AtomicBool>,
+    pw_stop: Option<pipewire::channel::Sender<()>>,
     #[cfg(feature = "pipewire")]
     pw_join: Option<JoinHandle<()>>,
     #[cfg(feature = "dbus")]
@@ -445,7 +457,7 @@ impl PrivacyMonitor {
             #[cfg(feature = "pipewire")]
             pw_entries: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "pipewire")]
-            pw_stop: Arc::new(AtomicBool::new(false)),
+            pw_stop: None,
             #[cfg(feature = "pipewire")]
             pw_join: None,
             #[cfg(feature = "dbus")]
@@ -463,10 +475,11 @@ impl PrivacyMonitor {
         #[cfg(feature = "pipewire")]
         if self.pw_join.is_none() {
             let shared = Arc::clone(&self.pw_entries);
-            let stop = Arc::clone(&self.pw_stop);
+            let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
+            self.pw_stop = Some(stop_tx);
             self.pw_join = std::thread::Builder::new()
                 .name("waywi-privacy-pw".to_owned())
-                .spawn(move || pw_monitor::run_pipewire_privacy_thread(shared, stop))
+                .spawn(move || pw_monitor::run_pipewire_privacy_thread(shared, stop_rx))
                 .ok();
         }
         #[cfg(feature = "dbus")]
@@ -486,11 +499,12 @@ impl PrivacyMonitor {
     pub fn stop_background(&mut self) {
         #[cfg(feature = "pipewire")]
         {
-            self.pw_stop.store(true, Ordering::Release);
+            if let Some(tx) = self.pw_stop.take() {
+                let _ = tx.send(());
+            }
             if let Some(j) = self.pw_join.take() {
                 let _ = j.join();
             }
-            self.pw_stop = Arc::new(AtomicBool::new(false));
             if let Ok(mut g) = self.pw_entries.lock() {
                 g.clear();
             }

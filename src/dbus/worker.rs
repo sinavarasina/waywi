@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use zbus::zvariant::Value;
-
-use super::client::{DbusSharedBus, connect_shared_bus, value_to_dbus};
+use super::client::{DbusSharedBus, connect_shared_bus, decode_message_body};
 use super::types::{DbusBus, DbusSignalEvent};
 
 /// Zero-polling asynchronous stop signal shared across D-Bus background workers.
@@ -133,12 +131,7 @@ impl DbusSignalWorker {
                                     member: header
                                         .member()
                                         .map_or_else(|| member.clone(), |m| m.to_string()),
-                                    args: msg
-                                        .body()
-                                        .deserialize::<Value<'_>>()
-                                        .ok()
-                                        .map(|v| vec![value_to_dbus(&v)])
-                                        .unwrap_or_default(),
+                                    args: decode_message_body(&msg),
                                 };
                                 let _ = sender.send(ev);
                             }
