@@ -42,7 +42,7 @@ pub use crate::system::{
     CalendarRow, DataRate, DdcMonitorInfo, FreqUnit, LocalDateTime, NetInterfaceKind,
     NetInterfaceSnapshot, NetLinkState, NetworkSnapshot, PrivacyAccessEntry, PrivacyAccessKind,
     PrivacyAccessSource, PrivacySnapshot, RateUnit, SnapshotState, System, TimeFormat,
-    TimeSnapshot,
+    TimeSnapshot, UsbDevice, read_usb_devices, read_usb_devices_from,
 };
 pub use crate::text::{
     Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextCursorMetrics, TextLayoutOptions,
@@ -86,7 +86,8 @@ pub use crate::dbus::{
     NotificationCloseReason, NotificationEvent, NotificationImageData, NotificationUrgency,
     PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
     TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
-    UPowerDevice, UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
+    UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice, UPowerDeviceKind,
+    UPowerDeviceState, UPowerSnapshot,
 };
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{

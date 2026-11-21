@@ -2,7 +2,7 @@
 //!
 //! Service-specific helpers live in dedicated submodules including [`bluetooth`], [`logind`],
 //! [`modem`], [`mpris`], [`notifications`], [`tray`], [`power_profiles`], [`network_manager`],
-//! [`upower`], [`idle_privacy`], and [`global_shortcuts`].
+//! [`udisks`], [`upower`], [`idle_privacy`], and [`global_shortcuts`].
 
 pub mod bluetooth;
 pub mod client;
@@ -17,6 +17,7 @@ pub mod notifications;
 pub mod power_profiles;
 pub mod tray;
 pub mod types;
+pub mod udisks;
 pub mod upower;
 pub(crate) mod worker;
 pub(crate) mod zvariant_helpers;
@@ -60,6 +61,8 @@ pub use tray::{
     TrayToolTip,
 };
 pub use types::{Dbus, DbusBus, DbusSignalEvent, DbusValue};
+pub(crate) use udisks::spawn_udisks_worker;
+pub use udisks::{UDisksBlockDevice, UDisksDrive, UDisksSnapshot};
 pub(crate) use upower::spawn_upower_worker;
 pub use upower::{UPowerDevice, UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot};
 pub(crate) use worker::{DbusSignalWorker, ServiceWatchWorker};

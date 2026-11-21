@@ -25,7 +25,7 @@ pub use disk::{DiskDeviceIo, DiskMount, DiskSampler, DiskSnapshot};
 pub use gpu::{GpuDeviceSnapshot, GpuSnapshot, GpuVendor};
 pub use hardware::{
     BacklightDevice, BatteryInfo, BrightnessSnapshot, DdcMonitorInfo, PowerStatus, ThermalSensor,
-    set_backlight_percent, set_backlight_raw,
+    UsbDevice, read_usb_devices, read_usb_devices_from, set_backlight_percent, set_backlight_raw,
 };
 pub use memory::{MemoryPsi, MemorySnapshot};
 pub use network::{

@@ -11,7 +11,7 @@ use super::builders::SnapshotState;
 use super::cpu::{self, CpuSnapshot};
 use super::disk::{self, DiskSnapshot};
 use super::gpu::{self, GpuSnapshot};
-use super::hardware::{self, BatteryInfo, BrightnessSnapshot, DdcWorker, ThermalSensor};
+use super::hardware::{self, BatteryInfo, BrightnessSnapshot, DdcWorker, ThermalSensor, UsbDevice};
 use super::memory::{self, MemorySnapshot};
 use super::network::{self, NetworkSnapshot};
 use super::os::{self, LoadAverage, OsInfo, UptimeSnapshot};
@@ -239,6 +239,11 @@ impl SystemProviders {
     /// Enumerates thermal sensors exposed under `/sys/class/hwmon`.
     pub fn sensors(&self) -> Result<Vec<ThermalSensor>> {
         hardware::read_sensors()
+    }
+
+    /// Enumerates attached USB hardware devices from `/sys/bus/usb/devices`.
+    pub fn usb_devices(&self) -> Result<Vec<UsbDevice>> {
+        hardware::read_usb_devices()
     }
 
     /// Reads `/proc/uptime` and `/proc/loadavg`.

@@ -89,6 +89,8 @@ pub(crate) struct LoopInbox<M> {
     #[cfg(feature = "dbus")]
     pub(crate) dbus_upower: VecDeque<crate::dbus::UPowerSnapshot>,
     #[cfg(feature = "dbus")]
+    pub(crate) dbus_udisks: VecDeque<crate::dbus::UDisksSnapshot>,
+    #[cfg(feature = "dbus")]
     pub(crate) dbus_logind: VecDeque<crate::dbus::LogindEvent>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_bluetooth: VecDeque<crate::dbus::BluetoothSnapshot>,
@@ -133,6 +135,8 @@ impl<M> Default for LoopInbox<M> {
             dbus_network_manager: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_upower: VecDeque::new(),
+            #[cfg(feature = "dbus")]
+            dbus_udisks: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_logind: VecDeque::new(),
             #[cfg(feature = "dbus")]
@@ -232,6 +236,10 @@ pub(crate) struct SubscriptionManager<M> {
     pub(crate) dbus_upower_subs: Vec<FrameSharedFn<crate::dbus::UPowerSnapshot, M>>,
     #[cfg(feature = "dbus")]
     dbus_upower_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_udisks_subs: Vec<FrameSharedFn<crate::dbus::UDisksSnapshot, M>>,
+    #[cfg(feature = "dbus")]
+    dbus_udisks_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_logind_subs: Vec<FrameSharedFn<crate::dbus::LogindEvent, M>>,
     #[cfg(feature = "dbus")]
@@ -343,6 +351,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             #[cfg(feature = "dbus")]
             dbus_upower_worker: None,
             #[cfg(feature = "dbus")]
+            dbus_udisks_subs: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_udisks_worker: None,
+            #[cfg(feature = "dbus")]
             dbus_logind_subs: Vec::new(),
             #[cfg(feature = "dbus")]
             dbus_logind_worker: None,
@@ -432,6 +444,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_power_profile_subs.clear();
             self.dbus_network_manager_subs.clear();
             self.dbus_upower_subs.clear();
+            self.dbus_udisks_subs.clear();
             self.dbus_logind_subs.clear();
             self.dbus_bluetooth_subs.clear();
             self.dbus_bluetooth_agent_subs.clear();
@@ -520,6 +533,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusUPower { map, .. } => {
                     self.dbus_upower_subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusUDisks { map, .. } => {
+                    self.dbus_udisks_subs.push(map.clone());
                 }
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusLogind { map, .. } => {
@@ -773,6 +790,27 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                         inbox_cl.borrow_mut().dbus_upower.push_back(ev);
                     },
                     crate::dbus::spawn_upower_worker,
+                );
+            }
+            {
+                let active = !self.dbus_udisks_subs.is_empty();
+                if !active && let Ok(mut g) = dbus_client.cache.udisks.write() {
+                    *g = None;
+                }
+                let inbox_cl = Rc::clone(inbox);
+                let cache = std::sync::Arc::clone(&dbus_client.cache);
+                sync_shared_dbus_worker(
+                    active,
+                    &mut self.dbus_udisks_worker,
+                    loop_handle,
+                    &sys_bus,
+                    move |ev| {
+                        if let Ok(mut g) = cache.udisks.write() {
+                            *g = Some(ev.clone());
+                        }
+                        inbox_cl.borrow_mut().dbus_udisks.push_back(ev);
+                    },
+                    crate::dbus::spawn_udisks_worker,
                 );
             }
             {
@@ -1053,6 +1091,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 self.dbus_power_profile_worker,
                 self.dbus_network_manager_worker,
                 self.dbus_upower_worker,
+                self.dbus_udisks_worker,
                 self.dbus_logind_worker,
                 self.dbus_bluetooth_worker,
                 self.dbus_bluetooth_agent_worker,

@@ -139,6 +139,11 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         );
         fanout_broadcast(
             &rt.inbox,
+            |inbox| inbox.dbus_udisks.drain(..).collect(),
+            &rt.sub_mgr.dbus_udisks_subs,
+        );
+        fanout_broadcast(
+            &rt.inbox,
             |inbox| inbox.dbus_logind.drain(..).collect(),
             &rt.sub_mgr.dbus_logind_subs,
         );

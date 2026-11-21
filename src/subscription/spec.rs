@@ -149,6 +149,11 @@ pub(crate) enum SubscriptionSpec<M> {
         map: FrameSharedFn<crate::dbus::UPowerSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
+    DbusUDisks {
+        key: SubscriptionKey,
+        map: FrameSharedFn<crate::dbus::UDisksSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
     DbusLogind {
         key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::LogindEvent, M>,
@@ -365,6 +370,8 @@ impl<M: 'static> Subscription<M> {
             DbusNetworkManager { key },
             #[cfg(feature = "dbus")]
             DbusUPower { key },
+            #[cfg(feature = "dbus")]
+            DbusUDisks { key },
             #[cfg(feature = "dbus")]
             DbusLogind { key },
             #[cfg(feature = "dbus")]

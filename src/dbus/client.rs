@@ -19,6 +19,7 @@ use super::mpris::MprisSnapshot;
 use super::network_manager::NetworkManagerSnapshot;
 use super::power_profiles::PowerProfileSnapshot;
 use super::types::{Dbus, DbusBus, DbusValue};
+use super::udisks::UDisksSnapshot;
 use super::upower::UPowerSnapshot;
 use super::worker::AsyncStopSignal;
 
@@ -752,6 +753,7 @@ pub(crate) struct DbusSnapshotCache {
     pub(crate) bluetooth: RwLock<Option<BluetoothSnapshot>>,
     pub(crate) network_manager: RwLock<Option<NetworkManagerSnapshot>>,
     pub(crate) upower: RwLock<Option<UPowerSnapshot>>,
+    pub(crate) udisks: RwLock<Option<UDisksSnapshot>>,
     pub(crate) power_profiles: RwLock<Option<PowerProfileSnapshot>>,
     pub(crate) logind: RwLock<Option<LogindSnapshot>>,
     pub(crate) modem: RwLock<Option<ModemSnapshot>>,
