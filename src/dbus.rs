@@ -38,7 +38,9 @@ pub use global_shortcuts::{
 pub use idle_privacy::{GeoClueSnapshot, ScreenSaverSnapshot};
 pub(crate) use idle_privacy::{spawn_geoclue_worker, spawn_screensaver_worker};
 pub(crate) use logind::LogindWorker;
-pub use logind::{LogindEvent, LogindInhibitor, LogindSnapshot};
+pub use logind::{
+    LogindEvent, LogindInhibitor, LogindPowerCapabilities, LogindSnapshot, PowerActionSupport,
+};
 pub(crate) use modem::spawn_modem_worker;
 pub use modem::{ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState};
 pub(crate) use mpris::MprisWorker;

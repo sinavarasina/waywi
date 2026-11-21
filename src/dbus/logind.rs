@@ -11,7 +11,8 @@ use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
 use super::client::{
-    DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
+    DBUS_FAST_TIMEOUT, DBUS_SLOW_TIMEOUT, DbusActionLane, DbusClient, DbusSharedBus,
+    LaneActionSpec, connect_shared_bus,
 };
 use super::types::{Dbus, DbusBus};
 use super::worker::AsyncStopSignal;
@@ -31,6 +32,66 @@ pub struct LogindInhibitor {
     _fd: OwnedFd,
 }
 
+/// Availability and authorization status returned by `org.freedesktop.login1.Manager.Can*`
+/// queries (`"yes"`, `"challenge"`, `"no"`, `"na"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PowerActionSupport {
+    /// Supported and authorized without interactive authentication (`"yes"`).
+    Yes,
+    /// Supported, but requires interactive Polkit authentication (`"challenge"`).
+    Challenge,
+    /// Disallowed by Polkit policy or active inhibitor (`"no"`).
+    No,
+    /// Not supported by the hardware, kernel, swap configuration, or login1 daemon (`"na"`).
+    #[default]
+    NotAvailable,
+}
+
+impl PowerActionSupport {
+    /// Parses a `systemd-logind` / `elogind` `Can*` reply string (`"yes"`, `"challenge"`,
+    /// `"no"`, `"na"`).
+    #[must_use]
+    pub fn from_logind_str(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("yes") {
+            Self::Yes
+        } else if trimmed.eq_ignore_ascii_case("challenge") {
+            Self::Challenge
+        } else if trimmed.eq_ignore_ascii_case("no") {
+            Self::No
+        } else {
+            Self::NotAvailable
+        }
+    }
+
+    /// Returns `true` when the system supports the action (`Yes` or `Challenge`).
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Yes | Self::Challenge)
+    }
+
+    /// Returns `true` when invoking the action requires interactive Polkit authorization.
+    #[must_use]
+    pub const fn needs_auth(self) -> bool {
+        matches!(self, Self::Challenge)
+    }
+}
+
+/// Real-time hardware, kernel, and Polkit capability summary queried from
+/// `org.freedesktop.login1.Manager.Can*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LogindPowerCapabilities {
+    pub power_off: PowerActionSupport,
+    pub reboot: PowerActionSupport,
+    pub reboot_to_firmware_setup: PowerActionSupport,
+    pub suspend: PowerActionSupport,
+    pub hibernate: PowerActionSupport,
+    pub hybrid_sleep: PowerActionSupport,
+    pub suspend_then_hibernate: PowerActionSupport,
+    pub soft_reboot: PowerActionSupport,
+    pub halt: PowerActionSupport,
+}
+
 /// Snapshot of the active `systemd-logind` session and power transition state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogindSnapshot {
@@ -42,6 +103,8 @@ pub struct LogindSnapshot {
     pub preparing_for_sleep: bool,
     pub preparing_for_shutdown: bool,
     pub block_inhibited: String,
+    /// Availability of system power transitions reported by `org.freedesktop.login1.Manager.Can*`.
+    pub power_capabilities: LogindPowerCapabilities,
 }
 
 /// Discrete event emitted by [`Dbus::logind`].
@@ -78,6 +141,20 @@ impl DbusClient {
         }
         let conn = self.connection(DbusBus::System)?;
         read_logind_snapshot_blocking(&conn)
+    }
+
+    /// Reads the current [`LogindPowerCapabilities`] (`CanPowerOff`, `CanReboot`, `CanSuspend`,
+    /// `CanHibernate`, `CanHybridSleep`, `CanSuspendThenHibernate`, `CanRebootToFirmwareSetup`,
+    /// `CanSoftReboot`, `CanHalt`) from cache (0 ms when [`Dbus::logind`] is active) or the
+    /// system bus.
+    pub fn logind_power_capabilities(&self) -> Result<LogindPowerCapabilities> {
+        if let Ok(guard) = self.cache.logind.read()
+            && let Some(ref snap) = *guard
+        {
+            return Ok(snap.power_capabilities);
+        }
+        let conn = self.connection(DbusBus::System)?;
+        Ok(read_power_capabilities_blocking(&conn))
     }
 
     /// Sets device brightness via `org.freedesktop.login1.Session.SetBrightness` without root.
@@ -171,14 +248,55 @@ impl DbusClient {
         )
     }
 
-    /// Requests system suspend via `org.freedesktop.login1.Manager.Suspend`.
+    /// Requests terminating (logging out) the active user session via
+    /// `org.freedesktop.login1.Session.Terminate`.
+    pub fn terminate_session(&self) -> Result<()> {
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "Session.Terminate",
+                LOGIN1_SESSION_AUTO,
+            )
+            .with_dedup("logind:terminate"),
+            move |conn| async move {
+                let path = resolve_session_path_async(&conn)
+                    .await
+                    .unwrap_or_else(|| LOGIN1_SESSION_AUTO.to_owned());
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    path.as_str(),
+                    Some(LOGIN1_SESSION_IFACE),
+                    "Terminate",
+                    &(),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Session.Terminate failed: {e}")))?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Requests system suspend (Sleep / Suspend-to-RAM) via `org.freedesktop.login1.Manager.Suspend`.
     pub fn suspend(&self, interactive: bool) -> Result<()> {
         self.call_manager_bool("Suspend", interactive)
     }
 
-    /// Requests system hibernate via `org.freedesktop.login1.Manager.Hibernate`.
+    /// Requests system hibernate (Suspend-to-Disk) via `org.freedesktop.login1.Manager.Hibernate`.
     pub fn hibernate(&self, interactive: bool) -> Result<()> {
         self.call_manager_bool("Hibernate", interactive)
+    }
+
+    /// Requests hybrid sleep (Suspend-to-Both: writes state to disk and sleeps in RAM) via
+    /// `org.freedesktop.login1.Manager.HybridSleep`.
+    pub fn hybrid_sleep(&self, interactive: bool) -> Result<()> {
+        self.call_manager_bool("HybridSleep", interactive)
+    }
+
+    /// Requests suspend-then-hibernate (sleeps in RAM first, then automatically transitions to
+    /// hibernate after the configured delay) via `org.freedesktop.login1.Manager.SuspendThenHibernate`.
+    pub fn suspend_then_hibernate(&self, interactive: bool) -> Result<()> {
+        self.call_manager_bool("SuspendThenHibernate", interactive)
     }
 
     /// Requests system reboot via `org.freedesktop.login1.Manager.Reboot`.
@@ -186,9 +304,67 @@ impl DbusClient {
         self.call_manager_bool("Reboot", interactive)
     }
 
-    /// Requests system power-off via `org.freedesktop.login1.Manager.PowerOff`.
+    /// Requests rebooting directly into UEFI/BIOS firmware setup by calling
+    /// `org.freedesktop.login1.Manager.SetRebootToFirmwareSetup(true)` followed by `Reboot`.
+    ///
+    /// If `SetRebootToFirmwareSetup` fails (for example on Legacy BIOS systems or denied Polkit
+    /// authorization), the reboot is aborted cleanly rather than performing a normal reboot.
+    pub fn reboot_to_firmware_setup(&self, interactive: bool) -> Result<()> {
+        let timeout = if interactive {
+            DBUS_SLOW_TIMEOUT
+        } else {
+            DBUS_FAST_TIMEOUT
+        };
+        self.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::System,
+                "Manager.RebootToFirmwareSetup",
+                LOGIN1_MANAGER_PATH,
+            )
+            .with_dedup("logind:RebootToFirmwareSetup")
+            .with_timeout(timeout),
+            move |conn| async move {
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    LOGIN1_MANAGER_PATH,
+                    Some(LOGIN1_MANAGER_IFACE),
+                    "SetRebootToFirmwareSetup",
+                    &(true,),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("Manager.SetRebootToFirmwareSetup failed: {e}"))
+                })?;
+                conn.call_method(
+                    Some(LOGIN1_DEST),
+                    LOGIN1_MANAGER_PATH,
+                    Some(LOGIN1_MANAGER_IFACE),
+                    "Reboot",
+                    &(interactive,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Manager.Reboot failed: {e}")))?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Requests a userspace-only soft reboot (`systemd` >= 254) via
+    /// `org.freedesktop.login1.Manager.SoftReboot`.
+    pub fn soft_reboot(&self, interactive: bool) -> Result<()> {
+        self.call_manager_bool("SoftReboot", interactive)
+    }
+
+    /// Requests system power-off (Shutdown) via `org.freedesktop.login1.Manager.PowerOff`.
     pub fn power_off(&self, interactive: bool) -> Result<()> {
         self.call_manager_bool("PowerOff", interactive)
+    }
+
+    /// Requests system halt (stops the OS without cutting hardware power) via
+    /// `org.freedesktop.login1.Manager.Halt`.
+    pub fn halt(&self, interactive: bool) -> Result<()> {
+        self.call_manager_bool("Halt", interactive)
     }
 
     /// Acquires a sleep/idle/handle-power-key inhibitor lock from `systemd-logind`.
@@ -213,13 +389,20 @@ impl DbusClient {
     }
 
     fn call_manager_bool(&self, method: &'static str, interactive: bool) -> Result<()> {
+        let timeout = if interactive {
+            DBUS_SLOW_TIMEOUT
+        } else {
+            DBUS_FAST_TIMEOUT
+        };
         self.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
                 format!("Manager.{method}"),
                 LOGIN1_MANAGER_PATH,
-            ),
+            )
+            .with_dedup(format!("logind:{method}"))
+            .with_timeout(timeout),
             move |conn| async move {
                 conn.call_method(
                     Some(LOGIN1_DEST),
@@ -255,7 +438,8 @@ impl LogindWorker {
                     return;
                 };
                 futures_lite::future::block_on(async move {
-                    let mut last_snap = read_logind_snapshot_async(&conn).await;
+                    let mut cached_caps = read_power_capabilities_async(&conn).await;
+                    let mut last_snap = read_logind_snapshot_async(&conn, cached_caps).await;
                     if let Some(ref s) = last_snap {
                         let _ = sender.send(LogindEvent::Snapshot(s.clone()));
                     }
@@ -303,11 +487,19 @@ impl LogindWorker {
                             }
                             _ => {}
                         }
-                        if let Some(snap) = read_logind_snapshot_async(&conn).await
-                            && last_snap.as_ref() != Some(&snap)
+                        if let Some(mut snap) = read_logind_snapshot_async(&conn, cached_caps).await
                         {
-                            last_snap = Some(snap.clone());
-                            let _ = sender.send(LogindEvent::Snapshot(snap));
+                            let inhibitors_changed = last_snap
+                                .as_ref()
+                                .is_none_or(|prev| prev.block_inhibited != snap.block_inhibited);
+                            if inhibitors_changed {
+                                cached_caps = read_power_capabilities_async(&conn).await;
+                                snap.power_capabilities = cached_caps;
+                            }
+                            if last_snap.as_ref() != Some(&snap) {
+                                last_snap = Some(snap.clone());
+                                let _ = sender.send(LogindEvent::Snapshot(snap));
+                            }
                         }
                     }
                 });
@@ -389,16 +581,123 @@ async fn resolve_session_path_async(conn: &zbus::Connection) -> Option<String> {
         .map(|p| p.to_string())
 }
 
+fn query_can_blocking(
+    conn: &zbus::blocking::Connection,
+    method: &'static str,
+) -> PowerActionSupport {
+    let Ok(reply) = conn.call_method(
+        Some(LOGIN1_DEST),
+        LOGIN1_MANAGER_PATH,
+        Some(LOGIN1_MANAGER_IFACE),
+        method,
+        &(),
+    ) else {
+        return PowerActionSupport::NotAvailable;
+    };
+    reply
+        .body()
+        .deserialize::<String>()
+        .map(|s| PowerActionSupport::from_logind_str(&s))
+        .unwrap_or(PowerActionSupport::NotAvailable)
+}
+
+fn read_power_capabilities_blocking(conn: &zbus::blocking::Connection) -> LogindPowerCapabilities {
+    LogindPowerCapabilities {
+        power_off: query_can_blocking(conn, "CanPowerOff"),
+        reboot: query_can_blocking(conn, "CanReboot"),
+        reboot_to_firmware_setup: query_can_blocking(conn, "CanRebootToFirmwareSetup"),
+        suspend: query_can_blocking(conn, "CanSuspend"),
+        hibernate: query_can_blocking(conn, "CanHibernate"),
+        hybrid_sleep: query_can_blocking(conn, "CanHybridSleep"),
+        suspend_then_hibernate: query_can_blocking(conn, "CanSuspendThenHibernate"),
+        soft_reboot: query_can_blocking(conn, "CanSoftReboot"),
+        halt: query_can_blocking(conn, "CanHalt"),
+    }
+}
+
+async fn query_can_async(conn: &zbus::Connection, method: &'static str) -> PowerActionSupport {
+    let Ok(reply) = conn
+        .call_method(
+            Some(LOGIN1_DEST),
+            LOGIN1_MANAGER_PATH,
+            Some(LOGIN1_MANAGER_IFACE),
+            method,
+            &(),
+        )
+        .await
+    else {
+        return PowerActionSupport::NotAvailable;
+    };
+    reply
+        .body()
+        .deserialize::<String>()
+        .map(|s| PowerActionSupport::from_logind_str(&s))
+        .unwrap_or(PowerActionSupport::NotAvailable)
+}
+
+async fn read_power_capabilities_async(conn: &zbus::Connection) -> LogindPowerCapabilities {
+    use futures_lite::future::zip;
+    let (
+        ((power_off, reboot), (reboot_to_firmware_setup, suspend)),
+        ((hibernate, hybrid_sleep), ((suspend_then_hibernate, soft_reboot), halt)),
+    ) = zip(
+        zip(
+            zip(
+                query_can_async(conn, "CanPowerOff"),
+                query_can_async(conn, "CanReboot"),
+            ),
+            zip(
+                query_can_async(conn, "CanRebootToFirmwareSetup"),
+                query_can_async(conn, "CanSuspend"),
+            ),
+        ),
+        zip(
+            zip(
+                query_can_async(conn, "CanHibernate"),
+                query_can_async(conn, "CanHybridSleep"),
+            ),
+            zip(
+                zip(
+                    query_can_async(conn, "CanSuspendThenHibernate"),
+                    query_can_async(conn, "CanSoftReboot"),
+                ),
+                query_can_async(conn, "CanHalt"),
+            ),
+        ),
+    )
+    .await;
+    LogindPowerCapabilities {
+        power_off,
+        reboot,
+        reboot_to_firmware_setup,
+        suspend,
+        hibernate,
+        hybrid_sleep,
+        suspend_then_hibernate,
+        soft_reboot,
+        halt,
+    }
+}
+
 fn read_logind_snapshot_blocking(conn: &zbus::blocking::Connection) -> Result<LogindSnapshot> {
     let mgr = get_all_blocking(conn, LOGIN1_DEST, LOGIN1_MANAGER_PATH, LOGIN1_MANAGER_IFACE)?;
     let session_path =
         resolve_session_path_blocking(conn).unwrap_or_else(|_| LOGIN1_SESSION_AUTO.to_owned());
     let sess = get_all_blocking(conn, LOGIN1_DEST, &session_path, LOGIN1_SESSION_IFACE)
         .unwrap_or_default();
-    Ok(assemble_logind_snapshot(session_path, &mgr, &sess))
+    let power_capabilities = read_power_capabilities_blocking(conn);
+    Ok(assemble_logind_snapshot(
+        session_path,
+        &mgr,
+        &sess,
+        power_capabilities,
+    ))
 }
 
-async fn read_logind_snapshot_async(conn: &zbus::Connection) -> Option<LogindSnapshot> {
+async fn read_logind_snapshot_async(
+    conn: &zbus::Connection,
+    power_capabilities: LogindPowerCapabilities,
+) -> Option<LogindSnapshot> {
     let mgr = get_all_async(conn, LOGIN1_DEST, LOGIN1_MANAGER_PATH, LOGIN1_MANAGER_IFACE).await?;
     let session_path = resolve_session_path_async(conn)
         .await
@@ -406,13 +705,19 @@ async fn read_logind_snapshot_async(conn: &zbus::Connection) -> Option<LogindSna
     let sess = get_all_async(conn, LOGIN1_DEST, &session_path, LOGIN1_SESSION_IFACE)
         .await
         .unwrap_or_default();
-    Some(assemble_logind_snapshot(session_path, &mgr, &sess))
+    Some(assemble_logind_snapshot(
+        session_path,
+        &mgr,
+        &sess,
+        power_capabilities,
+    ))
 }
 
 pub(crate) fn assemble_logind_snapshot(
     session_path: String,
     mgr: &HashMap<String, OwnedValue>,
     sess: &HashMap<String, OwnedValue>,
+    power_capabilities: LogindPowerCapabilities,
 ) -> LogindSnapshot {
     LogindSnapshot {
         session_id: dict_str(sess, "Id").unwrap_or_default(),
@@ -423,6 +728,7 @@ pub(crate) fn assemble_logind_snapshot(
         preparing_for_sleep: dict_bool(mgr, "PreparingForSleep").unwrap_or(false),
         preparing_for_shutdown: dict_bool(mgr, "PreparingForShutdown").unwrap_or(false),
         block_inhibited: dict_str(mgr, "BlockInhibited").unwrap_or_default(),
+        power_capabilities,
     }
 }
 
@@ -456,11 +762,63 @@ mod tests {
             OwnedValue::try_from(Value::from(false)).unwrap(),
         );
 
-        let snap =
-            assemble_logind_snapshot("/org/freedesktop/login1/session/_342".into(), &mgr, &sess);
+        let caps = LogindPowerCapabilities {
+            power_off: PowerActionSupport::Yes,
+            reboot: PowerActionSupport::Challenge,
+            hibernate: PowerActionSupport::NotAvailable,
+            ..LogindPowerCapabilities::default()
+        };
+        let snap = assemble_logind_snapshot(
+            "/org/freedesktop/login1/session/_342".into(),
+            &mgr,
+            &sess,
+            caps,
+        );
         assert_eq!(snap.session_id, "42");
         assert!(snap.locked_hint);
         assert!(snap.preparing_for_sleep);
         assert_eq!(snap.block_inhibited, "sleep:idle");
+        assert_eq!(snap.power_capabilities.power_off, PowerActionSupport::Yes);
+        assert_eq!(
+            snap.power_capabilities.reboot,
+            PowerActionSupport::Challenge
+        );
+        assert_eq!(
+            snap.power_capabilities.hibernate,
+            PowerActionSupport::NotAvailable
+        );
+    }
+
+    #[test]
+    fn parses_logind_power_action_support_strings_and_helpers() {
+        assert_eq!(
+            PowerActionSupport::from_logind_str("yes"),
+            PowerActionSupport::Yes
+        );
+        assert!(PowerActionSupport::Yes.is_supported());
+        assert!(!PowerActionSupport::Yes.needs_auth());
+
+        assert_eq!(
+            PowerActionSupport::from_logind_str("challenge"),
+            PowerActionSupport::Challenge
+        );
+        assert!(PowerActionSupport::Challenge.is_supported());
+        assert!(PowerActionSupport::Challenge.needs_auth());
+
+        assert_eq!(
+            PowerActionSupport::from_logind_str("no"),
+            PowerActionSupport::No
+        );
+        assert!(!PowerActionSupport::No.is_supported());
+
+        assert_eq!(
+            PowerActionSupport::from_logind_str("na"),
+            PowerActionSupport::NotAvailable
+        );
+        assert_eq!(
+            PowerActionSupport::from_logind_str(""),
+            PowerActionSupport::NotAvailable
+        );
+        assert!(!PowerActionSupport::NotAvailable.is_supported());
     }
 }

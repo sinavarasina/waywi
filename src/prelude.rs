@@ -79,15 +79,16 @@ pub use crate::compositor::{CompositorClient, CompositorWorkspace, WorkspaceTarg
 pub use crate::dbus::{
     BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
     BluetoothSnapshot, BluetoothTransportFilter, Dbus, DbusBus, DbusClient, DbusSignalEvent,
-    DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor, LogindSnapshot,
-    ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState,
-    MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection,
-    NmConnectivity, NmDeviceInfo, NmDeviceType, NmSavedConnection, NmState, NmWifiSecurity,
-    NotificationCapabilities, NotificationCloseReason, NotificationEvent, NotificationImageData,
-    NotificationUrgency, PowerProfileHold, PowerProfileKind, PowerProfileSnapshot,
-    ScreenSaverSnapshot, TrayCategory, TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem,
-    TrayStatus, TrayToolTip, UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice,
-    UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
+    DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor,
+    LogindPowerCapabilities, LogindSnapshot, ModemAccessTech, ModemInfo, ModemRegistrationState,
+    ModemSnapshot, ModemState, MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot,
+    NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo, NmDeviceType,
+    NmSavedConnection, NmState, NmWifiSecurity, NotificationCapabilities, NotificationCloseReason,
+    NotificationEvent, NotificationImageData, NotificationUrgency, PowerActionSupport,
+    PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
+    TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
+    UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice, UPowerDeviceKind,
+    UPowerDeviceState, UPowerSnapshot,
 };
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{
