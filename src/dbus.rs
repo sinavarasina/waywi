@@ -50,8 +50,8 @@ pub use network_manager::{
 };
 pub(crate) use notifications::NotificationServerWorker;
 pub use notifications::{
-    DesktopNotification, NotificationCloseReason, NotificationEvent, NotificationImageData,
-    NotificationUrgency,
+    DesktopNotification, NotificationCapabilities, NotificationCloseReason, NotificationEvent,
+    NotificationImageData, NotificationUrgency,
 };
 pub(crate) use power_profiles::PowerProfilesWorker;
 pub use power_profiles::{PowerProfileHold, PowerProfileKind, PowerProfileSnapshot};

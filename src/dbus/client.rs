@@ -769,7 +769,7 @@ pub struct DbusClient {
     action_pool: DbusActionPool,
     pub(crate) action_outbox: Arc<DbusActionOutbox>,
     pub(crate) cache: Arc<DbusSnapshotCache>,
-    pub(crate) notifications_conn: Arc<Mutex<Option<zbus::Connection>>>,
+    pub(crate) notifications_state: Arc<super::notifications::NotificationServerState>,
     pub(crate) bluetooth_agent_pending: super::bluetooth::PendingAgentMap,
 }
 
@@ -795,7 +795,7 @@ impl DbusClient {
             action_pool,
             action_outbox,
             cache: Arc::new(DbusSnapshotCache::default()),
-            notifications_conn: Arc::new(Mutex::new(None)),
+            notifications_state: Arc::new(super::notifications::NotificationServerState::default()),
             bluetooth_agent_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }

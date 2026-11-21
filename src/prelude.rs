@@ -83,11 +83,11 @@ pub use crate::dbus::{
     ModemAccessTech, ModemInfo, ModemRegistrationState, ModemSnapshot, ModemState,
     MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot, NmAccessPoint, NmActiveConnection,
     NmConnectivity, NmDeviceInfo, NmDeviceType, NmSavedConnection, NmState, NmWifiSecurity,
-    NotificationCloseReason, NotificationEvent, NotificationImageData, NotificationUrgency,
-    PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
-    TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
-    UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice, UPowerDeviceKind,
-    UPowerDeviceState, UPowerSnapshot,
+    NotificationCapabilities, NotificationCloseReason, NotificationEvent, NotificationImageData,
+    NotificationUrgency, PowerProfileHold, PowerProfileKind, PowerProfileSnapshot,
+    ScreenSaverSnapshot, TrayCategory, TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem,
+    TrayStatus, TrayToolTip, UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice,
+    UPowerDeviceKind, UPowerDeviceState, UPowerSnapshot,
 };
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{

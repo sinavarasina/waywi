@@ -126,6 +126,7 @@ pub(crate) enum SubscriptionSpec<M> {
     #[cfg(feature = "dbus")]
     DbusNotifications {
         key: SubscriptionKey,
+        capabilities: Option<crate::dbus::NotificationCapabilities>,
         map: FrameSharedFn<crate::dbus::NotificationEvent, M>,
     },
     #[cfg(feature = "dbus")]
@@ -361,7 +362,7 @@ impl<M: 'static> Subscription<M> {
             #[cfg(feature = "dbus")]
             DbusSignal { key, bus, interface, member, path },
             #[cfg(feature = "dbus")]
-            DbusNotifications { key },
+            DbusNotifications { key, capabilities },
             #[cfg(feature = "dbus")]
             DbusTray { key },
             #[cfg(feature = "dbus")]

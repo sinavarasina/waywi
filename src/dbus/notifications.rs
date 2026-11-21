@@ -1,10 +1,11 @@
 //! XDG Desktop Notifications daemon (`org.freedesktop.Notifications`) support.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use bitflags::bitflags;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Value};
@@ -18,6 +19,118 @@ use super::types::{Dbus, DbusBus};
 
 const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
+
+bitflags! {
+    /// Standard XDG Desktop Notifications Specification v1.2 server capability flags advertised by
+    /// `org.freedesktop.Notifications.GetCapabilities`.
+    ///
+    /// Applications should advertise only capabilities their UI actually implements (honest
+    /// capabilities). Defaults to `BODY | BODY_MARKUP | ACTIONS | ICON_STATIC`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct NotificationCapabilities: u16 {
+        /// Action keys are interpreted as named icons from the active icon theme (`"action-icons"`).
+        const ACTION_ICONS    = 1 << 0;
+        /// Server delivers action buttons and emits `ActionInvoked` (`"actions"`).
+        const ACTIONS         = 1 << 1;
+        /// Server displays notification body text (`"body"`).
+        const BODY            = 1 << 2;
+        /// Server supports hyperlinks inside notification body markup (`"body-hyperlinks"`).
+        const BODY_HYPERLINKS = 1 << 3;
+        /// Server supports inline images inside notification body markup (`"body-images"`).
+        const BODY_IMAGES     = 1 << 4;
+        /// Server parses basic HTML markup in notification bodies (`"body-markup"`).
+        const BODY_MARKUP     = 1 << 5;
+        /// Server animates multi-frame icons (`"icon-multi"`).
+        const ICON_MULTI      = 1 << 6;
+        /// Server renders static notification icons (`"icon-static"`).
+        const ICON_STATIC     = 1 << 7;
+        /// Server persists notifications in a history/notification center (`"persistence"`).
+        const PERSISTENCE     = 1 << 8;
+        /// Server handles `sound-file` / `sound-name` hints (`"sound"`).
+        const SOUND           = 1 << 9;
+    }
+}
+
+impl Default for NotificationCapabilities {
+    fn default() -> Self {
+        Self::BODY | Self::BODY_MARKUP | Self::ACTIONS | Self::ICON_STATIC
+    }
+}
+
+impl NotificationCapabilities {
+    /// Converts enabled capability flags into canonical XDG Desktop Notifications v1.2 strings.
+    #[must_use]
+    pub fn to_xdg_strings(self) -> Vec<&'static str> {
+        let mut out = Vec::with_capacity(self.bits().count_ones() as usize);
+        if self.contains(Self::ACTION_ICONS) {
+            out.push("action-icons");
+        }
+        if self.contains(Self::ACTIONS) {
+            out.push("actions");
+        }
+        if self.contains(Self::BODY) {
+            out.push("body");
+        }
+        if self.contains(Self::BODY_HYPERLINKS) {
+            out.push("body-hyperlinks");
+        }
+        if self.contains(Self::BODY_IMAGES) {
+            out.push("body-images");
+        }
+        if self.contains(Self::BODY_MARKUP) {
+            out.push("body-markup");
+        }
+        if self.contains(Self::ICON_MULTI) {
+            out.push("icon-multi");
+        }
+        if self.contains(Self::ICON_STATIC) {
+            out.push("icon-static");
+        }
+        if self.contains(Self::PERSISTENCE) {
+            out.push("persistence");
+        }
+        if self.contains(Self::SOUND) {
+            out.push("sound");
+        }
+        out
+    }
+}
+
+/// Shared lock-free capability state and live connection slot shared between [`DbusClient`] and
+/// [`NotificationServerWorker`].
+pub(crate) struct NotificationServerState {
+    conn: Mutex<Option<zbus::Connection>>,
+    capabilities: AtomicU16,
+}
+
+impl Default for NotificationServerState {
+    fn default() -> Self {
+        Self {
+            conn: Mutex::new(None),
+            capabilities: AtomicU16::new(NotificationCapabilities::default().bits()),
+        }
+    }
+}
+
+impl NotificationServerState {
+    pub(crate) fn capabilities(&self) -> NotificationCapabilities {
+        NotificationCapabilities::from_bits_truncate(self.capabilities.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_capabilities(&self, caps: NotificationCapabilities) {
+        self.capabilities.store(caps.bits(), Ordering::Release);
+    }
+
+    pub(crate) fn connection(&self) -> Option<zbus::Connection> {
+        self.conn.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn set_connection(&self, conn: Option<zbus::Connection>) {
+        if let Ok(mut guard) = self.conn.lock() {
+            *guard = conn;
+        }
+    }
+}
 
 /// Notification urgency level defined by the XDG Desktop Notifications specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -138,6 +251,22 @@ impl Dbus {
         Subscription {
             spec: SubscriptionSpec::DbusNotifications {
                 key: "dbus:org.freedesktop.Notifications".into_subscription_key(),
+                capabilities: None,
+                map: FrameSharedFn::new(map),
+            },
+        }
+    }
+
+    /// Registers an `org.freedesktop.Notifications` server advertising explicit XDG v1.2
+    /// [`NotificationCapabilities`] via `GetCapabilities`.
+    pub fn notifications_with_capabilities<M: 'static>(
+        capabilities: NotificationCapabilities,
+        map: impl Fn(NotificationEvent) -> M + 'static,
+    ) -> Subscription<M> {
+        Subscription {
+            spec: SubscriptionSpec::DbusNotifications {
+                key: "dbus:org.freedesktop.Notifications".into_subscription_key(),
+                capabilities: Some(capabilities),
                 map: FrameSharedFn::new(map),
             },
         }
@@ -145,6 +274,18 @@ impl Dbus {
 }
 
 impl DbusClient {
+    /// Updates the XDG v1.2 [`NotificationCapabilities`] returned by
+    /// `org.freedesktop.Notifications.GetCapabilities` without restarting the server.
+    pub fn set_notification_capabilities(&self, capabilities: NotificationCapabilities) {
+        self.notifications_state.set_capabilities(capabilities);
+    }
+
+    /// Returns the currently configured [`NotificationCapabilities`] advertised by the
+    /// notification server.
+    #[must_use]
+    pub fn notification_capabilities(&self) -> NotificationCapabilities {
+        self.notifications_state.capabilities()
+    }
     /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server.
     pub fn close_notification(&self, id: u32, reason: NotificationCloseReason) -> Result<()> {
         let conn = self.active_notifications_conn()?;
@@ -193,30 +334,26 @@ impl DbusClient {
     }
 
     fn active_notifications_conn(&self) -> Result<zbus::Connection> {
-        self.notifications_conn
-            .lock()
-            .map_err(|_| WaywiError::DbusError("notification connection lock poisoned".into()))?
-            .clone()
-            .ok_or_else(|| {
-                WaywiError::DbusError("org.freedesktop.Notifications server is not running".into())
-            })
+        self.notifications_state.connection().ok_or_else(|| {
+            WaywiError::DbusError("org.freedesktop.Notifications server is not running".into())
+        })
     }
 }
 
 pub(crate) struct NotificationServerWorker {
     stop: super::worker::AsyncStopSignal,
-    conn_slot: Arc<Mutex<Option<zbus::Connection>>>,
+    state: Arc<NotificationServerState>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NotificationServerWorker {
     pub(crate) fn spawn(
         sender: calloop::channel::Sender<NotificationEvent>,
-        conn_slot: Arc<Mutex<Option<zbus::Connection>>>,
+        state: Arc<NotificationServerState>,
     ) -> Self {
         let stop = super::worker::AsyncStopSignal::new();
         let stop_flag = stop.clone();
-        let slot_for_thread = Arc::clone(&conn_slot);
+        let state_for_thread = Arc::clone(&state);
 
         let join = std::thread::Builder::new()
             .name("waywi-dbus-notify".to_owned())
@@ -224,6 +361,7 @@ impl NotificationServerWorker {
                 let iface = NotificationsIface {
                     next_id: AtomicU32::new(1),
                     sender: sender.clone(),
+                    state: Arc::clone(&state_for_thread),
                 };
                 let conn_res = futures_lite::future::block_on(async move {
                     let builder = zbus::connection::Builder::session()?
@@ -240,33 +378,23 @@ impl NotificationServerWorker {
                     return;
                 };
 
-                if let Ok(mut guard) = slot_for_thread.lock() {
-                    *guard = Some(conn.clone());
-                }
+                state_for_thread.set_connection(Some(conn.clone()));
 
                 futures_lite::future::block_on(stop_flag.wait_stopped());
 
-                if let Ok(mut guard) = slot_for_thread.lock() {
-                    *guard = None;
-                }
+                state_for_thread.set_connection(None);
                 drop(conn);
             })
             .ok();
 
-        Self {
-            stop,
-            conn_slot,
-            join,
-        }
+        Self { stop, state, join }
     }
 }
 
 impl Drop for NotificationServerWorker {
     fn drop(&mut self) {
         self.stop.trigger();
-        if let Ok(mut guard) = self.conn_slot.lock() {
-            *guard = None;
-        }
+        self.state.set_connection(None);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -276,6 +404,7 @@ impl Drop for NotificationServerWorker {
 struct NotificationsIface {
     next_id: AtomicU32,
     sender: calloop::channel::Sender<NotificationEvent>,
+    state: Arc<NotificationServerState>,
 }
 
 #[interface(name = "org.freedesktop.Notifications")]
@@ -345,7 +474,7 @@ impl NotificationsIface {
     }
 
     async fn get_capabilities(&self) -> Vec<&'static str> {
-        vec!["body", "body-markup", "actions", "icon-static"]
+        self.state.capabilities().to_xdg_strings()
     }
 
     async fn get_server_information(
@@ -569,5 +698,38 @@ mod tests {
         // Empty strings normalize to None.
         hints.insert("category".to_owned(), Value::from("").try_into().unwrap());
         assert_eq!(hint_string(&hints, "category"), None);
+    }
+
+    #[test]
+    fn notification_capabilities_update_lock_free() {
+        assert_eq!(
+            NotificationCapabilities::default().to_xdg_strings(),
+            vec!["actions", "body", "body-markup", "icon-static"]
+        );
+
+        let full = NotificationCapabilities::default()
+            | NotificationCapabilities::PERSISTENCE
+            | NotificationCapabilities::SOUND
+            | NotificationCapabilities::ACTION_ICONS;
+        assert_eq!(
+            full.to_xdg_strings(),
+            vec![
+                "action-icons",
+                "actions",
+                "body",
+                "body-markup",
+                "icon-static",
+                "persistence",
+                "sound",
+            ]
+        );
+
+        let client = DbusClient::new();
+        assert_eq!(
+            client.notification_capabilities(),
+            NotificationCapabilities::default()
+        );
+        client.set_notification_capabilities(full);
+        assert_eq!(client.notification_capabilities(), full);
     }
 }

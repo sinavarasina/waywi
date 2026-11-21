@@ -515,7 +515,12 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                     ));
                 }
                 #[cfg(feature = "dbus")]
-                SubscriptionSpec::DbusNotifications { map, .. } => {
+                SubscriptionSpec::DbusNotifications {
+                    capabilities, map, ..
+                } => {
+                    if let Some(caps) = capabilities {
+                        dbus_client.set_notification_capabilities(*caps);
+                    }
                     self.dbus_notification_subs.push(map.clone());
                 }
                 #[cfg(feature = "dbus")]
@@ -710,13 +715,13 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
 
             {
                 let inbox_cl = Rc::clone(inbox);
-                let notif_conn = std::sync::Arc::clone(&dbus_client.notifications_conn);
+                let notif_state = std::sync::Arc::clone(&dbus_client.notifications_state);
                 sync_singleton_dbus_worker(
                     !self.dbus_notification_subs.is_empty(),
                     &mut self.dbus_notification_worker,
                     loop_handle,
                     move |ev| inbox_cl.borrow_mut().dbus_notifications.push_back(ev),
-                    move |tx| crate::dbus::NotificationServerWorker::spawn(tx, notif_conn),
+                    move |tx| crate::dbus::NotificationServerWorker::spawn(tx, notif_state),
                 );
             }
             {
