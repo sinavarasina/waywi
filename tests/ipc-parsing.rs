@@ -92,18 +92,25 @@ fn hyprland_ipc_parsing_and_mock_socket_roundtrip() {
     let _ = srv.join();
     let _ = std::fs::remove_file(&cmd_sock);
 
-    // Verify HyprLua v0.56 fallback when `dispatch workspace N` returns a Lua syntax hint.
+    // Verify HyprLua v0.57 hydration: the one-shot `j/systeminfo` probe reports a non-Lua
+    // provider, then `dispatch workspace N` returns a Lua syntax hint and the client falls back.
     let listener2 = UnixListener::bind(&cmd_sock).unwrap();
     let srv2 = std::thread::spawn(move || {
+        let legacy_error = "error: [string \"return hl.dispatch(workspace 3)\"]:1: ')' expected near '3'\n\n → Note: dispatch in lua is a shorthand for hl.dispatch(...), your syntax might need to be updated.";
         let mut seen = Vec::new();
-        for reply in [
-            "error: [string \"return hl.dispatch(workspace 3)\"]:1: ')' expected near '3'\n\n → Note: dispatch in lua is a shorthand for hl.dispatch(...), your syntax might need to be updated.",
-            "ok",
-        ] {
+        for _ in 0..3 {
             if let Ok((mut stream, _)) = listener2.accept() {
                 let mut buf = [0u8; 256];
                 let n = stream.read(&mut buf).unwrap_or(0);
-                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply = if req.starts_with("j/systeminfo") {
+                    "System Information:\nconfigProvider: hypr\n"
+                } else if req == "dispatch workspace 3" {
+                    legacy_error
+                } else {
+                    "ok"
+                };
+                seen.push(req);
                 let _ = stream.write_all(reply.as_bytes());
             }
         }
@@ -116,6 +123,7 @@ fn hyprland_ipc_parsing_and_mock_socket_roundtrip() {
     assert_eq!(
         cmds,
         vec![
+            "j/systeminfo".to_owned(),
             "dispatch workspace 3".to_owned(),
             "dispatch hl.dsp.focus({ workspace = 3 })".to_owned(),
         ]

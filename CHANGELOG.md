@@ -2,9 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.8] - 2026-11-21
+
+### Added
+- **Hyprland v0.57 hydration (`hyprland-ipc`)**: Expanded the Hyprland IPC layer for v0.57 — bounded request/response command client, full `socket2` event stream coverage (workspace/window/monitor/keyboard-layout/urgent/submap variants including the `v2` payloads), and HyprLua support: Lua-syntax dispatch fallbacks (`hl.dsp.*`) for window/workspace/DPMS dispatchers, `keyword` → `eval hl.config(...)` mapping, `eval`, `batch`, and `raw_command`. `Sway`'s event stream received the same zero-polling treatment.
+- **Zero-polling IPC workers (`hyprland-ipc`, `sway-ipc`)**: Replaced timed socket polling with zero-polling `poll(2)` + `eventfd(2)` listeners, bounded steady-state buffers, exponential reconnect backoff, and instant shutdown on drop.
+- **Generic D-Bus calls (`dbus`)**: `DbusClient::call_method`/`call_method_blocking` building request bodies from `DbusValue` (`Struct`, `Dict`, `Variant`, …), `Dbus::subscribe_signal` for arbitrary interfaces, and `Dbus::action_results` for lane-routed reply/error results; `DbusSignalEvent`/`DbusActionLane`/`DbusActionResult` types.
+- **Process cgroup lookup (`system`)**: `ProcessCgroupInfo` + `system::os::cgroup::{read_process_cgroup, parse_process_cgroup}` reading `/proc/<pid>/cgroup` with cgroup v1/v2 parsing, re-exported under `system::os` (`system.rs` also re-exports it at the domain root).
+- **UDisks2 storage (`dbus`)**: `UDisksDrive`, `UDisksBlockDevice`, `UDisksSnapshot`, and `Dbus::udisks` hotplug subscription tracking `org.freedesktop.UDisks2` ObjectManager events on the system bus; NUL-terminated UDisks2 byte-array decoding; non-blocking `DbusClient` actions for `Filesystem.{Mount,Unmount}`, `Drive.{Eject,PowerOff}`, and `Encrypted.{Unlock,Lock}` with explicit `auth.no_user_interaction` Polkit option support.
+- **USB device enumeration (`system`)**: `UsbDevice`, `read_usb_devices`, `read_usb_devices_from`, and `SystemProviders::usb_devices` reading `/sys/bus/usb/devices`.
 
 ### Fixed
+- `--no-default-features --features dbus` failed to compile: `tray.rs` uses `serde::Serialize` bounds but `dep:serde` was only pulled in via `hyprland-ipc`/`sway-ipc`; the `dbus` feature now declares `dep:serde`.
 - `HyprlandClient` now probes `j/systeminfo` once per client and seeds the HyprLua dispatch mode directly when the compositor reports `configProvider: lua` (Hyprland v0.55+ Lua configs, mandatory on v0.57+), so the first dispatch/keyword no longer wastes a guaranteed-failing legacy roundtrip. The error-based fallback stays in charge whenever the field is missing or the probe fails, so behavior on older Hyprland is unchanged.
 
 ## [0.1.7] - 2026-11-19
