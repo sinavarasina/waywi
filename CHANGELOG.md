@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `HyprlandClient` now probes `j/systeminfo` once per client and seeds the HyprLua dispatch mode directly when the compositor reports `configProvider: lua` (Hyprland v0.55+ Lua configs, mandatory on v0.57+), so the first dispatch/keyword no longer wastes a guaranteed-failing legacy roundtrip. The error-based fallback stays in charge whenever the field is missing or the probe fails, so behavior on older Hyprland is unchanged.
+
 ## [0.1.7] - 2026-11-19
 
 ### Added

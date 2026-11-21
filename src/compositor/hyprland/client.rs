@@ -23,6 +23,7 @@ pub struct HyprlandClient {
     sockets: HyprlandSockets,
     timeout: Duration,
     lua_mode: Arc<AtomicBool>,
+    lua_probed: Arc<AtomicBool>,
 }
 
 impl HyprlandClient {
@@ -38,6 +39,7 @@ impl HyprlandClient {
             sockets,
             timeout: DEFAULT_TIMEOUT,
             lua_mode: Arc::new(AtomicBool::new(false)),
+            lua_probed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -47,6 +49,7 @@ impl HyprlandClient {
             sockets,
             timeout: DEFAULT_TIMEOUT,
             lua_mode: Arc::new(AtomicBool::new(false)),
+            lua_probed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -278,6 +281,7 @@ impl HyprlandClient {
         validate_token("keyword", key)?;
         validate_arg(value)?;
         let lua_cmd = format_lua_config_eval(key, value)?;
+        self.ensure_config_provider_probed();
         if !self.lua_mode.load(Ordering::Relaxed) {
             let legacy_cmd = format!("keyword {key} {value}");
             match self.send_ok_command(&legacy_cmd, "keyword") {
@@ -373,6 +377,7 @@ impl HyprlandClient {
     }
 
     fn dispatch_with_lua_fallback(&self, dispatcher: &str, arg: &str, lua_cmd: &str) -> Result<()> {
+        self.ensure_config_provider_probed();
         if !self.lua_mode.load(Ordering::Relaxed) {
             match self.dispatch(dispatcher, arg) {
                 Ok(()) => return Ok(()),
@@ -383,6 +388,22 @@ impl HyprlandClient {
             }
         }
         self.send_ok_command(lua_cmd, dispatcher)
+    }
+
+    /// Detects the config provider once per client via `j/systeminfo` and seeds `lua_mode` when
+    /// the compositor reports `configProvider: lua` (Hyprland v0.55+ Lua configs, mandatory on
+    /// v0.57+), so the first dispatch/keyword skips the guaranteed-failing legacy request. Any
+    /// detection failure (missing field, older version, I/O error) keeps `lua_mode` untouched and
+    /// leaves the error-based fallback as the authoritative decision path.
+    fn ensure_config_provider_probed(&self) {
+        if self.lua_probed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(info) = self.request("j/systeminfo")
+            && systeminfo_says_lua(&info)
+        {
+            self.lua_mode.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Switches all keyboards to the next XKB layout (`switchxkblayout all next`).
@@ -519,6 +540,16 @@ fn escape_lua_string(input: &str) -> String {
 
 fn is_hyprlua_dispatch_error(msg: &str) -> bool {
     msg.contains("hl.dispatch") || msg.contains("syntax might need to be updated")
+}
+
+/// Returns `true` when `j/systeminfo` text output reports `configProvider: lua`.
+fn systeminfo_says_lua(info: &str) -> bool {
+    info.lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("configProvider")
+                && value.trim().eq_ignore_ascii_case("lua")
+        })
 }
 
 fn is_hyprlua_keyword_error(msg: &str) -> bool {
@@ -759,12 +790,13 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for _ in 0..11 {
+            for _ in 0..12 {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut req = [0u8; 512];
                 let n = conn.read(&mut req).unwrap();
                 let cmd = std::str::from_utf8(&req[..n]).unwrap().to_owned();
                 let resp: &str = match cmd.as_str() {
+                    "j/systeminfo" => "System Information:\nconfigProvider: hypr\n",
                     "j/cursorpos" => r#"{"x":1206,"y":515}"#,
                     "j/version" => {
                         r#"{"branch":"v0.56.2","version":"0.56.2","tag":"v0.56.2","dirty":false,"flags":[]}"#
@@ -821,14 +853,15 @@ mod tests {
         assert!(client.batch(&["cmd1;cmd2"]).is_err());
 
         client.keyword("animations:enabled", "false").unwrap();
-        // Triggers HyprLua v0.56 auto-detection on focus_window, then uses Lua directly for the rest:
+        // Probe reports a non-Lua provider, so focus_window still hits the v0.57 hydration error
+        // first, then uses Lua directly for the rest:
         client.focus_window("0xabc").unwrap();
         client.close_window("0xdef").unwrap();
         client.move_window_to_workspace("0xabc", "2", true).unwrap();
         client.toggle_special_workspace(Some("magic")).unwrap();
 
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
 
         // Verify RenameWorkspace updates WorkspaceInfo in place.
         let mut wss = vec![WorkspaceInfo {
@@ -882,12 +915,13 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut req = [0u8; 512];
                 let n = conn.read(&mut req).unwrap();
                 let cmd = std::str::from_utf8(&req[..n]).unwrap().to_owned();
                 let resp: &str = match cmd.as_str() {
+                    "j/systeminfo" => "System Information:\nconfigProvider: hypr\n",
                     "keyword animations:enabled false" => {
                         "error: keyword can't work with non-legacy parsers. Use eval."
                     }
@@ -907,7 +941,8 @@ mod tests {
             event_socket: ev_sock,
         });
 
-        // First keyword call hits v0.57 non-legacy error -> flips lua_mode -> retries via eval.
+        // Probe reports a non-Lua provider, so the first keyword call hits the v0.57 hydration
+        // error -> flips lua_mode -> retries via eval.
         client.keyword("animations:enabled", "false").unwrap();
         // Second keyword call goes straight to eval in 1 roundtrip.
         client.keyword("decoration:blur:passes", "2").unwrap();
@@ -915,7 +950,69 @@ mod tests {
         assert!(client.eval("   ").is_err());
 
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn systeminfo_probe_reports_lua_provider_and_skips_legacy_requests() {
+        // Pure parser checks first:
+        assert!(systeminfo_says_lua(
+            "System Information:\nconfigProvider: lua\n"
+        ));
+        assert!(systeminfo_says_lua("configProvider:  LUA"));
+        assert!(!systeminfo_says_lua("configProvider: hypr\n"));
+        assert!(!systeminfo_says_lua("some text without the field"));
+        assert!(!systeminfo_says_lua("unknown request"));
+
+        // Then the full client flow: the probe flips lua_mode before any dispatch, so every
+        // request goes straight to the Lua syntax in one roundtrip.
+        let dir = std::env::temp_dir().join(format!(
+            "waywi-hypr-fastpath-{}-{}",
+            std::process::id(),
+            SOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd_sock = dir.join(".socket.sock");
+        let ev_sock = dir.join(".socket2.sock");
+        let listener = UnixListener::bind(&cmd_sock).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut req = [0u8; 512];
+                let n = conn.read(&mut req).unwrap();
+                let cmd = std::str::from_utf8(&req[..n]).unwrap().to_owned();
+                let resp: &str = match cmd.as_str() {
+                    "j/systeminfo" => "System Information:\nconfigProvider: lua\n",
+                    "eval hl.config({ animations = { enabled = false } })" => "ok",
+                    "dispatch hl.dsp.focus({ window = \"address:0xabc\" })" => "ok",
+                    other => panic!("unexpected legacy command: {other}"),
+                };
+                seen.push(cmd);
+                conn.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+
+        let client = HyprlandClient::with_sockets(HyprlandSockets {
+            command_socket: cmd_sock,
+            event_socket: ev_sock,
+        });
+
+        client.keyword("animations:enabled", "false").unwrap();
+        client.focus_window("0xabc").unwrap();
+
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                "j/systeminfo".to_owned(),
+                "eval hl.config({ animations = { enabled = false } })".to_owned(),
+                "dispatch hl.dsp.focus({ window = \"address:0xabc\" })".to_owned(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
