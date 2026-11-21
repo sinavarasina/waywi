@@ -50,7 +50,8 @@ pub struct NotificationImageData {
     pub data: Vec<u8>,
 }
 
-/// Typed XDG desktop notification received over `org.freedesktop.Notifications.Notify`.
+/// Typed XDG desktop notification received over `org.freedesktop.Notifications.Notify`
+/// (Desktop Notifications Specification v1.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopNotification {
     pub id: u32,
@@ -61,14 +62,62 @@ pub struct DesktopNotification {
     pub body: String,
     /// Action `(action_key, display_label)` pairs declared by the sending client.
     pub actions: Vec<(String, String)>,
+    /// Urgency hint (`"urgency"`: Low / Normal / Critical).
     pub urgency: NotificationUrgency,
+    /// XDG notification category hint (`"category"`, e.g. `"im.received"`, `"email.arrived"`).
+    pub category: Option<String>,
+    /// Sending application's `.desktop` identifier (`"desktop-entry"`).
     pub desktop_entry: Option<String>,
+    /// File path or icon name hint (`"image-path"` / legacy `"image_path"`).
     pub image_path: Option<String>,
+    /// Inline uncompressed pixel payload (`"image-data"` / legacy `"image_data"`, `"icon_data"`).
     pub image_data: Option<NotificationImageData>,
+    /// Whether action keys should be interpreted as named icons (`"action-icons"`).
+    pub action_icons: bool,
+    /// Whether the notification should remain open after an action is invoked (`"resident"`).
+    pub resident: bool,
+    /// Whether the notification is transient and should bypass persistence/history (`"transient"`).
+    pub transient: bool,
+    /// Whether the sending application requests suppressing notification sounds (`"suppress-sound"`).
+    pub suppress_sound: bool,
+    /// Freedesktop named sound theme hint (`"sound-name"`).
+    pub sound_name: Option<String>,
+    /// Explicit sound file path hint (`"sound-file"`).
+    pub sound_file: Option<String>,
+    /// Optional target screen coordinates (`"x"`, `"y"`) when both hints are supplied.
+    pub position: Option<(i32, i32)>,
     /// Requested expiration timeout in milliseconds (`-1` = server default, `0` = never expire).
     pub expire_timeout_ms: i32,
     /// Local wall-clock timestamp recorded immediately when the notification was received.
     pub received_at: SystemTime,
+}
+
+impl Default for DesktopNotification {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            app_name: String::new(),
+            replaces_id: 0,
+            app_icon: String::new(),
+            summary: String::new(),
+            body: String::new(),
+            actions: Vec::new(),
+            urgency: NotificationUrgency::Normal,
+            category: None,
+            desktop_entry: None,
+            image_path: None,
+            image_data: None,
+            action_icons: false,
+            resident: false,
+            transient: false,
+            suppress_sound: false,
+            sound_name: None,
+            sound_file: None,
+            position: None,
+            expire_timeout_ms: -1,
+            received_at: SystemTime::UNIX_EPOCH,
+        }
+    }
 }
 
 /// Events emitted by [`Dbus::notifications`] when acting as the session notification server.
@@ -263,10 +312,18 @@ impl NotificationsIface {
             body,
             actions: action_pairs,
             urgency: parse_urgency(&hints),
+            category: hint_string(&hints, "category"),
             desktop_entry: hint_string(&hints, "desktop-entry"),
             image_path: hint_string(&hints, "image-path")
                 .or_else(|| hint_string(&hints, "image_path")),
             image_data: parse_image_data_hints(&hints),
+            action_icons: hint_bool(&hints, "action-icons"),
+            resident: hint_bool(&hints, "resident"),
+            transient: hint_bool(&hints, "transient"),
+            suppress_sound: hint_bool(&hints, "suppress-sound"),
+            sound_name: hint_string(&hints, "sound-name"),
+            sound_file: hint_string(&hints, "sound-file"),
+            position: parse_position_hints(&hints),
             expire_timeout_ms: expire_timeout,
             received_at: SystemTime::now(),
         };
@@ -327,9 +384,28 @@ fn unwrap_value<'a>(mut val: &'a Value<'a>) -> &'a Value<'a> {
 fn hint_string(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
     let val = hints.get(key)?;
     match unwrap_value(val) {
-        Value::Str(s) => Some(s.to_string()),
+        Value::Str(s) if !s.is_empty() => Some(s.to_string()),
         _ => None,
     }
+}
+
+fn hint_bool(hints: &HashMap<String, OwnedValue>, key: &str) -> bool {
+    let Some(val) = hints.get(key) else {
+        return false;
+    };
+    match unwrap_value(val) {
+        Value::Bool(b) => *b,
+        Value::U8(v) => *v != 0,
+        Value::I32(v) => *v != 0,
+        Value::U32(v) => *v != 0,
+        _ => false,
+    }
+}
+
+fn parse_position_hints(hints: &HashMap<String, OwnedValue>) -> Option<(i32, i32)> {
+    let x = as_i32(unwrap_value(hints.get("x")?))?;
+    let y = as_i32(unwrap_value(hints.get("y")?))?;
+    Some((x, y))
 }
 
 fn parse_urgency(hints: &HashMap<String, OwnedValue>) -> NotificationUrgency {
@@ -428,5 +504,70 @@ mod tests {
         assert!(img.has_alpha);
         assert_eq!(img.channels, 4);
         assert_eq!(img.data.len(), 8);
+    }
+
+    #[test]
+    fn notification_hints_parse_all_xdg_v1_2_standard_hints() {
+        let mut hints: HashMap<String, OwnedValue> = HashMap::new();
+        hints.insert(
+            "category".to_owned(),
+            Value::from("im.received").try_into().unwrap(),
+        );
+        hints.insert(
+            "desktop-entry".to_owned(),
+            Value::from("org.example.Chat").try_into().unwrap(),
+        );
+        hints.insert(
+            "action-icons".to_owned(),
+            Value::from(true).try_into().unwrap(),
+        );
+        hints.insert("resident".to_owned(), Value::from(true).try_into().unwrap());
+        hints.insert("transient".to_owned(), Value::from(1u8).try_into().unwrap());
+        hints.insert(
+            "suppress-sound".to_owned(),
+            Value::from(true).try_into().unwrap(),
+        );
+        hints.insert(
+            "sound-name".to_owned(),
+            Value::from("message-new-instant").try_into().unwrap(),
+        );
+        hints.insert(
+            "sound-file".to_owned(),
+            Value::from("/usr/share/sounds/ding.ogg")
+                .try_into()
+                .unwrap(),
+        );
+        hints.insert("x".to_owned(), Value::from(640i32).try_into().unwrap());
+        hints.insert("y".to_owned(), Value::from(480i32).try_into().unwrap());
+
+        assert_eq!(
+            hint_string(&hints, "category").as_deref(),
+            Some("im.received")
+        );
+        assert_eq!(
+            hint_string(&hints, "desktop-entry").as_deref(),
+            Some("org.example.Chat")
+        );
+        assert!(hint_bool(&hints, "action-icons"));
+        assert!(hint_bool(&hints, "resident"));
+        assert!(hint_bool(&hints, "transient"));
+        assert!(hint_bool(&hints, "suppress-sound"));
+        assert_eq!(
+            hint_string(&hints, "sound-name").as_deref(),
+            Some("message-new-instant")
+        );
+        assert_eq!(
+            hint_string(&hints, "sound-file").as_deref(),
+            Some("/usr/share/sounds/ding.ogg")
+        );
+        assert_eq!(parse_position_hints(&hints), Some((640, 480)));
+
+        // Missing y coordinate yields None rather than a half-specified position.
+        hints.remove("y");
+        assert_eq!(parse_position_hints(&hints), None);
+
+        // Empty strings normalize to None.
+        hints.insert("category".to_owned(), Value::from("").try_into().unwrap());
+        assert_eq!(hint_string(&hints, "category"), None);
     }
 }
