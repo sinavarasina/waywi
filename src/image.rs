@@ -1,4 +1,4 @@
-pub use crate::asset::ImageAsset;
+pub use crate::asset::{AssetRetention, ImageAsset};
 use crate::input::CommonProps;
 
 /// Pixel-space sub-rectangle `(x, y, width, height)` inside an [`ImageAsset`] texture atlas.

@@ -30,6 +30,6 @@ Implement `Application`:
 
 ## Assets, Timers & System Telemetry
 
-- Assets: `ctx.load_image(path)`, `ctx.load_image_sized(path, min_svg_px)`, `ctx.load_image_bytes(bytes)`, `ctx.load_image_bytes_sized(bytes, min_svg_px)`, `ctx.load_rgba_image(...)`, `ctx.load_image_async(...)`, `ctx.reload_asset(...)`, `ctx.unload_asset(...)`.
+- Assets: `ctx.load_image(path)`, `ctx.load_image_sized(path, min_svg_px)`, `ctx.load_image_bytes(bytes)`, `ctx.load_image_bytes_sized(bytes, min_svg_px)`, `ctx.load_rgba_image(...)`, `ctx.load_image_async(...)`, `ctx.set_asset_retention(asset, AssetRetention::KeepDecoded | ReclaimAfterPresent)`, `ctx.asset_retention(asset)`, `ctx.evict_asset_pixels(asset)`, `ctx.reload_asset(...)`, `ctx.unload_asset(...)`.
 - Timers: `Timer::once(key, duration, msg)` (resets on key change) and `Timer::every(key, interval, msg)`.
 - System telemetry: `System::{cpu, memory, time, gpu, disk, network, battery, sensors, uptime, brightness, privacy}().every(...)` subscriptions and direct `ctx.system()` queries, plus formatted units (`ByteSize`, `DataRate`, `RateUnit`, `FreqUnit`, `LocalDateTime`, `CalendarMonth`).

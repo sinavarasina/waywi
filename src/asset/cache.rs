@@ -3,12 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Result, WaywiError};
+use crate::render::retained::{DrawCommand, PaintPayload};
 
 use super::decode::{
     decode_image_bytes, decode_image_bytes_sized, detect_format, hash_bytes, premultiply_into,
     read_bounded_file, validate_dimensions,
 };
-use super::types::{AssetId, AssetSource, CacheEntry, DecodedImage, ImageAsset, ImageFormat};
+use super::types::{
+    AssetId, AssetRetention, AssetSource, CacheEntry, DecodedImage, ImageAsset, ImageFormat,
+};
 
 /// Shared decoded asset store owned by `App`.
 pub(crate) struct AssetCache {
@@ -18,7 +21,8 @@ pub(crate) struct AssetCache {
     path_index: HashMap<PathBuf, AssetId>,
     sized_path_index: HashMap<(PathBuf, u32), AssetId>,
     hash_index: HashMap<u64, AssetId>,
-    svg_source_cache: HashMap<AssetId, Arc<[u8]>>,
+    evicted_count: usize,
+    reclaimable_count: usize,
 }
 
 impl Default for AssetCache {
@@ -36,7 +40,8 @@ impl AssetCache {
             path_index: HashMap::new(),
             sized_path_index: HashMap::new(),
             hash_index: HashMap::new(),
-            svg_source_cache: HashMap::new(),
+            evicted_count: 0,
+            reclaimable_count: 0,
         }
     }
 
@@ -58,8 +63,8 @@ impl AssetCache {
             {
                 return Ok(ImageAsset {
                     id: existing_id,
-                    width: entry.image.width,
-                    height: entry.image.height,
+                    width: entry.width,
+                    height: entry.height,
                 });
             }
         } else {
@@ -68,19 +73,19 @@ impl AssetCache {
             {
                 return Ok(ImageAsset {
                     id: existing_id,
-                    width: entry.image.width,
-                    height: entry.image.height,
+                    width: entry.width,
+                    height: entry.height,
                 });
             }
             if let Some(&existing_id) = self.path_index.get(&canonical)
                 && let Some(entry) = self.entries.get(&existing_id)
-                && (!self.svg_source_cache.contains_key(&existing_id)
-                    || entry.image.width.max(entry.image.height) >= min_svg_px)
+                && (entry.format != Some(ImageFormat::Svg)
+                    || entry.width.max(entry.height) >= min_svg_px)
             {
                 return Ok(ImageAsset {
                     id: existing_id,
-                    width: entry.image.width,
-                    height: entry.image.height,
+                    width: entry.width,
+                    height: entry.height,
                 });
             }
         }
@@ -101,22 +106,19 @@ impl AssetCache {
             }
             return Ok(ImageAsset {
                 id: existing_id,
-                width: entry.image.width,
-                height: entry.image.height,
+                width: entry.width,
+                height: entry.height,
             });
         }
 
-        let decoded =
-            decode_image_bytes_sized(&bytes, format, effective_svg_px, self.alloc_revision())?;
+        let revision = self.alloc_revision();
+        let decoded = decode_image_bytes_sized(&bytes, format, effective_svg_px, revision)?;
         let id = self.alloc_id();
         let asset = ImageAsset {
             id,
             width: decoded.width,
             height: decoded.height,
         };
-        if format == ImageFormat::Svg {
-            self.svg_source_cache.insert(id, Arc::from(bytes));
-        }
         if effective_svg_px > 0 {
             self.sized_path_index
                 .insert((canonical.clone(), effective_svg_px), id);
@@ -127,9 +129,17 @@ impl AssetCache {
         self.entries.insert(
             id,
             CacheEntry {
-                image: decoded,
-                source: AssetSource::Path(canonical),
+                width: decoded.width,
+                height: decoded.height,
+                revision,
+                format: Some(format),
+                image: Some(decoded),
+                source: AssetSource::Path {
+                    path: canonical,
+                    min_svg_px: effective_svg_px,
+                },
                 content_hash: cache_hash,
+                retention: AssetRetention::KeepDecoded,
             },
         );
         Ok(asset)
@@ -149,29 +159,35 @@ impl AssetCache {
         {
             return Ok(ImageAsset {
                 id: existing_id,
-                width: entry.image.width,
-                height: entry.image.height,
+                width: entry.width,
+                height: entry.height,
             });
         }
 
-        let decoded =
-            decode_image_bytes_sized(bytes, format, effective_svg_px, self.alloc_revision())?;
+        let revision = self.alloc_revision();
+        let decoded = decode_image_bytes_sized(bytes, format, effective_svg_px, revision)?;
         let id = self.alloc_id();
         let asset = ImageAsset {
             id,
             width: decoded.width,
             height: decoded.height,
         };
-        if format == ImageFormat::Svg {
-            self.svg_source_cache.insert(id, Arc::from(bytes));
-        }
         self.hash_index.insert(cache_hash, id);
         self.entries.insert(
             id,
             CacheEntry {
-                image: decoded,
-                source: AssetSource::Bytes,
+                width: decoded.width,
+                height: decoded.height,
+                revision,
+                format: Some(format),
+                image: Some(decoded),
+                source: AssetSource::EncodedBytes {
+                    bytes: Arc::from(bytes),
+                    format,
+                    min_svg_px: effective_svg_px,
+                },
                 content_hash: cache_hash,
+                retention: AssetRetention::KeepDecoded,
             },
         );
         Ok(asset)
@@ -203,8 +219,8 @@ impl AssetCache {
         {
             return Ok(ImageAsset {
                 id: existing_id,
-                width: entry.image.width,
-                height: entry.image.height,
+                width: entry.width,
+                height: entry.height,
             });
         }
 
@@ -215,15 +231,20 @@ impl AssetCache {
         self.entries.insert(
             id,
             CacheEntry {
-                image: DecodedImage {
+                width,
+                height,
+                revision,
+                format: None,
+                image: Some(DecodedImage {
                     width,
                     height,
                     pixels: Arc::from(premultiplied_rgba),
                     revision,
                     animated_frames: None,
-                },
-                source: AssetSource::Bytes,
+                }),
+                source: AssetSource::RawPixels,
                 content_hash,
+                retention: AssetRetention::KeepDecoded,
             },
         );
         Ok(asset)
@@ -297,32 +318,46 @@ impl AssetCache {
         let bytes = read_bounded_file(&canonical)?;
         let format = detect_format(&bytes, Some(&canonical))?;
         let new_hash = hash_bytes(&bytes);
-        let decoded = decode_image_bytes(&bytes, format, self.alloc_revision())?;
+        let revision = self.alloc_revision();
+        let decoded = decode_image_bytes(&bytes, format, revision)?;
         let updated = ImageAsset {
             id: asset.id,
             width: decoded.width,
             height: decoded.height,
         };
 
+        let mut preserved_retention = AssetRetention::KeepDecoded;
         if let Some(old_entry) = self.entries.get(&asset.id) {
+            preserved_retention = old_entry.retention;
+            if old_entry.image.is_none() {
+                self.evicted_count = self.evicted_count.saturating_sub(1);
+            }
             self.hash_index.remove(&old_entry.content_hash);
-            if let AssetSource::Path(ref old_path) = old_entry.source {
+            if let AssetSource::Path {
+                path: ref old_path, ..
+            } = old_entry.source
+            {
                 self.path_index.remove(old_path);
             }
         }
-        if format == ImageFormat::Svg {
-            self.svg_source_cache.insert(asset.id, Arc::from(bytes));
-        } else {
-            self.svg_source_cache.remove(&asset.id);
-        }
+        self.sized_path_index
+            .retain(|_, &mut cached| cached != asset.id);
         self.path_index.insert(canonical.clone(), asset.id);
         self.hash_index.insert(new_hash, asset.id);
         self.entries.insert(
             asset.id,
             CacheEntry {
-                image: decoded,
-                source: AssetSource::Path(canonical),
+                width: decoded.width,
+                height: decoded.height,
+                revision,
+                format: Some(format),
+                image: Some(decoded),
+                source: AssetSource::Path {
+                    path: canonical,
+                    min_svg_px: 0,
+                },
                 content_hash: new_hash,
+                retention: preserved_retention,
             },
         );
         Ok(updated)
@@ -331,12 +366,17 @@ impl AssetCache {
     /// Removes an asset from the cache and frees its decoded pixel buffer (once unused).
     pub(crate) fn unload(&mut self, id: AssetId) -> bool {
         if let Some(entry) = self.entries.remove(&id) {
+            if entry.image.is_none() {
+                self.evicted_count = self.evicted_count.saturating_sub(1);
+            }
+            if entry.retention == AssetRetention::ReclaimAfterPresent {
+                self.reclaimable_count = self.reclaimable_count.saturating_sub(1);
+            }
             self.hash_index.remove(&entry.content_hash);
-            if let AssetSource::Path(path) = entry.source {
+            if let AssetSource::Path { path, .. } = entry.source {
                 self.path_index.remove(&path);
             }
             self.sized_path_index.retain(|_, &mut cached| cached != id);
-            self.svg_source_cache.remove(&id);
             true
         } else {
             false
@@ -347,10 +387,12 @@ impl AssetCache {
     pub(crate) fn commit_worker_decoded(
         &mut self,
         path: Option<PathBuf>,
+        format: Option<ImageFormat>,
         content_hash: u64,
         mut decoded: DecodedImage,
     ) -> ImageAsset {
-        decoded.revision = self.alloc_revision();
+        let revision = self.alloc_revision();
+        decoded.revision = revision;
         let id = self.alloc_id();
         let asset = ImageAsset {
             id,
@@ -361,25 +403,215 @@ impl AssetCache {
             self.path_index.insert(p.clone(), id);
         }
         self.hash_index.insert(content_hash, id);
+        let source = path.map_or(AssetSource::RawPixels, |p| AssetSource::Path {
+            path: p,
+            min_svg_px: 0,
+        });
         self.entries.insert(
             id,
             CacheEntry {
-                image: decoded,
-                source: path.map_or(AssetSource::Bytes, AssetSource::Path),
+                width: decoded.width,
+                height: decoded.height,
+                revision,
+                format,
+                image: Some(decoded),
+                source,
                 content_hash,
+                retention: AssetRetention::KeepDecoded,
             },
         );
         asset
     }
 
+    /// Updates the memory retention policy for `id`.
+    ///
+    /// Returns `false` if `id` is unknown or if [`AssetRetention::ReclaimAfterPresent`] is
+    /// requested for a raw-pixel asset (`load_rgba_image`) that cannot be re-decoded.
+    pub(crate) fn set_retention(&mut self, id: AssetId, retention: AssetRetention) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if retention == AssetRetention::ReclaimAfterPresent && !entry.source.is_reclaimable() {
+            return false;
+        }
+        if entry.retention != retention {
+            match retention {
+                AssetRetention::ReclaimAfterPresent => {
+                    self.reclaimable_count += 1;
+                }
+                AssetRetention::KeepDecoded => {
+                    self.reclaimable_count = self.reclaimable_count.saturating_sub(1);
+                }
+            }
+            entry.retention = retention;
+        }
+        true
+    }
+
+    #[must_use]
+    pub(crate) fn retention(&self, id: AssetId) -> Option<AssetRetention> {
+        self.entries.get(&id).map(|e| e.retention)
+    }
+
+    /// Releases the decoded RGBA8 pixel buffer for `id` while preserving its handle, dimensions,
+    /// revision, and backing source so future redraws transparently re-decode on demand.
+    ///
+    /// Returns `true` if decoded pixels were resident and freed; returns `false` if `id` is
+    /// unknown, already evicted, or backed by raw pixels with no encoded/file source.
+    pub(crate) fn evict_decoded_pixels(&mut self, id: AssetId) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if !entry.source.is_reclaimable() || entry.image.is_none() {
+            return false;
+        }
+        entry.image = None;
+        self.evicted_count += 1;
+        true
+    }
+
+    /// Re-decodes `id` from its backing disk path or compressed bytes if its decoded pixels were
+    /// previously evicted, preserving its original `revision`.
+    pub(crate) fn ensure_decoded(&mut self, id: AssetId) -> Result<()> {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return Err(WaywiError::AssetDecode(format!(
+                "cannot decode unknown asset {id:?}"
+            )));
+        };
+        if entry.image.is_some() {
+            return Ok(());
+        }
+        let decoded = match &entry.source {
+            AssetSource::Path { path, min_svg_px } => {
+                let bytes = read_bounded_file(path)?;
+                let format = detect_format(&bytes, Some(path))?;
+                let effective_svg_px = if format == ImageFormat::Svg {
+                    *min_svg_px
+                } else {
+                    0
+                };
+                decode_image_bytes_sized(&bytes, format, effective_svg_px, entry.revision)?
+            }
+            AssetSource::EncodedBytes {
+                bytes,
+                format,
+                min_svg_px,
+            } => {
+                let effective_svg_px = if *format == ImageFormat::Svg {
+                    *min_svg_px
+                } else {
+                    0
+                };
+                decode_image_bytes_sized(bytes, *format, effective_svg_px, entry.revision)?
+            }
+            AssetSource::RawPixels => {
+                return Err(WaywiError::AssetDecode(format!(
+                    "raw pixel asset {id:?} has no re-decodable backing source"
+                )));
+            }
+        };
+        entry.width = decoded.width;
+        entry.height = decoded.height;
+        entry.image = Some(decoded);
+        self.evicted_count = self.evicted_count.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Ensures every evicted `Image` or `Sprite` asset referenced by `commands` has its decoded
+    /// RGBA8 pixels resident before constructing a `FrameScene`.
+    ///
+    /// Fast path: single branch (`O(1)`) when no cached assets are currently evicted.
+    pub(crate) fn ensure_decoded_for_commands(&mut self, commands: &[DrawCommand]) {
+        if self.evicted_count == 0 {
+            return;
+        }
+        for cmd in commands {
+            let id = match &cmd.payload {
+                PaintPayload::Image { asset, .. } => asset.id,
+                PaintPayload::Sprite { sheet, .. } => sheet.asset.id,
+                _ => continue,
+            };
+            if self.entries.get(&id).is_some_and(|e| e.image.is_none()) {
+                let _ = self.ensure_decoded(id);
+                if self.evicted_count == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Collects resident [`AssetRetention::ReclaimAfterPresent`] asset IDs referenced by
+    /// `commands` so callers can reclaim them once all dirty surfaces in the pass have committed.
+    ///
+    /// Fast path: single branch (`O(1)`) when no assets use `ReclaimAfterPresent`.
+    pub(crate) fn collect_reclaimable_from_commands(
+        &self,
+        commands: &[DrawCommand],
+        out: &mut Vec<AssetId>,
+    ) {
+        if self.reclaimable_count == 0 {
+            return;
+        }
+        for cmd in commands {
+            let id = match &cmd.payload {
+                PaintPayload::Image { asset, .. } => asset.id,
+                PaintPayload::Sprite { sheet, .. } => sheet.asset.id,
+                _ => continue,
+            };
+            if self.entries.get(&id).is_some_and(|e| {
+                e.retention == AssetRetention::ReclaimAfterPresent && e.image.is_some()
+            }) {
+                out.push(id);
+            }
+        }
+    }
+
+    /// Evicts decoded pixel buffers for every `ReclaimAfterPresent` asset listed in `ids`.
+    pub(crate) fn reclaim_assets(&mut self, ids: &[AssetId]) {
+        for &id in ids {
+            if self
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.retention == AssetRetention::ReclaimAfterPresent)
+            {
+                self.evict_decoded_pixels(id);
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) fn get(&self, id: AssetId) -> Option<&DecodedImage> {
-        self.entries.get(&id).map(|e| &e.image)
+        self.entries.get(&id).and_then(|e| e.image.as_ref())
+    }
+
+    #[must_use]
+    pub(crate) fn dimensions_of(&self, id: AssetId) -> Option<(u32, u32)> {
+        self.entries.get(&id).map(|e| (e.width, e.height))
     }
 
     #[must_use]
     pub(crate) fn revision_of(&self, id: AssetId) -> u64 {
-        self.entries.get(&id).map_or(0, |e| e.image.revision)
+        self.entries.get(&id).map_or(0, |e| e.revision)
+    }
+
+    #[must_use]
+    pub(crate) fn is_decoded(&self, id: AssetId) -> bool {
+        self.entries.get(&id).is_some_and(|e| e.image.is_some())
+    }
+
+    #[must_use]
+    pub(crate) fn decoded_pixel_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .filter_map(|e| e.image.as_ref())
+            .map(|img| {
+                let extra: usize = img
+                    .animated_frames
+                    .as_ref()
+                    .map_or(0, |frames| frames.iter().map(|f| f.pixels.len()).sum());
+                img.pixels.len() + extra
+            })
+            .sum()
     }
 
     fn alloc_id(&mut self) -> AssetId {
@@ -407,4 +639,77 @@ fn svg_sized_hash(base_hash: u64, format: ImageFormat, min_svg_px: u32) -> (u32,
         base_hash
     };
     (effective, hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_counter_invariants(cache: &AssetCache) {
+        let actual_evicted = cache.entries.values().filter(|e| e.image.is_none()).count();
+        let actual_reclaimable = cache
+            .entries
+            .values()
+            .filter(|e| e.retention == AssetRetention::ReclaimAfterPresent)
+            .count();
+        assert_eq!(cache.evicted_count, actual_evicted);
+        assert_eq!(cache.reclaimable_count, actual_reclaimable);
+    }
+
+    #[test]
+    fn raw_pixel_assets_cannot_be_evicted_or_marked_reclaimable() {
+        let mut cache = AssetCache::new();
+        let raw = cache
+            .insert_decoded_rgba(2, 2, vec![255; 16])
+            .expect("raw rgba insert");
+        assert_eq!(cache.retention(raw.id), Some(AssetRetention::KeepDecoded));
+        assert!(!cache.set_retention(raw.id, AssetRetention::ReclaimAfterPresent));
+        assert!(!cache.evict_decoded_pixels(raw.id));
+        assert!(cache.is_decoded(raw.id));
+        assert_eq!(cache.decoded_pixel_bytes(), 16);
+        assert_counter_invariants(&cache);
+
+        assert!(cache.unload(raw.id));
+        assert_eq!(cache.decoded_pixel_bytes(), 0);
+        assert_counter_invariants(&cache);
+    }
+
+    #[cfg(feature = "image-svg")]
+    #[test]
+    fn eviction_redecode_and_unload_keep_revision_and_counters_consistent() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6"><rect width="8" height="6" fill="red"/></svg>"#;
+        let mut cache = AssetCache::new();
+        let asset = cache.load_bytes_sized(svg, 24).expect("svg decode");
+        let rev_before = cache.revision_of(asset.id);
+        let dims_before = cache.dimensions_of(asset.id);
+        assert_eq!(dims_before, Some((24, 18)));
+        assert_eq!(cache.decoded_pixel_bytes(), 24 * 18 * 4);
+
+        assert!(cache.set_retention(asset.id, AssetRetention::ReclaimAfterPresent));
+        assert_counter_invariants(&cache);
+        assert!(cache.evict_decoded_pixels(asset.id));
+        assert!(!cache.evict_decoded_pixels(asset.id));
+        assert!(!cache.is_decoded(asset.id));
+        assert_eq!(cache.decoded_pixel_bytes(), 0);
+        assert_eq!(cache.revision_of(asset.id), rev_before);
+        assert_eq!(cache.dimensions_of(asset.id), dims_before);
+        assert_counter_invariants(&cache);
+
+        // Deduplication hit while evicted still returns accurate dimensions without re-decoding.
+        let dedup = cache.load_bytes_sized(svg, 24).expect("dedup");
+        assert_eq!(dedup, asset);
+        assert!(!cache.is_decoded(asset.id));
+
+        // On-demand re-decode restores exact pixels and keeps revision identical.
+        cache.ensure_decoded(asset.id).expect("redecode");
+        assert!(cache.is_decoded(asset.id));
+        assert_eq!(cache.revision_of(asset.id), rev_before);
+        assert_eq!(cache.decoded_pixel_bytes(), 24 * 18 * 4);
+        assert_counter_invariants(&cache);
+
+        // Switching retention back to KeepDecoded and unloading an evicted asset keeps counters clean.
+        assert!(cache.evict_decoded_pixels(asset.id));
+        assert!(cache.unload(asset.id));
+        assert_counter_invariants(&cache);
+    }
 }

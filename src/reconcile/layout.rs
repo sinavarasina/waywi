@@ -143,8 +143,8 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
         ElementKind::Image(img) => {
             if let Some(sr) = img.source_rect {
                 LogicalSize::new(LogicalPx(sr.width as f32), LogicalPx(sr.height as f32))
-            } else if let Some(d) = assets.get(img.asset.id) {
-                LogicalSize::new(LogicalPx(d.width as f32), LogicalPx(d.height as f32))
+            } else if let Some((w, h)) = assets.dimensions_of(img.asset.id) {
+                LogicalSize::new(LogicalPx(w as f32), LogicalPx(h as f32))
             } else {
                 LogicalSize::new(
                     LogicalPx(img.asset.width as f32),

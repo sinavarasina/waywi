@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::asset::{AssetCache, AssetId};
+use crate::asset::{AssetCache, AssetId, AssetRetention};
 use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
 use crate::error::{Result, WaywiError};
@@ -143,7 +143,48 @@ impl<'a> EffectCtx<'a> {
         Ok(())
     }
 
-    /// Removes `asset` from the internal asset cache to reclaim decoded pixel memory.
+    /// Configures the decoded pixel memory retention policy for `asset`.
+    ///
+    /// - [`AssetRetention::KeepDecoded`] (default): keeps decoded premultiplied RGBA8 pixels
+    ///   resident in RAM for immediate redraws.
+    /// - [`AssetRetention::ReclaimAfterPresent`]: releases the decoded RGBA8 pixel buffer after
+    ///   presenting frames that reference `asset` (e.g., static 4K wallpapers), while retaining
+    ///   the [`ImageAsset`] handle, dimensions, revision, and backing disk path or compressed
+    ///   bytes so future redraws (output resize, hotplug, scale change) transparently re-decode
+    ///   on demand.
+    ///
+    /// Returns `false` if `asset` is unknown/unloaded, or if
+    /// [`AssetRetention::ReclaimAfterPresent`] is requested for a raw pixel asset created via
+    /// [`Self::load_rgba_image`] (which has no compressed or disk backing source).
+    pub fn set_asset_retention(&mut self, asset: ImageAsset, retention: AssetRetention) -> bool {
+        self.assets.set_retention(asset.id, retention)
+    }
+
+    /// Returns the active [`AssetRetention`] policy for `asset`, or `None` if unloaded.
+    #[must_use]
+    pub fn asset_retention(&self, asset: ImageAsset) -> Option<AssetRetention> {
+        self.assets.retention(asset.id)
+    }
+
+    /// Immediately frees the decoded RGBA8 pixel buffer for `asset` while keeping its
+    /// [`ImageAsset`] handle, dimensions, revision, and backing disk path or compressed bytes
+    /// intact.
+    ///
+    /// Unlike [`Self::unload_asset`], any future redraw referencing `asset` (such as a sprite
+    /// sheet or popup becoming visible again, or a surface resizing) transparently re-decodes the
+    /// pixels on demand.
+    ///
+    /// Returns `true` if decoded pixels were resident and freed; returns `false` if `asset` is
+    /// unknown, already evicted, or backed only by raw pixels ([`Self::load_rgba_image`]).
+    pub fn evict_asset_pixels(&mut self, asset: ImageAsset) -> bool {
+        self.assets.evict_decoded_pixels(asset.id)
+    }
+
+    /// Removes `asset` permanently from the internal asset cache to reclaim all associated memory.
+    ///
+    /// Once unloaded, the handle can no longer be rendered unless reloaded into a fresh asset.
+    /// Prefer [`Self::set_asset_retention`] or [`Self::evict_asset_pixels`] when the asset may
+    /// still need to redraw later.
     pub fn unload_asset(&mut self, asset: ImageAsset) -> bool {
         self.assets.unload(asset.id)
     }

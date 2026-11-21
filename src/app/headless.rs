@@ -288,10 +288,12 @@ impl<A: Application> HeadlessRuntime<A> {
             self.frame_buffers.remove(rk);
         }
 
+        let mut reclaim_candidates = Vec::new();
         for (rk, surf) in &mut self.reconciler.surfaces {
             if !surf.needs_redraw {
                 continue;
             }
+            self.assets.ensure_decoded_for_commands(&surf.commands);
             let eff = surf.effective_logical_size();
             let (bw, bh) = eff.to_buffer_ceil(surf.scale);
             let len = (bw.0 as usize) * (bh.0 as usize) * 4;
@@ -319,7 +321,10 @@ impl<A: Application> HeadlessRuntime<A> {
             surf.needs_redraw = false;
             surf.full_redraw = false;
             surf.dirty_logical_rects.clear();
+            self.assets
+                .collect_reclaimable_from_commands(&surf.commands, &mut reclaim_candidates);
         }
+        self.assets.reclaim_assets(&reclaim_candidates);
 
         Ok(())
     }
@@ -612,6 +617,18 @@ impl<A: Application> HeadlessRuntime<A> {
     #[must_use]
     pub fn arena_heap_fallbacks(&self) -> usize {
         self.arena.last_stats().heap_fallbacks
+    }
+
+    /// Returns `true` if `asset`'s decoded RGBA8 pixel buffer is currently resident in RAM.
+    #[must_use]
+    pub fn asset_pixels_resident(&self, asset: crate::image::ImageAsset) -> bool {
+        self.assets.is_decoded(asset.id)
+    }
+
+    /// Returns total decoded RGBA8 pixel bytes currently resident in the internal asset cache.
+    #[must_use]
+    pub fn decoded_asset_bytes(&self) -> usize {
+        self.assets.decoded_pixel_bytes()
     }
 
     #[must_use]

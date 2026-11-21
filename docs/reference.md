@@ -36,7 +36,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 `EffectCtx<'a>` (`effect::context`) is passed into `Application::init` and `Application::update`:
 
 - **Lifecycle & runtime**: `quit()`, `capabilities() -> &Capabilities`, `outputs() -> &[OutputInfo]`, `after<M>(delay, make)` (`M: Send + 'static`), `system() -> &mut SystemProviders`.
-- **Image & sprite assets**: `load_image(path)`, `load_image_sized(path, min_svg_px)`, `load_image_bytes(bytes)`, `load_image_bytes_sized(bytes, min_svg_px)`, `load_rgba_image(width, height, stride, pixels)`, `load_image_async(source, map)`, `reload_asset(asset, path)`, `unload_asset(asset) -> bool`.
+- **Image & sprite assets**: `load_image(path)`, `load_image_sized(path, min_svg_px)`, `load_image_bytes(bytes)`, `load_image_bytes_sized(bytes, min_svg_px)`, `load_rgba_image(width, height, stride, pixels)`, `load_image_async(source, map)`, `set_asset_retention(asset, retention) -> bool`, `asset_retention(asset) -> Option<AssetRetention>`, `evict_asset_pixels(asset) -> bool`, `reload_asset(asset, path)`, `unload_asset(asset) -> bool`.
 - **Audio (`audio` / `audio-playback`)**: `audio() -> Result<&AudioClient>`, `player() -> Result<&AudioPlayer>`, `load_sound(path)`, `load_sound_bytes(bytes)`, `load_sound_preset(preset)`, `load_system_sound(name)`, `play_sound(sound)`, `play_sound_volume(sound, volume)`, `play_sound_preset(preset, volume)`, `play_system_sound(name, volume)`, `stop_sounds()`.
 - **Compositors**: `hyprland()` (`hyprland-ipc`), `sway()` (`sway-ipc`), `compositor() -> Result<CompositorClient<'_>>`.
 - **D-Bus & hardware**: `dbus()` (`dbus`), `set_backlight_percent(device_name, percent)`, `set_ddc_brightness(i2c_bus, percent)`, `privacy_snapshot() -> PrivacySnapshot`.
@@ -117,7 +117,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `TextCursorMetrics` (`size`, `cursor_x`, `cursor_y`, `line_height`) and `TextLayoutOptions` (`new`, `line_height`, `max_width`, `align`, `bounds_mode`).
   - `SharedStr`: `EMPTY`, `from_static`, `from_str_inline_or_arc`, `format_inline`, `as_str`, `is_inline`, `is_static`.
 - **Images & Assets (`image`, `asset::types`)**:
-  - `AssetId(pub u64)` (`new`, `get`), `ImageAsset`, `DecodedImage`, `DecodedGifFrame`, `ImageFormat` (`Png`, `Svg`, `Gif`, `Webp`).
+  - `AssetId(pub u64)` (`new`, `get`), `AssetRetention` (`KeepDecoded`, `ReclaimAfterPresent`), `ImageAsset`, `DecodedImage`, `DecodedGifFrame`, `ImageFormat` (`Png`, `Svg`, `Gif`, `Webp`).
   - `SourceRect` (`new`, `as_tuple`), `ImageFit`: `Fill`, `Contain`, `Cover`, `Original`; `ImageFilter`: `Bilinear`, `Bicubic`, `Nearest`.
   - `Image<M>`: `new(asset)`, `fit`, `filter`, `source_rect`, `region`, `flip_x`, `flip_y`, `map`.
 - **Sprites (`sprite`)**:

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::Connection;
 
+use crate::asset::AssetId;
 use crate::error::Result;
 use crate::geometry::BufferPx;
 use crate::reconcile::{ReconcileTargets, RetainedSurfaceKey};
@@ -132,13 +133,18 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
 ) -> Result<()> {
     let frame_seq = rt.reconciler.frame_seq;
     let renderer = &mut rt.renderer;
-    let assets = &rt.assets;
+    let assets = &mut rt.assets;
     let conn = &rt.conn;
+    let mut reclaim_candidates: Vec<AssetId> = Vec::new();
 
     for (&rk, surf) in &mut rt.reconciler.surfaces {
-        let pending = wl.surfaces.get(&rk).is_some_and(|ws| ws.pending_redraw);
+        let ws = wl.surfaces.get(&rk);
+        let pending = ws.is_some_and(|w| w.pending_redraw);
         if !surf.needs_redraw && !pending {
             continue;
+        }
+        if ws.is_some_and(|w| w.configured) {
+            assets.ensure_decoded_for_commands(&surf.commands);
         }
         let logical_size = surf.effective_logical_size();
         let scale = surf.scale;
@@ -146,7 +152,7 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
             scale,
             background: surf.spec.background,
             commands: &surf.commands,
-            assets,
+            assets: &*assets,
             frame_seq,
         };
 
@@ -182,8 +188,11 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
             surf.needs_redraw = false;
             surf.full_redraw = false;
             surf.dirty_logical_rects.clear();
+            assets.collect_reclaimable_from_commands(&surf.commands, &mut reclaim_candidates);
         }
     }
+
+    assets.reclaim_assets(&reclaim_candidates);
 
     Ok(())
 }

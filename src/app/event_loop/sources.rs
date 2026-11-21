@@ -69,7 +69,7 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
     for done in rt.asset_worker.drain_completed() {
         let asset_res = done.decoded.map(|dec| {
             rt.assets
-                .commit_worker_decoded(Some(done.path), done.content_hash, dec)
+                .commit_worker_decoded(Some(done.path), done.format, done.content_hash, dec)
         });
         if let Ok(msg) = (done.map)(asset_res).downcast::<M>() {
             rt.inbox.borrow_mut().messages.push_back(*msg);

@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use crate::asset::types::ImageFormat;
 use crate::asset::{
     DecodedImage, decode_image_bytes, detect_format, hash_bytes, read_bounded_file,
 };
@@ -17,6 +18,7 @@ pub(crate) type BoxedAssetCallback =
 
 pub(crate) struct AsyncAssetCompletion {
     pub(crate) path: PathBuf,
+    pub(crate) format: Option<ImageFormat>,
     pub(crate) content_hash: u64,
     pub(crate) decoded: Result<DecodedImage>,
     pub(crate) map: BoxedAssetCallback,
@@ -138,14 +140,17 @@ impl AsyncAssetWorker {
 
                     let canonical = std::fs::canonicalize(&job.path).unwrap_or(job.path);
                     let mut hash = 0u64;
+                    let mut format = None;
                     let decoded = read_bounded_file(&canonical).and_then(|bytes| {
                         hash = hash_bytes(&bytes);
                         let fmt = detect_format(&bytes, Some(&canonical))?;
+                        format = Some(fmt);
                         decode_image_bytes(&bytes, fmt, 0)
                     });
 
                     let _ = tx.send(AsyncAssetCompletion {
                         path: canonical,
+                        format,
                         content_hash: hash,
                         decoded,
                         map: job.map,
@@ -168,6 +173,7 @@ impl AsyncAssetWorker {
                 if let Some(d) = dropped {
                     let _ = self.tx_done.send(AsyncAssetCompletion {
                         path: d.path,
+                        format: None,
                         content_hash: 0,
                         decoded: Err(WaywiError::AssetDecode(
                             "async asset decode queue capacity reached".to_owned(),

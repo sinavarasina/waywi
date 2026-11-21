@@ -20,7 +20,7 @@ pub use crate::geometry::{
 };
 #[cfg(feature = "idle-notify")]
 pub use crate::idle::{Idle, IdleEvent};
-pub use crate::image::{Image, ImageAsset, ImageFilter, ImageFit, SourceRect};
+pub use crate::image::{AssetRetention, Image, ImageAsset, ImageFilter, ImageFit, SourceRect};
 pub use crate::input::{
     ElementKey, ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit,
     ImeSurroundingText, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout,
