@@ -55,7 +55,10 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         guard.messages.extend(rt.system.collect_due::<M>(now));
     }
 
-    let (anim_dirty, _) = rt.reconciler.tick_animations(now);
+    let (anim_dirty, _, anim_msgs) = rt.reconciler.tick_animations(now);
+    if !anim_msgs.is_empty() {
+        rt.inbox.borrow_mut().messages.extend(anim_msgs);
+    }
     for rk in anim_dirty {
         if let Some(s) = rt.reconciler.surfaces.get(&rk) {
             let buf_rects = s.dirty_buffer_rects();

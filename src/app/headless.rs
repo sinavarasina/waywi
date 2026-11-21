@@ -203,7 +203,10 @@ impl<A: Application> HeadlessRuntime<A> {
         for msg in self.system.collect_due::<A::Message>(now) {
             self.inbox.push_back(msg);
         }
-        let (_, _) = self.reconciler.tick_animations(now);
+        let (_, _, anim_msgs) = self.reconciler.tick_animations(now);
+        for msg in anim_msgs {
+            self.inbox.push_back(msg);
+        }
 
         while let Some(msg) = self.inbox.pop_front() {
             let mut pending_after = Vec::new();

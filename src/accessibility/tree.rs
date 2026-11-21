@@ -458,6 +458,7 @@ mod tests {
                 hidden: false,
             },
             sprite_timeline: None,
+            on_animation_end: None,
             children: Vec::new(),
         };
 

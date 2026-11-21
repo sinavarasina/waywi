@@ -187,7 +187,10 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 }
             }
             WaylandEvent::SurfaceFrame { key } => {
-                let (_, _) = rt.reconciler.tick_animations(Instant::now());
+                let (_, _, anim_msgs) = rt.reconciler.tick_animations(Instant::now());
+                if !anim_msgs.is_empty() {
+                    rt.inbox.borrow_mut().messages.extend(anim_msgs);
+                }
                 if let Some(s) = rt.reconciler.surfaces.get(&key)
                     && s.needs_redraw
                 {

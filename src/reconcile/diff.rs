@@ -246,6 +246,8 @@ impl<M: Clone + 'static> Reconciler<M> {
         let mut prev_hovered = None;
         let mut config_dirty = true;
         let mut full_redraw = true;
+        let mut prev_needs_redraw = false;
+        let mut dirty_rects = Vec::new();
         let mut prev_spec_input_mode = None;
         let mut prev_selective_rects = Vec::new();
 
@@ -260,16 +262,18 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.logical_size != spec.logical_size
                 || prev.spec.ime != spec.ime
                 || prev.scale != scale;
-            full_redraw = prev.spec.background != spec.background
+            full_redraw = prev.full_redraw
+                || prev.spec.background != spec.background
                 || prev.spec.logical_size != spec.logical_size
                 || prev.scale != scale;
+            prev_needs_redraw = prev.needs_redraw;
+            dirty_rects = prev.dirty_logical_rects;
             prev_spec_input_mode = Some(prev.spec.input_mode);
             prev_selective_rects = prev.selective_input_rects;
             prev_roots = prev.roots;
             prev_hovered = prev.hovered_node;
         }
 
-        let mut dirty_rects = Vec::new();
         let mut anim_deadline: Option<Instant> = None;
         let mut tree_pass = super::tree::TreePass {
             renderer: pass.renderer,
@@ -311,7 +315,7 @@ impl<M: Clone + 'static> Reconciler<M> {
 
         let input_region_dirty = prev_spec_input_mode != Some(spec.input_mode)
             || prev_selective_rects != selective_input_rects;
-        let needs_redraw = full_redraw || !dirty_rects.is_empty();
+        let needs_redraw = prev_needs_redraw || full_redraw || !dirty_rects.is_empty();
 
         let hovered_node = prev_hovered.filter(|id| hit_nodes.iter().any(|n| n.node_id == *id));
 
@@ -360,13 +364,15 @@ impl<M: Clone + 'static> Reconciler<M> {
     }
 
     /// Advances active keyed sprite animations up to `now`, marking only changed sprite regions
-    /// dirty without re-running `view(state)`.
+    /// dirty without re-running `view(state)`, and returning any one-shot `on_animation_end`
+    /// messages emitted on completion.
     pub(crate) fn tick_animations(
         &mut self,
         now: Instant,
-    ) -> (Vec<RetainedSurfaceKey>, Option<Instant>) {
+    ) -> (Vec<RetainedSurfaceKey>, Option<Instant>, Vec<M>) {
         let mut dirty_surfaces = Vec::new();
         let mut next_deadline: Option<Instant> = None;
+        let mut emitted_messages = Vec::new();
 
         for (&rk, surface) in &mut self.surfaces {
             if surface.next_animation_deadline.is_none() {
@@ -383,6 +389,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                     &mut surf_changed,
                     &mut surf_dirty_rects,
                     &mut surf_deadline,
+                    &mut emitted_messages,
                 );
             }
 
@@ -405,7 +412,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             }
         }
 
-        (dirty_surfaces, next_deadline)
+        (dirty_surfaces, next_deadline, emitted_messages)
     }
 
     /// Marks every surface referencing `asset_id` for a full redraw (used after `ctx.reload_asset`).

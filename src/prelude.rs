@@ -20,7 +20,7 @@ pub use crate::geometry::{
 };
 #[cfg(feature = "idle-notify")]
 pub use crate::idle::{Idle, IdleEvent};
-pub use crate::image::{Image, ImageAsset, ImageFit};
+pub use crate::image::{Image, ImageAsset, ImageFilter, ImageFit, SourceRect};
 pub use crate::input::{
     ElementKey, ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit,
     ImeSurroundingText, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout,
@@ -31,7 +31,7 @@ pub use crate::render::{
     Align, Border, Canvas, Clip, Color, Column, CornerRadius, Element, Group, Painter, PathBuilder,
     Rect, RendererPreference, Row,
 };
-pub use crate::sprite::{Fps, FpsExt, Frames, PlaybackMode, Sprite, SpriteSheet};
+pub use crate::sprite::{Fps, FpsExt, Frames, PlaybackMode, Sprite, SpriteFrame, SpriteSheet};
 pub use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionKey, Subscriptions};
 pub use crate::surface::{
     Anchor, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, Surface, SurfaceKey,

@@ -14,6 +14,7 @@ use super::{FlowLayout, ParentScope, TreePass};
 struct PrevSnapshot {
     visible: bool,
     world_bounds: GeoRect,
+    affine: Affine2D,
     opacity: f32,
     z_index: i32,
     visual: RetainedVisual,
@@ -106,10 +107,30 @@ fn resolve_node_geometry<M: 'static, R: RenderBackend>(
         resolved_w,
         resolved_h,
     );
-    let local_affine = if common.transform.is_identity() {
+    let mut local_transform = common.transform;
+    match &el.kind {
+        ElementKind::Sprite(sp) => {
+            if sp.flip_x {
+                local_transform.scale_x = -local_transform.scale_x;
+            }
+            if sp.flip_y {
+                local_transform.scale_y = -local_transform.scale_y;
+            }
+        }
+        ElementKind::Image(img) => {
+            if img.flip_x {
+                local_transform.scale_x = -local_transform.scale_x;
+            }
+            if img.flip_y {
+                local_transform.scale_y = -local_transform.scale_y;
+            }
+        }
+        _ => {}
+    }
+    let local_affine = if local_transform.is_identity() {
         Affine2D::IDENTITY
     } else {
-        common.transform.to_affine_around(bounds.center())
+        local_transform.to_affine_around(local_transform.pivot_point(bounds))
     };
     let affine = local_affine.then(&parent_affine);
     let world_bounds = affine.transform_rect(bounds);
@@ -121,6 +142,7 @@ fn resolve_sprite_timeline<R: RenderBackend>(
     mode: &SpriteSourceState,
     prev_timeline: Option<SpriteTimeline>,
     visible: bool,
+    has_end_handler: bool,
     pass: &mut TreePass<'_, R>,
 ) -> (usize, Option<SpriteTimeline>) {
     match mode {
@@ -134,14 +156,23 @@ fn resolve_sprite_timeline<R: RenderBackend>(
                 _ => {
                     let start_idx = sheet
                         .get_animation(animation.as_str())
-                        .map_or(0, |a| a.frames.start);
+                        .map_or(0, |a| a.frames.first_frame());
                     SpriteTimeline::new(animation.clone(), pass.now, start_idx)
                 }
             };
-            let (frame, _, next_dl) = if cfg!(feature = "animation") && visible {
-                tl.advance(sheet, animation.as_str(), *playback_override, pass.now)
+            let (frame, next_dl) = if cfg!(feature = "animation") && visible {
+                let adv = tl.advance(
+                    sheet,
+                    animation.as_str(),
+                    *playback_override,
+                    pass.now,
+                    false,
+                    has_end_handler,
+                );
+                (adv.frame, adv.next_deadline)
             } else {
-                (tl.current_frame, false, None)
+                tl.next_deadline = None;
+                (tl.current_frame, None)
             };
             if let Some(dl) = next_dl {
                 *pass.anim_deadline = Some(pass.anim_deadline.map_or(dl, |p| p.min(dl)));
@@ -151,33 +182,39 @@ fn resolve_sprite_timeline<R: RenderBackend>(
     }
 }
 
-fn record_dirty_bounds(
-    prev_snapshot: Option<PrevSnapshot>,
+struct NodeSnapshotRef<'a> {
     visible: bool,
     world_bounds: GeoRect,
+    affine: Affine2D,
     opacity: f32,
     z_index: i32,
-    visual: &RetainedVisual,
+    visual: &'a RetainedVisual,
+}
+
+fn record_dirty_bounds(
+    prev_snapshot: Option<PrevSnapshot>,
+    next: &NodeSnapshotRef<'_>,
     dirty_rects: &mut Vec<GeoRect>,
 ) {
     match prev_snapshot {
         None => {
-            if visible && !matches!(visual, RetainedVisual::Container) {
-                dirty_rects.push(world_bounds);
+            if next.visible && !matches!(next.visual, RetainedVisual::Container) {
+                dirty_rects.push(next.world_bounds);
             }
         }
         Some(prev) => {
-            let changed = prev.visible != visible
-                || prev.world_bounds != world_bounds
-                || (prev.opacity - opacity).abs() > f32::EPSILON
-                || prev.z_index != z_index
-                || prev.visual.visual_changed(visual);
-            if changed && !matches!(visual, RetainedVisual::Container) {
+            let changed = prev.visible != next.visible
+                || prev.world_bounds != next.world_bounds
+                || prev.affine != next.affine
+                || (prev.opacity - next.opacity).abs() > f32::EPSILON
+                || prev.z_index != next.z_index
+                || prev.visual.visual_changed(next.visual);
+            if changed && !matches!(next.visual, RetainedVisual::Container) {
                 if prev.visible {
                     dirty_rects.push(prev.world_bounds);
                 }
-                if visible && world_bounds != prev.world_bounds {
-                    dirty_rects.push(world_bounds);
+                if next.visible && next.world_bounds != prev.world_bounds {
+                    dirty_rects.push(next.world_bounds);
                 }
             }
         }
@@ -218,6 +255,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 let snap = Some(PrevSnapshot {
                     visible: p.visible,
                     world_bounds: p.world_bounds,
+                    affine: p.affine,
                     opacity: p.opacity,
                     z_index: p.z_index,
                     visual: p.visual,
@@ -229,6 +267,7 @@ impl<M: Clone + 'static> Reconciler<M> {
         let node_id = prev_id.unwrap_or_else(|| self.node_ids.alloc());
 
         let mut sprite_timeline = None;
+        let mut on_animation_end = None;
         let mut children_out = Vec::new();
         let handlers: EventHandlers<M>;
 
@@ -260,20 +299,30 @@ impl<M: Clone + 'static> Reconciler<M> {
                     asset: img.asset,
                     asset_revision: rev,
                     fit: img.fit,
+                    filter: img.filter,
+                    source_rect: img.source_rect,
                 }
             }
             ElementKind::Sprite(sp) => {
                 let sp = *sp;
                 handlers = sp.common.handlers;
+                on_animation_end = sp.on_animation_end;
                 let rev = pass.assets.revision_of(sp.sheet.asset.id);
-                let (resolved_frame, tl) =
-                    resolve_sprite_timeline(&sp.sheet, &sp.mode, prev_timeline, visible, pass);
+                let (resolved_frame, tl) = resolve_sprite_timeline(
+                    &sp.sheet,
+                    &sp.mode,
+                    prev_timeline,
+                    visible,
+                    on_animation_end.is_some(),
+                    pass,
+                );
                 sprite_timeline = tl;
                 RetainedVisual::Sprite {
                     sheet: Box::new(sp.sheet),
                     asset_revision: rev,
                     mode: sp.mode,
                     resolved_frame,
+                    filter: sp.filter,
                 }
             }
             ElementKind::Canvas(c) => {
@@ -348,11 +397,14 @@ impl<M: Clone + 'static> Reconciler<M> {
 
         record_dirty_bounds(
             prev_snapshot,
-            visible,
-            world_bounds,
-            opacity,
-            z_index,
-            &visual,
+            &NodeSnapshotRef {
+                visible,
+                world_bounds,
+                affine,
+                opacity,
+                z_index,
+                visual: &visual,
+            },
             pass.dirty_rects,
         );
 
@@ -372,6 +424,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             visual,
             a11y,
             sprite_timeline,
+            on_animation_end,
             children: children_out,
         }
     }

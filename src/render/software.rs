@@ -32,6 +32,7 @@ pub(crate) struct SoftwareRenderer {
     pub(crate) text_engine: TextEngine,
     pub(crate) canvas_cache: HashMap<NodeId, CachedCanvasPixmap>,
     pub(crate) scratch_rgba: Vec<u8>,
+    pub(crate) scratch_sprite_cell: Vec<u8>,
 }
 
 impl Default for SoftwareRenderer {
@@ -47,6 +48,7 @@ impl SoftwareRenderer {
             text_engine: TextEngine::new(),
             canvas_cache: HashMap::new(),
             scratch_rgba: Vec::new(),
+            scratch_sprite_cell: Vec::new(),
         }
     }
 }

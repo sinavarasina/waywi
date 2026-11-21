@@ -12,6 +12,7 @@ use crate::asset::{AssetCache, AssetId};
 use crate::geometry::LogicalSize;
 #[cfg(feature = "text")]
 use crate::geometry::{LogicalPx, ScaleFactor};
+use crate::image::ImageFilter;
 use crate::input::NodeId;
 use crate::render::CanvasDrawHandle;
 use crate::render::canvas::{CanvasOp, Painter};
@@ -61,10 +62,11 @@ enum ImageBucket {
     Text,
 }
 
-type SpriteCacheKey = (AssetId, u64, u32, u32, u32, u32);
+type AssetCacheKey = (AssetId, u64, ImageFilter);
+type SpriteCacheKey = (AssetId, u64, u32, u32, u32, u32, ImageFilter);
 
 struct GpuImageStore<I: Copy> {
-    assets: HashMap<(AssetId, u64), CachedImageMeta<I>>,
+    assets: HashMap<AssetCacheKey, CachedImageMeta<I>>,
     sprites: HashMap<SpriteCacheKey, CachedImageMeta<I>>,
     #[cfg(feature = "text")]
     texts: HashMap<u64, CachedImageMeta<I>>,
@@ -196,7 +198,7 @@ impl<I: Copy> GpuImageStore<I> {
 
     fn insert_asset(
         &mut self,
-        key: (AssetId, u64),
+        key: AssetCacheKey,
         entry: CachedImageMeta<I>,
         frame_seq: u64,
     ) -> Vec<I> {
@@ -260,6 +262,29 @@ impl<I: Copy> GpuImageStore<I> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SpriteCellSpec {
+    pub(crate) asset_id: AssetId,
+    pub(crate) asset_rev: u64,
+    pub(crate) src_rect: (u32, u32, u32, u32),
+    pub(crate) filter: ImageFilter,
+}
+
+fn gpu_cache_filter_and_flags(filter: ImageFilter) -> (ImageFilter, ImageFlags) {
+    match filter {
+        ImageFilter::Nearest => (
+            ImageFilter::Nearest,
+            ImageFlags::PREMULTIPLIED | ImageFlags::NEAREST,
+        ),
+        // GPU hardware sampling maps both Bilinear and Bicubic to linear filtering + mipmaps,
+        // normalizing the cache key so identical textures are not uploaded twice.
+        ImageFilter::Bilinear | ImageFilter::Bicubic => (
+            ImageFilter::Bilinear,
+            ImageFlags::PREMULTIPLIED | ImageFlags::GENERATE_MIPMAPS,
+        ),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct GpuTextureCache {
     images: GpuImageStore<ImageId>,
@@ -279,9 +304,11 @@ impl GpuTextureCache {
         assets: &AssetCache,
         asset: &crate::asset::ImageAsset,
         asset_rev: u64,
+        filter: ImageFilter,
         frame_seq: u64,
     ) -> Option<CachedGpuImage> {
-        let key = (asset.id, asset_rev);
+        let (cache_filter, flags) = gpu_cache_filter_and_flags(filter);
+        let key = (asset.id, asset_rev, cache_filter);
         if let Some(entry) = self.images.assets.get_mut(&key) {
             entry.last_used_frame = frame_seq;
             return Some(*entry);
@@ -292,13 +319,7 @@ impl GpuTextureCache {
         if w == 0 || h == 0 {
             return None;
         }
-        let id = upload_premultiplied_rgba_with_flags(
-            canvas,
-            pixels,
-            w,
-            h,
-            ImageFlags::PREMULTIPLIED | ImageFlags::GENERATE_MIPMAPS,
-        )?;
+        let id = upload_premultiplied_rgba_with_flags(canvas, pixels, w, h, flags)?;
         let entry = CachedGpuImage {
             id,
             width: w,
@@ -315,19 +336,18 @@ impl GpuTextureCache {
         &mut self,
         canvas: &mut Canvas<WGPURenderer>,
         assets: &AssetCache,
-        asset: &crate::asset::ImageAsset,
-        asset_rev: u64,
-        src_rect: (u32, u32, u32, u32),
+        spec: SpriteCellSpec,
         frame_seq: u64,
     ) -> Option<CachedGpuImage> {
-        let (sx, sy, sw, sh) = src_rect;
-        let key = (asset.id, asset_rev, sx, sy, sw, sh);
+        let (sx, sy, sw, sh) = spec.src_rect;
+        let (cache_filter, flags) = gpu_cache_filter_and_flags(spec.filter);
+        let key = (spec.asset_id, spec.asset_rev, sx, sy, sw, sh, cache_filter);
         if let Some(entry) = self.images.sprites.get_mut(&key) {
             entry.last_used_frame = frame_seq;
             return Some(*entry);
         }
 
-        let decoded = assets.get(asset.id)?;
+        let decoded = assets.get(spec.asset_id)?;
         let full_w = decoded.width;
         let full_h = decoded.height;
         let cw = sw.min(full_w.saturating_sub(sx));
@@ -337,7 +357,7 @@ impl GpuTextureCache {
         }
 
         let id = if sx == 0 && sy == 0 && cw == full_w && ch == full_h {
-            upload_premultiplied_rgba(canvas, &decoded.pixels, cw, ch)?
+            upload_premultiplied_rgba_with_flags(canvas, &decoded.pixels, cw, ch, flags)?
         } else {
             let mut sub = Vec::with_capacity((cw as usize) * (ch as usize) * 4);
             let src = decoded.pixels.as_ref();
@@ -350,7 +370,7 @@ impl GpuTextureCache {
                     sub.resize(sub.len() + len, 0);
                 }
             }
-            upload_premultiplied_rgba(canvas, &sub, cw, ch)?
+            upload_premultiplied_rgba_with_flags(canvas, &sub, cw, ch, flags)?
         };
 
         let entry = CachedGpuImage {
@@ -489,15 +509,6 @@ impl GpuTextureCache {
     }
 }
 
-fn upload_premultiplied_rgba(
-    canvas: &mut Canvas<WGPURenderer>,
-    rgba_bytes: &[u8],
-    w: u32,
-    h: u32,
-) -> Option<ImageId> {
-    upload_premultiplied_rgba_with_flags(canvas, rgba_bytes, w, h, ImageFlags::PREMULTIPLIED)
-}
-
 fn upload_premultiplied_rgba_with_flags(
     canvas: &mut Canvas<WGPURenderer>,
     rgba_bytes: &[u8],
@@ -530,26 +541,41 @@ mod tests {
 
         assert!(
             store
-                .insert_asset((AssetId::new(1), 1), mk(1, 1), 1)
+                .insert_asset((AssetId::new(1), 1, ImageFilter::Bilinear), mk(1, 1), 1)
                 .is_empty()
         );
         assert!(
             store
-                .insert_sprite((AssetId::new(2), 1, 0, 0, 16, 16), mk(2, 2), 2)
+                .insert_sprite(
+                    (AssetId::new(2), 1, 0, 0, 16, 16, ImageFilter::Bilinear),
+                    mk(2, 2),
+                    2,
+                )
                 .is_empty()
         );
         assert_eq!(store.total_bytes, 2048);
 
         // Touch asset 1 at frame 5 so sprite 2 (frame 2) becomes globally oldest.
-        if let Some(a) = store.assets.get_mut(&(AssetId::new(1), 1)) {
+        if let Some(a) = store
+            .assets
+            .get_mut(&(AssetId::new(1), 1, ImageFilter::Bilinear))
+        {
             a.last_used_frame = 5;
         }
 
-        let evicted = store.insert_asset((AssetId::new(3), 1), mk(3, 6), 6);
+        let evicted = store.insert_asset((AssetId::new(3), 1, ImageFilter::Bilinear), mk(3, 6), 6);
         assert_eq!(evicted, vec![2]);
         assert_eq!(store.total_bytes, 2048);
-        assert!(store.assets.contains_key(&(AssetId::new(1), 1)));
-        assert!(store.assets.contains_key(&(AssetId::new(3), 1)));
+        assert!(
+            store
+                .assets
+                .contains_key(&(AssetId::new(1), 1, ImageFilter::Bilinear))
+        );
+        assert!(
+            store
+                .assets
+                .contains_key(&(AssetId::new(3), 1, ImageFilter::Bilinear))
+        );
         assert!(store.sprites.is_empty());
     }
 
@@ -565,16 +591,24 @@ mod tests {
 
         assert!(
             store
-                .insert_asset((AssetId::new(1), 1), mk(10, 1), 1)
+                .insert_asset((AssetId::new(1), 1, ImageFilter::Bilinear), mk(10, 1), 1)
                 .is_empty()
         );
         assert!(
             store
-                .insert_sprite((AssetId::new(2), 1, 0, 0, 16, 16), mk(20, 250), 250)
+                .insert_sprite(
+                    (AssetId::new(2), 1, 0, 0, 16, 16, ImageFilter::Bilinear),
+                    mk(20, 250),
+                    250,
+                )
                 .is_empty()
         );
 
-        let evicted = store.insert_asset((AssetId::new(3), 1), mk(30, 260), 260);
+        let evicted = store.insert_asset(
+            (AssetId::new(3), 1, ImageFilter::Bilinear),
+            mk(30, 260),
+            260,
+        );
         assert_eq!(evicted, vec![10]);
         assert_eq!(store.total_bytes, 2048);
     }

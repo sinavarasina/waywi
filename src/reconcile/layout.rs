@@ -140,7 +140,9 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
             )
         }
         ElementKind::Image(img) => {
-            if let Some(d) = assets.get(img.asset.id) {
+            if let Some(sr) = img.source_rect {
+                LogicalSize::new(LogicalPx(sr.width as f32), LogicalPx(sr.height as f32))
+            } else if let Some(d) = assets.get(img.asset.id) {
                 LogicalSize::new(LogicalPx(d.width as f32), LogicalPx(d.height as f32))
             } else {
                 LogicalSize::new(
@@ -149,10 +151,17 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
                 )
             }
         }
-        ElementKind::Sprite(sp) => LogicalSize::new(
-            LogicalPx(sp.sheet.frame_width as f32),
-            LogicalPx(sp.sheet.frame_height as f32),
-        ),
+        ElementKind::Sprite(sp) => {
+            let active_idx = match &sp.mode {
+                crate::sprite::SpriteSourceState::FixedFrame(idx) => *idx,
+                crate::sprite::SpriteSourceState::Playing { animation, .. } => sp
+                    .sheet
+                    .get_animation(animation.as_str())
+                    .map_or(0, |a| a.frames.first_frame()),
+            };
+            let (_, _, fw, fh) = sp.sheet.frame_source_rect(active_idx);
+            LogicalSize::new(LogicalPx(fw as f32), LogicalPx(fh as f32))
+        }
         ElementKind::Rect(_) | ElementKind::Canvas(_) => LogicalSize::ZERO,
         ElementKind::Group(g) => {
             let mut max_w = LogicalPx::ZERO;

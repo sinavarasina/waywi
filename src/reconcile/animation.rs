@@ -11,20 +11,12 @@ pub(crate) fn collect_subtree_deadlines<M>(node: &RetainedNode<M>, out: &mut Opt
     if let (
         Some(tl),
         RetainedVisual::Sprite {
-            sheet,
-            mode:
-                SpriteSourceState::Playing {
-                    animation,
-                    playback_override,
-                },
+            mode: SpriteSourceState::Playing { .. },
             ..
         },
     ) = (&node.sprite_timeline, &node.visual)
-        && !tl.finished
-        && let Some(def) = sheet.get_animation(animation.as_str())
+        && let Some(dl) = tl.next_deadline
     {
-        let _ = playback_override;
-        let dl = tl.started_at + def.fps.frame_duration();
         *out = Some(out.map_or(dl, |p| p.min(dl)));
     }
     for ch in &node.children {
@@ -32,12 +24,13 @@ pub(crate) fn collect_subtree_deadlines<M>(node: &RetainedNode<M>, out: &mut Opt
     }
 }
 
-pub(crate) fn tick_node_animations<M>(
+pub(crate) fn tick_node_animations<M: Clone>(
     node: &mut RetainedNode<M>,
     now: Instant,
     changed: &mut bool,
     dirty_rects: &mut Vec<GeoRect>,
     next_deadline: &mut Option<Instant>,
+    emitted_messages: &mut Vec<M>,
 ) {
     if !node.visible {
         return;
@@ -57,19 +50,37 @@ pub(crate) fn tick_node_animations<M>(
     ) = (&mut node.sprite_timeline, &mut node.visual)
         && cfg!(feature = "animation")
     {
-        let (frame, frame_changed, dl) =
-            tl.advance(sheet, animation.as_str(), *playback_override, now);
-        if frame_changed {
-            *resolved_frame = frame;
+        let adv = tl.advance(
+            sheet,
+            animation.as_str(),
+            *playback_override,
+            now,
+            true,
+            node.on_animation_end.is_some(),
+        );
+        if adv.frame_changed {
+            *resolved_frame = adv.frame;
             *changed = true;
             dirty_rects.push(node.world_bounds);
         }
-        if let Some(d) = dl {
+        if adv.just_finished
+            && let Some(ref msg) = node.on_animation_end
+        {
+            emitted_messages.push(msg.clone());
+        }
+        if let Some(d) = adv.next_deadline {
             *next_deadline = Some(next_deadline.map_or(d, |p| p.min(d)));
         }
     }
     for ch in &mut node.children {
-        tick_node_animations(ch, now, changed, dirty_rects, next_deadline);
+        tick_node_animations(
+            ch,
+            now,
+            changed,
+            dirty_rects,
+            next_deadline,
+            emitted_messages,
+        );
     }
 }
 
@@ -104,4 +115,81 @@ pub(crate) fn update_asset_rev_in_tree<M>(
         }
     }
     hit
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::accessibility::AccessibleProps;
+    use crate::asset::{AssetId, ImageAsset};
+    use crate::geometry::{Affine2D, LogicalPx};
+    use crate::image::ImageFilter;
+    use crate::input::{EventHandlers, NodeId};
+    use crate::sprite::{FpsExt, Frames, PlaybackMode, SpriteSheet, SpriteTimeline};
+    use crate::text::SharedStr;
+
+    #[test]
+    fn collect_subtree_deadlines_preserves_future_step_deadline_not_first_frame() {
+        let asset = ImageAsset {
+            id: AssetId::new(1),
+            width: 64,
+            height: 16,
+        };
+        let sheet = SpriteSheet::new(asset)
+            .frame_size(LogicalPx(16.0), LogicalPx(16.0))
+            .animation_with_mode("walk", Frames::range(0..4), 10.fps(), PlaybackMode::Loop);
+
+        let t0 = Instant::now();
+        let mut tl = SpriteTimeline::new(SharedStr::from_static("walk"), t0, 0);
+        // Advance past 2.5 frames (250ms): current frame = 2, next deadline = t0 + 300ms.
+        let adv = tl.advance(
+            &sheet,
+            "walk",
+            None,
+            t0 + Duration::from_millis(250),
+            true,
+            false,
+        );
+        assert_eq!(adv.frame, 2);
+        assert_eq!(adv.next_deadline, Some(t0 + Duration::from_millis(300)));
+
+        let node = RetainedNode::<()> {
+            node_id: NodeId {
+                index: 0,
+                generation: 1,
+            },
+            key: None,
+            kind_tag: 3,
+            bounds: GeoRect::ZERO,
+            world_bounds: GeoRect::ZERO,
+            affine: Affine2D::IDENTITY,
+            clip_rect: None,
+            z_index: 0,
+            visible: true,
+            input_enabled: false,
+            opacity: 1.0,
+            handlers: EventHandlers::default(),
+            visual: RetainedVisual::Sprite {
+                sheet: Box::new(sheet),
+                asset_revision: 1,
+                mode: SpriteSourceState::Playing {
+                    animation: SharedStr::from_static("walk"),
+                    playback_override: None,
+                },
+                resolved_frame: adv.frame,
+                filter: ImageFilter::Nearest,
+            },
+            a11y: AccessibleProps::default(),
+            sprite_timeline: Some(tl),
+            on_animation_end: None,
+            children: Vec::new(),
+        };
+
+        let mut collected = None;
+        collect_subtree_deadlines(&node, &mut collected);
+        assert_eq!(collected, adv.next_deadline);
+        assert_eq!(collected, Some(t0 + Duration::from_millis(300)));
+    }
 }

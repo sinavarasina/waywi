@@ -1,7 +1,7 @@
 use crate::accessibility::AccessibleProps;
 use crate::arena::FrameSharedFn;
 use crate::geometry::{Affine2D, LogicalPx, Rect as GeoRect};
-use crate::image::ImageFit;
+use crate::image::{ImageFilter, ImageFit, SourceRect};
 use crate::input::{ElementKey, EventHandlers, HitTestNode, NodeId};
 use crate::render::canvas::Painter;
 use crate::render::style::{Border, Color, CornerRadius};
@@ -28,11 +28,14 @@ pub(crate) enum PaintPayload {
         asset: crate::asset::ImageAsset,
         asset_revision: u64,
         fit: ImageFit,
+        filter: ImageFilter,
+        source_rect: Option<SourceRect>,
     },
     Sprite {
         sheet: Box<SpriteSheet>,
         asset_revision: u64,
         frame_index: usize,
+        filter: ImageFilter,
     },
     Canvas {
         render_key: u64,
@@ -92,6 +95,7 @@ pub(crate) struct RetainedNode<M> {
     #[cfg_attr(not(feature = "accessibility"), allow(dead_code))]
     pub(crate) a11y: AccessibleProps,
     pub(crate) sprite_timeline: Option<SpriteTimeline>,
+    pub(crate) on_animation_end: Option<M>,
     pub(crate) children: Vec<RetainedNode<M>>,
 }
 
@@ -116,12 +120,15 @@ pub(crate) enum RetainedVisual {
         asset: crate::asset::ImageAsset,
         asset_revision: u64,
         fit: ImageFit,
+        filter: ImageFilter,
+        source_rect: Option<SourceRect>,
     },
     Sprite {
         sheet: Box<SpriteSheet>,
         asset_revision: u64,
         mode: SpriteSourceState,
         resolved_frame: usize,
+        filter: ImageFilter,
     },
     Canvas {
         render_key: u64,
@@ -181,27 +188,33 @@ impl RetainedVisual {
                     asset: a1,
                     asset_revision: r1,
                     fit: f1,
+                    filter: fl1,
+                    source_rect: sr1,
                 },
                 Self::Image {
                     asset: a2,
                     asset_revision: r2,
                     fit: f2,
+                    filter: fl2,
+                    source_rect: sr2,
                 },
-            ) => a1 != a2 || r1 != r2 || f1 != f2,
+            ) => a1 != a2 || r1 != r2 || f1 != f2 || fl1 != fl2 || sr1 != sr2,
             (
                 Self::Sprite {
                     sheet: s1,
                     asset_revision: r1,
                     resolved_frame: rf1,
+                    filter: fl1,
                     ..
                 },
                 Self::Sprite {
                     sheet: s2,
                     asset_revision: r2,
                     resolved_frame: rf2,
+                    filter: fl2,
                     ..
                 },
-            ) => s1 != s2 || r1 != r2 || rf1 != rf2,
+            ) => s1 != s2 || r1 != r2 || rf1 != rf2 || fl1 != fl2,
             (Self::Canvas { render_key: k1, .. }, Self::Canvas { render_key: k2, .. }) => k1 != k2,
             (Self::Clip { corner_radius: c1 }, Self::Clip { corner_radius: c2 }) => c1 != c2,
             _ => true,
@@ -286,20 +299,26 @@ fn collect_node_recursive<M: Clone + 'static>(
             asset,
             asset_revision,
             fit,
+            filter,
+            source_rect,
         } => Some(PaintPayload::Image {
             asset: *asset,
             asset_revision: *asset_revision,
             fit: *fit,
+            filter: *filter,
+            source_rect: *source_rect,
         }),
         RetainedVisual::Sprite {
             sheet,
             asset_revision,
             resolved_frame,
+            filter,
             ..
         } => Some(PaintPayload::Sprite {
             sheet: sheet.clone(),
             asset_revision: *asset_revision,
             frame_index: *resolved_frame,
+            filter: *filter,
         }),
         RetainedVisual::Canvas { render_key, draw } => Some(PaintPayload::Canvas {
             render_key: *render_key,

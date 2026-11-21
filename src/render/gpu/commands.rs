@@ -101,10 +101,31 @@ pub(crate) fn encode_commands(
                 asset,
                 asset_revision,
                 fit,
+                filter,
+                source_rect,
             } => {
-                let Some(img) =
-                    textures.resolve_asset_image(canvas, assets, asset, *asset_revision, frame_seq)
-                else {
+                let img = match source_rect {
+                    Some(sr) => textures.resolve_sprite_cell(
+                        canvas,
+                        assets,
+                        super::textures::SpriteCellSpec {
+                            asset_id: asset.id,
+                            asset_rev: *asset_revision,
+                            src_rect: sr.as_tuple(),
+                            filter: *filter,
+                        },
+                        frame_seq,
+                    ),
+                    None => textures.resolve_asset_image(
+                        canvas,
+                        assets,
+                        asset,
+                        *asset_revision,
+                        *filter,
+                        frame_seq,
+                    ),
+                };
+                let Some(img) = img else {
                     continue;
                 };
                 draw_textured_rect(canvas, cmd, scale_f, img.id, img.width, img.height, *fit);
@@ -113,14 +134,18 @@ pub(crate) fn encode_commands(
                 sheet,
                 asset_revision,
                 frame_index,
+                filter,
             } => {
                 let src_rect = sheet.frame_source_rect(*frame_index);
                 let Some(img) = textures.resolve_sprite_cell(
                     canvas,
                     assets,
-                    &sheet.asset,
-                    *asset_revision,
-                    src_rect,
+                    super::textures::SpriteCellSpec {
+                        asset_id: sheet.asset.id,
+                        asset_rev: *asset_revision,
+                        src_rect,
+                        filter: *filter,
+                    },
                     frame_seq,
                 ) else {
                     continue;

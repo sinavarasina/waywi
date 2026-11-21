@@ -2,7 +2,7 @@
 
 use crate::asset::AssetCache;
 use crate::geometry::{LogicalSize, ScaleFactor};
-use crate::image::ImageFit;
+use crate::image::{ImageFilter, ImageFit};
 use crate::render::canvas::Painter;
 use crate::render::retained::{DrawCommand, PaintPayload};
 use crate::render::software::bitmap::draw_bitmap_region;
@@ -161,10 +161,20 @@ impl SoftwareRenderer {
                     );
                 }
             }
-            PaintPayload::Image { asset, fit, .. } => {
+            PaintPayload::Image {
+                asset,
+                fit,
+                filter,
+                source_rect,
+                ..
+            } => {
                 let Some(decoded) = assets.get(asset.id) else {
                     return;
                 };
+                let src_rect = source_rect.map_or(
+                    (0, 0, decoded.width, decoded.height),
+                    crate::image::SourceRect::as_tuple,
+                );
                 draw_bitmap_region(
                     tile,
                     scale_f,
@@ -173,13 +183,18 @@ impl SoftwareRenderer {
                         pixels: &decoded.pixels,
                         full_w: decoded.width,
                         full_h: decoded.height,
-                        src_rect: (0, 0, decoded.width, decoded.height),
+                        src_rect,
                     },
                     *fit,
+                    *filter,
+                    &mut self.scratch_sprite_cell,
                 );
             }
             PaintPayload::Sprite {
-                sheet, frame_index, ..
+                sheet,
+                frame_index,
+                filter,
+                ..
             } => {
                 let Some(decoded) = assets.get(sheet.asset.id) else {
                     return;
@@ -195,6 +210,8 @@ impl SoftwareRenderer {
                         src_rect: sheet.frame_source_rect(*frame_index),
                     },
                     ImageFit::Fill,
+                    *filter,
+                    &mut self.scratch_sprite_cell,
                 );
             }
             PaintPayload::Canvas { render_key, draw } => {
@@ -241,6 +258,8 @@ impl SoftwareRenderer {
                             src_rect: (0, 0, px_w, px_h),
                         },
                         ImageFit::Fill,
+                        ImageFilter::Bilinear,
+                        &mut self.scratch_sprite_cell,
                     );
                 }
             }

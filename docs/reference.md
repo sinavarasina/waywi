@@ -70,7 +70,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - **Placement & transforms (`geometry::placement`, `geometry::transform`)**:
   - `Position`: `Auto`, `Absolute { x, y }`, `RelativeToSurface { x, y, offset_x, offset_y }`, `RelativeToParent { x, y, offset_x, offset_y }`; constructors `absolute`, `relative_to_surface`, `relative_to_parent`, `.with_offset(dx, dy)`.
   - `ElementAnchor`: `TopLeft`, `TopCenter`, `TopRight`, `CenterLeft`, `Center`, `CenterRight`, `BottomLeft`, `BottomCenter`, `BottomRight`; method `top_left_offset(width, height)`.
-  - `Transform`: `identity`, `is_identity`, `is_pure_translation`, `translate`, `scale`, `scale_xy`, `rotate_deg`, `rotate_rad`, `to_affine_around(pivot)`.
+  - `Transform`: `identity`, `is_identity`, `is_pure_translation`, `translate`, `scale`, `scale_xy`, `rotate_deg`, `rotate_rad`, `pivot`, `pivot_point`, `to_affine_around(pivot)`.
   - `Affine2D`: `IDENTITY`, `is_identity`, `is_axis_aligned_unscaled`, `then`, `transform_point`, `inverse`, `transform_rect`.
 
 ## Surfaces & Displays (`surface`, `display`)
@@ -117,14 +117,14 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `SharedStr`: `EMPTY`, `from_static`, `from_str_inline_or_arc`, `format_inline`, `as_str`, `is_inline`, `is_static`.
 - **Images & Assets (`image`, `asset::types`)**:
   - `AssetId(pub u64)` (`new`, `get`), `ImageAsset`, `DecodedImage`, `DecodedGifFrame`, `ImageFormat` (`Png`, `Svg`, `Gif`, `Webp`).
-  - `ImageFit`: `Fill`, `Contain`, `Cover`, `Original`.
-  - `Image<M>`: `new(asset)`, `fit`, `map`.
+  - `SourceRect` (`new`, `as_tuple`), `ImageFit`: `Fill`, `Contain`, `Cover`, `Original`; `ImageFilter`: `Bilinear`, `Bicubic`, `Nearest`.
+  - `Image<M>`: `new(asset)`, `fit`, `filter`, `source_rect`, `region`, `flip_x`, `flip_y`, `map`.
 - **Sprites (`sprite`)**:
   - `PlaybackMode`: `Once`, `Loop`, `PingPong`.
   - `Fps(pub f32)` (`new`, `get`, `frame_duration`) and `FpsExt::fps(self)`.
-  - `Frames` (`range`, `count`, `frame_at`), `AnimationDef`.
-  - `SpriteSheet`: `new(asset)`, `frame_size`, `animation`, `animation_with_mode`, `get_animation`, `columns`, `rows`, `total_frames`, `frame_source_rect`.
-  - `Sprite<M>`: `new(sheet)`, `frame`, `playing`, `playback`, `map`.
+  - `SpriteFrame` (`new(index, duration)`), `Frames` (`range`, `sequence`, `timed`, `count`, `first_frame`, `frame_at`), `AnimationDef`.
+  - `SpriteSheet`: `new(asset)`, `from_regions(asset, regions)`, `regions`, `region_of`, `frame_size`, `animation`, `animation_with_mode`, `timed_animation`, `animation_count`, `animations`, `get_animation`, `columns`, `rows`, `total_frames`, `frame_source_rect`.
+  - `Sprite<M>`: `new(sheet)`, `frame`, `playing`, `playback`, `filter`, `flip_x`, `flip_y`, `on_animation_end`, `map`.
 
 ## Input, Accessibility, Clipboard & Idle (`input`, `accessibility`, `clipboard`, `idle`)
 

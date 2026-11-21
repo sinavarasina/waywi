@@ -78,7 +78,7 @@ impl Application for RenderTestApp {
                 .position(Position::absolute(20.logical_px(), 0.logical_px())),
             );
 
-        if let Some(sheet) = state.sheet {
+        if let Some(ref sheet) = state.sheet {
             surf = surf.child(
                 Sprite::new(sheet)
                     .frame(state.sprite_frame)
@@ -443,4 +443,372 @@ fn proportional_text_cursor_line_renders_at_measured_x_inside_text() {
             .map(|r| r.x.0),
         Some(12.0 + new_x)
     );
+}
+
+#[cfg(all(feature = "renderer-software", feature = "animation"))]
+#[test]
+fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
+    use std::time::{Duration, Instant};
+
+    struct SpriteTestState {
+        sheet: SpriteSheet,
+        flip_x: bool,
+        rotate_90: bool,
+        anim_ended_count: usize,
+        unrelated_tick: usize,
+    }
+
+    #[derive(Clone)]
+    enum SpriteTestMsg {
+        SetFlipX(bool),
+        SetRotate90(bool),
+        AnimEnded,
+        BumpUnrelated,
+    }
+
+    struct SpriteTestApp;
+
+    impl Application for SpriteTestApp {
+        type State = SpriteTestState;
+        type Message = SpriteTestMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            // 4x2 sheet containing two 2x2 cells:
+            // Frame 0 (cols 0..2): TL=Red, TR=Green, BL=Blue, BR=White.
+            // Frame 1 (cols 2..4): solid Yellow.
+            #[rustfmt::skip]
+            let pixels: [u8; 4 * 2 * 4] = [
+                // Row 0: (0,0) Red, (1,0) Green | (2,0) Yellow, (3,0) Yellow
+                255, 0, 0, 255,   0, 255, 0, 255,   255, 255, 0, 255,   255, 255, 0, 255,
+                // Row 1: (0,1) Blue, (1,1) White | (2,1) Yellow, (3,1) Yellow
+                0, 0, 255, 255,   255, 255, 255, 255, 255, 255, 0, 255, 255, 255, 0, 255,
+            ];
+            let asset = ctx.load_rgba_image(4, 2, 16, true, &pixels)?;
+            let mut sheet = SpriteSheet::new(asset)
+                .frame_size(2.logical_px(), 2.logical_px())
+                .timed_animation(
+                    String::from("land_once"),
+                    [
+                        (0, Duration::from_millis(60)),
+                        (1, Duration::from_millis(90)),
+                    ],
+                    PlaybackMode::Once,
+                );
+            // Register >16 dynamic animations to verify unbounded animation storage.
+            for i in 0..24 {
+                sheet =
+                    sheet.animation(format!("dynamic_{i}"), Frames::sequence([0, 1, 0]), 8.fps());
+            }
+            assert_eq!(sheet.animation_count(), 25);
+            assert!(sheet.get_animation("dynamic_23").is_some());
+
+            Ok(SpriteTestState {
+                sheet,
+                flip_x: false,
+                rotate_90: false,
+                anim_ended_count: 0,
+                unrelated_tick: 0,
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                SpriteTestMsg::SetFlipX(v) => state.flip_x = v,
+                SpriteTestMsg::SetRotate90(v) => state.rotate_90 = v,
+                SpriteTestMsg::AnimEnded => state.anim_ended_count += 1,
+                SpriteTestMsg::BumpUnrelated => state.unrelated_tick += 1,
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            let mut transform = Transform::identity();
+            if state.rotate_90 {
+                transform = transform.rotate_deg(90.0);
+            }
+            // Static asymmetric sprite scaled 4x (2x2 -> 8x8) at (10, 10) with Nearest filter.
+            let static_sprite = Sprite::new(&state.sheet)
+                .key("asymmetric")
+                .frame(0)
+                .filter(ImageFilter::Nearest)
+                .flip_x(state.flip_x)
+                .transform(transform)
+                .position(Position::absolute(10.logical_px(), 10.logical_px()))
+                .size(Size::px(8.logical_px(), 8.logical_px()));
+
+            // Timed one-shot animated sprite inside a memoized element verifying deadline
+            // preservation and `on_animation_end` delivery after the final frame's full duration.
+            let sheet_clone = state.sheet.clone();
+            let animated_sprite = Element::memo("memo-anim", &(), move |()| {
+                Sprite::new(&sheet_clone)
+                    .key("once-anim")
+                    .playing("land_once")
+                    .filter(ImageFilter::Nearest)
+                    .on_animation_end(SpriteTestMsg::AnimEnded)
+                    .position(Position::absolute(24.logical_px(), 10.logical_px()))
+                    .size(Size::px(4.logical_px(), 4.logical_px()))
+                    .into()
+            });
+
+            s.push(
+                Surface::floating("sprite-surf", Output::Primary)
+                    .size(Size::px(40.logical_px(), 32.logical_px()))
+                    .background(Color::BLACK)
+                    .child(static_sprite)
+                    .child(animated_sprite),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<SpriteTestApp>::new_with_renderer(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+        RendererPreference::Software,
+    )
+    .unwrap();
+
+    let pixel = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 40 + x) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+
+    // Unflipped 8x8 nearest-neighbor sprite at (10..18, 10..18):
+    // TL=(11,11) Red [0,0,255,255], TR=(16,11) Green [0,255,0,255],
+    // BL=(11,16) Blue [255,0,0,255], BR=(16,16) White [255,255,255,255].
+    let buf0 = rt.rendered_buffer("sprite-surf").unwrap();
+    assert_eq!(pixel(buf0, 11, 11), [0, 0, 255, 255]);
+    assert_eq!(pixel(buf0, 16, 11), [0, 255, 0, 255]);
+    assert_eq!(pixel(buf0, 11, 16), [255, 0, 0, 255]);
+    assert_eq!(pixel(buf0, 16, 16), [255, 255, 255, 255]);
+
+    // Flip horizontally: stays strictly inside (10..18, 10..18), left and right halves swap!
+    rt.enqueue(SpriteTestMsg::SetFlipX(true));
+    rt.step().unwrap();
+    let buf1 = rt.rendered_buffer("sprite-surf").unwrap();
+    assert_eq!(pixel(buf1, 11, 11), [0, 255, 0, 255]); // Green now on left
+    assert_eq!(pixel(buf1, 16, 11), [0, 0, 255, 255]); // Red now on right
+    assert_eq!(pixel(buf1, 11, 16), [255, 255, 255, 255]); // White now on left
+    assert_eq!(pixel(buf1, 16, 16), [255, 0, 0, 255]); // Blue now on right
+    // Outside rect remains untouched black background.
+    assert_eq!(pixel(buf1, 9, 11), [0, 0, 0, 255]);
+    assert_eq!(pixel(buf1, 19, 11), [0, 0, 0, 255]);
+
+    // Unflip and rotate 90 deg clockwise around center:
+    // Old TL (Red) moves to TR (16, 11); old TR (Green) moves to BR (16, 16);
+    // old BR (White) moves to BL (11, 16); old BL (Blue) moves to TL (11, 11).
+    rt.enqueue(SpriteTestMsg::SetFlipX(false));
+    rt.enqueue(SpriteTestMsg::SetRotate90(true));
+    rt.step().unwrap();
+    let buf2 = rt.rendered_buffer("sprite-surf").unwrap();
+    assert_eq!(pixel(buf2, 16, 11), [0, 0, 255, 255]); // Red -> TR
+    assert_eq!(pixel(buf2, 16, 16), [0, 255, 0, 255]); // Green -> BR
+    assert_eq!(pixel(buf2, 11, 16), [255, 255, 255, 255]); // White -> BL
+    assert_eq!(pixel(buf2, 11, 11), [255, 0, 0, 255]); // Blue -> TL
+
+    // Advance timed `land_once` clip (60ms frame 0, then 90ms frame 1 = 150ms total):
+    let t_base = Instant::now();
+    // At +70ms: should be showing frame 1 (solid Yellow [0,255,255,255]) and NOT yet ended.
+    rt.step_at(t_base + Duration::from_millis(70)).unwrap();
+    let buf_mid = rt.rendered_buffer("sprite-surf").unwrap();
+    assert_eq!(pixel(buf_mid, 25, 11), [0, 255, 255, 255]);
+    assert_eq!(rt.state().anim_ended_count, 0);
+
+    // Trigger an unrelated reconcile hitting the memoized sprite at +100ms: must still not end early.
+    rt.enqueue(SpriteTestMsg::BumpUnrelated);
+    rt.step_at(t_base + Duration::from_millis(100)).unwrap();
+    assert_eq!(rt.state().anim_ended_count, 0);
+
+    // At +180ms (> 150ms): clip completes and fires `on_animation_end` exactly once!
+    rt.step_at(t_base + Duration::from_millis(180)).unwrap();
+    assert_eq!(rt.state().anim_ended_count, 1);
+
+    // Further ticks must not re-fire `on_animation_end`.
+    rt.step_at(t_base + Duration::from_millis(400)).unwrap();
+    assert_eq!(rt.state().anim_ended_count, 1);
+}
+
+#[cfg(all(feature = "renderer-software", feature = "animation"))]
+#[test]
+fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
+    use std::time::{Duration, Instant};
+
+    struct LayeredState {
+        atlas: ImageAsset,
+        eye_sheet: SpriteSheet,
+        happy_mouth: bool,
+        arm_angle_deg: f32,
+    }
+
+    #[derive(Clone)]
+    enum LayeredMsg {
+        SetHappyMouth(bool),
+        SetArmAngle(f32),
+    }
+
+    struct LayeredApp;
+
+    impl Application for LayeredApp {
+        type State = LayeredState;
+        type Message = LayeredMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            // Single 16x16 irregular texture atlas:
+            // - Body (0, 0, 8, 12): solid Blue [0, 0, 255, 255]
+            // - Eyes open (8, 0, 4, 2): solid Green [0, 255, 0, 255]
+            // - Eyes closed (8, 2, 4, 2): solid Yellow [255, 255, 0, 255]
+            // - Mouth neutral (8, 4, 2, 2): solid White [255, 255, 255, 255]
+            // - Mouth happy (10, 4, 2, 2): solid Red [255, 0, 0, 255]
+            // - Arm (8, 8, 6, 2): solid Cyan [0, 255, 255, 255]
+            let mut pixels = vec![0u8; 16 * 16 * 4];
+            let mut fill_rect = |rx: usize, ry: usize, rw: usize, rh: usize, rgba: [u8; 4]| {
+                for y in ry..(ry + rh) {
+                    for x in rx..(rx + rw) {
+                        let off = (y * 16 + x) * 4;
+                        pixels[off..off + 4].copy_from_slice(&rgba);
+                    }
+                }
+            };
+            fill_rect(0, 0, 8, 12, [0, 0, 255, 255]);
+            fill_rect(8, 0, 4, 2, [0, 255, 0, 255]);
+            fill_rect(8, 2, 4, 2, [255, 255, 0, 255]);
+            fill_rect(8, 4, 2, 2, [255, 255, 255, 255]);
+            fill_rect(10, 4, 2, 2, [255, 0, 0, 255]);
+            fill_rect(8, 8, 6, 2, [0, 255, 255, 255]);
+
+            let atlas = ctx.load_rgba_image(16, 16, 64, true, &pixels)?;
+            let eye_sheet = SpriteSheet::from_regions(
+                atlas,
+                [SourceRect::new(8, 0, 4, 2), SourceRect::new(8, 2, 4, 2)],
+            )
+            .timed_animation(
+                "blink",
+                [
+                    (0, Duration::from_millis(50)),
+                    (1, Duration::from_millis(50)),
+                ],
+                PlaybackMode::Loop,
+            );
+
+            assert_eq!(eye_sheet.total_frames(), 2);
+            assert_eq!(eye_sheet.frame_source_rect(0), (8, 0, 4, 2));
+            assert_eq!(eye_sheet.frame_source_rect(1), (8, 2, 4, 2));
+
+            Ok(LayeredState {
+                atlas,
+                eye_sheet,
+                happy_mouth: false,
+                arm_angle_deg: 0.0,
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                LayeredMsg::SetHappyMouth(v) => state.happy_mouth = v,
+                LayeredMsg::SetArmAngle(deg) => state.arm_angle_deg = deg,
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            let mouth_region = if state.happy_mouth {
+                SourceRect::new(10, 4, 2, 2)
+            } else {
+                SourceRect::new(8, 4, 2, 2)
+            };
+
+            let character = Group::new()
+                .position(Position::absolute(10.logical_px(), 10.logical_px()))
+                .size(Size::px(24.logical_px(), 24.logical_px()))
+                // Layer 1: Base body (auto-sized to 8x12 from source_rect, using Bicubic filter)
+                .child(
+                    Image::new(state.atlas)
+                        .source_rect(0, 0, 8, 12)
+                        .filter(ImageFilter::Bicubic),
+                )
+                // Layer 2: Blinking eyes from irregular atlas SpriteSheet at (2, 2)
+                .child(
+                    Sprite::new(&state.eye_sheet)
+                        .key("eyes")
+                        .playing("blink")
+                        .filter(ImageFilter::Nearest)
+                        .position(Position::absolute(2.logical_px(), 2.logical_px())),
+                )
+                // Layer 3: Swappable mouth region at (3, 6)
+                .child(
+                    Image::new(state.atlas)
+                        .region(mouth_region)
+                        .filter(ImageFilter::Nearest)
+                        .position(Position::absolute(3.logical_px(), 6.logical_px())),
+                )
+                // Layer 4: Arm attached at shoulder (8, 4), rotating around left-center pivot (0.0, 0.5)
+                .child(
+                    Image::new(state.atlas)
+                        .source_rect(8, 8, 6, 2)
+                        .filter(ImageFilter::Nearest)
+                        .position(Position::absolute(8.logical_px(), 4.logical_px()))
+                        .transform(
+                            Transform::identity()
+                                .pivot(0.0, 0.5)
+                                .rotate_deg(state.arm_angle_deg),
+                        ),
+                );
+
+            s.push(
+                Surface::floating("char-surf", Output::Primary)
+                    .size(Size::px(40.logical_px(), 40.logical_px()))
+                    .background(Color::BLACK)
+                    .child(character),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<LayeredApp>::new_with_renderer(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+        RendererPreference::Software,
+    )
+    .unwrap();
+
+    let pixel = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 40 + x) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+
+    // Initial pose (BGRA little-endian):
+    // Body at (10..18, 10..22): Blue [255, 0, 0, 255]
+    // Eyes open at (12..16, 12..14): Green [0, 255, 0, 255]
+    // Mouth neutral at (13..15, 16..18): White [255, 255, 255, 255]
+    // Arm horizontal at (18..24, 14..16): Cyan [255, 255, 0, 255]
+    let buf0 = rt.rendered_buffer("char-surf").unwrap();
+    assert_eq!(pixel(buf0, 10, 10), [255, 0, 0, 255]); // body
+    assert_eq!(pixel(buf0, 13, 12), [0, 255, 0, 255]); // eyes open
+    assert_eq!(pixel(buf0, 13, 16), [255, 255, 255, 255]); // neutral mouth
+    assert_eq!(pixel(buf0, 22, 14), [255, 255, 0, 255]); // horizontal arm
+
+    // Swap mouth to happy (Red) & swing arm 90 deg down around shoulder pivot (18, 15):
+    // Swung arm should now occupy x=17..19, y=15..21 (pointing straight down from shoulder!).
+    rt.enqueue(LayeredMsg::SetHappyMouth(true));
+    rt.enqueue(LayeredMsg::SetArmAngle(90.0));
+    let t_base = Instant::now();
+    // Advance +60ms so eyes also blink to closed (Yellow [0, 255, 255, 255]).
+    rt.step_at(t_base + Duration::from_millis(60)).unwrap();
+
+    let buf1 = rt.rendered_buffer("char-surf").unwrap();
+    assert_eq!(pixel(buf1, 10, 10), [255, 0, 0, 255]); // body unchanged
+    assert_eq!(pixel(buf1, 13, 12), [0, 255, 255, 255]); // eyes blinked closed (yellow)
+    assert_eq!(pixel(buf1, 13, 16), [0, 0, 255, 255]); // happy mouth (red)
+    assert_eq!(pixel(buf1, 22, 14), [0, 0, 0, 255]); // old horizontal arm cleared
+    assert_eq!(pixel(buf1, 18, 19), [255, 255, 0, 255]); // arm now points downward from shoulder!
 }

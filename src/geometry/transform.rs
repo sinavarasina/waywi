@@ -2,7 +2,8 @@ use super::primitives::Point;
 use super::rect::Rect;
 use super::units::LogicalPx;
 
-/// Element-local 2D transform around the element's center (plus post-translation).
+/// Element-local 2D transform around a normalized pivot (default `(0.5, 0.5)` = center) plus
+/// post-translation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
     pub translate_x: LogicalPx,
@@ -10,6 +11,10 @@ pub struct Transform {
     pub scale_x: f32,
     pub scale_y: f32,
     pub rotation_rad: f32,
+    /// Normalized horizontal pivot within the element's bounds (`0.0` = left, `0.5` = center, `1.0` = right).
+    pub pivot_x: f32,
+    /// Normalized vertical pivot within the element's bounds (`0.0` = top, `0.5` = center, `1.0` = bottom).
+    pub pivot_y: f32,
 }
 
 impl Default for Transform {
@@ -28,6 +33,8 @@ impl Transform {
             scale_x: 1.0,
             scale_y: 1.0,
             rotation_rad: 0.0,
+            pivot_x: 0.5,
+            pivot_y: 0.5,
         }
     }
 
@@ -85,6 +92,26 @@ impl Transform {
     pub const fn rotate_rad(mut self, radians: f32) -> Self {
         self.rotation_rad = radians;
         self
+    }
+
+    /// Sets the normalized rotation/scale pivot within the element's bounds
+    /// (`(0.5, 0.5)` = center, `(0.5, 1.0)` = bottom-center, `(0.0, 0.5)` = left-center).
+    #[inline]
+    #[must_use]
+    pub const fn pivot(mut self, nx: f32, ny: f32) -> Self {
+        self.pivot_x = nx;
+        self.pivot_y = ny;
+        self
+    }
+
+    /// Resolves this transform's logical pivot point inside `bounds`.
+    #[inline]
+    #[must_use]
+    pub fn pivot_point(&self, bounds: Rect) -> Point {
+        Point::new(
+            LogicalPx(bounds.x.0 + bounds.width.0 * self.pivot_x),
+            LogicalPx(bounds.y.0 + bounds.height.0 * self.pivot_y),
+        )
     }
 
     /// Computes a 2D affine matrix `[sx, ky, kx, sy, tx, ty]` in logical space pivoting around `pivot`.
