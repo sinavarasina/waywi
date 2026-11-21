@@ -167,6 +167,7 @@ pub(crate) fn encode_commands(
                 color,
                 font,
                 align,
+                bounds_mode,
                 wrap_to_width,
             } => {
                 #[cfg(feature = "text")]
@@ -182,6 +183,7 @@ pub(crate) fn encode_commands(
                             max_width,
                             font,
                             align: *align,
+                            bounds_mode: *bounds_mode,
                         },
                         wrap_to_width: *wrap_to_width,
                         scale,
@@ -216,6 +218,8 @@ pub(crate) fn encode_commands(
                         color,
                         font,
                         align,
+                        bounds_mode,
+                        wrap_to_width,
                     );
                 }
             }

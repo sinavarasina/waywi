@@ -135,6 +135,7 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
                     max_width: max_w,
                     font: &t.font,
                     align: t.align,
+                    bounds_mode: t.bounds_mode,
                 },
                 frame_seq,
             )

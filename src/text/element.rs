@@ -2,7 +2,7 @@ use crate::geometry::LogicalPx;
 use crate::input::CommonProps;
 use crate::render::Color;
 
-use super::font::{Font, TextAlign};
+use super::font::{Font, TextAlign, TextBoundsMode};
 use super::shared_str::SharedStr;
 
 /// Styled text primitive.
@@ -16,6 +16,7 @@ pub struct Text<M = ()> {
     pub(crate) color: Color,
     pub(crate) font: Font,
     pub(crate) align: TextAlign,
+    pub(crate) bounds_mode: TextBoundsMode,
 }
 
 impl<M: 'static> Text<M> {
@@ -29,6 +30,7 @@ impl<M: 'static> Text<M> {
             color: Color::WHITE,
             font: Font::default(),
             align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
         }
     }
 
@@ -57,6 +59,24 @@ impl<M: 'static> Text<M> {
         self
     }
 
+    /// Selects how this text element's bounds are measured and positioned
+    /// ([`TextBoundsMode::Typographic`] default or tight [`TextBoundsMode::Optical`] ink bounds).
+    pub fn bounds_mode(mut self, mode: TextBoundsMode) -> Self {
+        self.bounds_mode = mode;
+        self
+    }
+
+    /// Convenience setter toggling [`TextBoundsMode::Optical`] tight ink bounds (ideal for
+    /// centering single icon glyphs such as Nerd Font PUA symbols).
+    pub fn optical_bounds(mut self, optical: bool) -> Self {
+        self.bounds_mode = if optical {
+            TextBoundsMode::Optical
+        } else {
+            TextBoundsMode::Typographic
+        };
+        self
+    }
+
     crate::input::impl_common_builders!();
 
     /// Maps emitted messages into a parent message type `N`.
@@ -72,6 +92,7 @@ impl<M: 'static> Text<M> {
             color: self.color,
             font: self.font,
             align: self.align,
+            bounds_mode: self.bounds_mode,
         }
     }
 }

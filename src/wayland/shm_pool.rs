@@ -100,6 +100,12 @@ impl SurfaceShmPool {
         }
     }
 
+    /// Returns `true` when no allocated SHM buffer slot is currently held by the compositor.
+    #[must_use]
+    pub(crate) fn all_idle(&self) -> bool {
+        self.slots.iter().flatten().all(|s| !s.busy)
+    }
+
     /// Destroys pool/buffers, drops mappings, and closes the memfd when hidden/removed. The file is
     /// never truncated: a compositor may still map/use released buffers, and shrinking it under
     /// that mapping causes SIGBUS in the compositor.
@@ -523,14 +529,35 @@ mod tests {
             AcquireSlot::AllBusy
         ));
         pool.mark_released(slot2, gen2);
-        assert!(matches!(
-            pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap(),
-            AcquireSlot::Ready { slot: 0, .. }
-        ));
+        assert!(!pool.all_idle()); // slot 1 (gen3) is still busy
+        pool.mark_released(slot3, gen3);
+        assert!(pool.all_idle());
 
         pool.shrink_and_unmap();
         assert_eq!(pool.current_pool_bytes(), 0);
         assert_eq!(pool.allocated_slot_count(), 0);
+        assert!(pool.all_idle());
+
+        // Re-acquiring after release-after-commit shrink reallocates cleanly with full-redraw damage.
+        let AcquireSlot::Ready {
+            slot: slot_after,
+            damage: damage_after,
+            ..
+        } = pool.acquire_for_draw(96, 24, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected fresh slot after shrink_and_unmap");
+        };
+        assert_eq!(slot_after, 0);
+        assert_eq!(
+            damage_after,
+            vec![BufferRect {
+                x: 0,
+                y: 0,
+                width: 96,
+                height: 24,
+            }]
+        );
+        pool.shrink_and_unmap();
 
         stop.store(true, Ordering::Relaxed);
         let _ = srv_thread.join();

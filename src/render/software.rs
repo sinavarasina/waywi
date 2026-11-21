@@ -18,6 +18,10 @@ pub(crate) mod fast_path;
 pub(crate) mod path;
 pub(crate) mod raster;
 
+/// Upper bound retained on reusable software rasterization scratch buffers between frames
+/// (2 MiB keeps panels/popups allocation-free while releasing temporary full-screen tiles).
+const SCRATCH_RETAIN_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 /// Cached rasterized `Canvas` output keyed by `(NodeId, render_key, pixel_w, pixel_h)`.
 pub(crate) struct CachedCanvasPixmap {
     pub(crate) render_key: u64,
@@ -77,6 +81,7 @@ impl RenderBackend for SoftwareRenderer {
                 style.max_width,
                 style.font,
                 style.align,
+                style.bounds_mode,
                 frame_seq,
             );
             let char_w = style.font_size.0 * 0.6;
@@ -249,6 +254,52 @@ impl RenderBackend for SoftwareRenderer {
             }
         }
 
+        if self.scratch_rgba.capacity() > SCRATCH_RETAIN_MAX_BYTES {
+            self.scratch_rgba.clear();
+            self.scratch_rgba.shrink_to(SCRATCH_RETAIN_MAX_BYTES);
+        }
+        if self.scratch_sprite_cell.capacity() > SCRATCH_RETAIN_MAX_BYTES {
+            self.scratch_sprite_cell.clear();
+            self.scratch_sprite_cell.shrink_to(SCRATCH_RETAIN_MAX_BYTES);
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "renderer-software"))]
+mod tests {
+    use super::*;
+    use crate::asset::AssetCache;
+    use crate::geometry::ScaleFactor;
+    use crate::render::Color;
+
+    #[test]
+    fn software_scratch_buffer_shrinks_after_large_fullscreen_tile() {
+        let mut renderer = SoftwareRenderer::new();
+        let assets = AssetCache::new();
+        // 1920x400 RGBA = ~3.07 MiB (> 2 MiB retain cap).
+        let (w, h) = (1920_i32, 400_i32);
+        let mut dst = vec![0u8; (w as usize) * (h as usize) * 4];
+        renderer
+            .render_argb8888(
+                &mut dst,
+                BufferPx(w),
+                BufferPx(h),
+                &[],
+                FrameScene {
+                    scale: ScaleFactor::ONE,
+                    background: Color::BLACK,
+                    commands: &[],
+                    assets: &assets,
+                    frame_seq: 1,
+                },
+            )
+            .unwrap();
+        assert!(
+            renderer.scratch_rgba.capacity() <= SCRATCH_RETAIN_MAX_BYTES,
+            "expected scratch_rgba capacity <= {SCRATCH_RETAIN_MAX_BYTES}, got {}",
+            renderer.scratch_rgba.capacity()
+        );
     }
 }

@@ -449,6 +449,7 @@ mod tests {
                 color: crate::render::Color::WHITE,
                 font: Font::default(),
                 align: TextAlign::Left,
+                bounds_mode: crate::text::TextBoundsMode::Typographic,
             },
             a11y: AccessibleProps {
                 role: Some(AccessibleRole::Button),
@@ -473,6 +474,7 @@ mod tests {
                 exclusive_zone: 36,
                 keyboard_interactivity: KeyboardInteractivity::None,
                 input_mode: InputMode::Full,
+                buffer_retention: crate::surface::BufferRetention::Retain,
                 background: crate::render::Color::BLACK,
                 title: SharedStr::from_static("Top Panel"),
                 namespace: SharedStr::from_static("waywi"),

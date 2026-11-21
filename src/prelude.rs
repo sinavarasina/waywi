@@ -34,8 +34,8 @@ pub use crate::render::{
 pub use crate::sprite::{Fps, FpsExt, Frames, PlaybackMode, Sprite, SpriteFrame, SpriteSheet};
 pub use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionKey, Subscriptions};
 pub use crate::surface::{
-    Anchor, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, Surface, SurfaceKey,
-    SurfaceKind, Surfaces,
+    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, Surface,
+    SurfaceKey, SurfaceKind, Surfaces,
 };
 pub use crate::system::{
     BacklightDevice, BatteryInfo, BrightnessSnapshot, ByteSize, CalendarDayCell, CalendarMonth,
@@ -45,7 +45,8 @@ pub use crate::system::{
     TimeSnapshot, UsbDevice, read_usb_devices, read_usb_devices_from,
 };
 pub use crate::text::{
-    Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextCursorMetrics, TextLayoutOptions,
+    Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextBoundsMode, TextCursorMetrics,
+    TextLayoutOptions,
 };
 pub use crate::timer::Timer;
 

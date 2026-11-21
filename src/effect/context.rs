@@ -448,6 +448,7 @@ impl<'a> EffectCtx<'a> {
             max_width: None,
             font,
             align: crate::text::TextAlign::Left,
+            bounds_mode: crate::text::TextBoundsMode::Typographic,
         };
         let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
         (self.text_cursor_measurer)(&shared, style, cursor_byte)

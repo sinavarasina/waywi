@@ -812,3 +812,83 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
     assert_eq!(pixel(buf1, 22, 14), [0, 0, 0, 255]); // old horizontal arm cleared
     assert_eq!(pixel(buf1, 18, 19), [255, 255, 0, 255]); // arm now points downward from shoulder!
 }
+
+#[cfg(all(feature = "renderer-software", feature = "text"))]
+#[test]
+fn optical_text_bounds_centers_ink_pixels_symmetrically_in_box() {
+    struct OpticalApp;
+
+    impl Application for OpticalApp {
+        type State = ();
+        type Message = ();
+
+        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            Ok(())
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            _msg: Self::Message,
+            _ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::floating("optical-box", Output::Primary)
+                    .size(Size::px(48.logical_px(), 48.logical_px()))
+                    .buffer_retention(BufferRetention::ReleaseAfterCommit)
+                    .background(Color::TRANSPARENT)
+                    .child(
+                        Text::new("O")
+                            .font(Font::sans())
+                            .font_size(24.logical_px())
+                            .line_height(1.5)
+                            .optical_bounds(true)
+                            .color(Color::WHITE)
+                            .position(Position::absolute(24.logical_px(), 24.logical_px()))
+                            .anchor(ElementAnchor::Center),
+                    ),
+            );
+            s
+        }
+    }
+
+    let rt = HeadlessRuntime::<OpticalApp>::new_with_renderer(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+        RendererPreference::Software,
+    )
+    .unwrap();
+
+    let buf = rt.rendered_buffer("optical-box").unwrap();
+    let mut min_x = 48usize;
+    let mut max_x = 0usize;
+    let mut min_y = 48usize;
+    let mut max_y = 0usize;
+    for y in 0..48 {
+        for x in 0..48 {
+            let alpha = buf[(y * 48 + x) * 4 + 3];
+            if alpha > 0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    assert!(min_x < max_x && min_y < max_y);
+    // Optical center of inked pixels must lie within <= 1.0 px of box center (23.5, 23.5).
+    let ink_cx = (min_x + max_x) as f32 * 0.5;
+    let ink_cy = (min_y + max_y) as f32 * 0.5;
+    assert!(
+        (ink_cx - 23.5).abs() <= 1.0,
+        "optical horizontal center {ink_cx} drifted from 23.5 (bounds {min_x}..={max_x})"
+    );
+    assert!(
+        (ink_cy - 23.5).abs() <= 1.0,
+        "optical vertical center {ink_cy} drifted from 23.5 (bounds {min_y}..={max_y})"
+    );
+}

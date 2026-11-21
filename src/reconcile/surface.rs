@@ -11,7 +11,9 @@ use crate::input::{
     ScrollEvent, hit_test, hit_test_scroll,
 };
 use crate::render::{Color, DrawCommand, RetainedNode};
-use crate::surface::{Anchor, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind};
+use crate::surface::{
+    Anchor, BufferRetention, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind,
+};
 use crate::text::SharedStr;
 
 /// Identity of a live retained Wayland surface instance.
@@ -33,6 +35,7 @@ pub(crate) struct SurfaceSpec {
     pub(crate) exclusive_zone: i32,
     pub(crate) keyboard_interactivity: KeyboardInteractivity,
     pub(crate) input_mode: InputMode,
+    pub(crate) buffer_retention: BufferRetention,
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
     pub(crate) namespace: SharedStr,

@@ -289,6 +289,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                     color: t.color,
                     font: t.font,
                     align: t.align,
+                    bounds_mode: t.bounds_mode,
                     wrap_to_width: !matches!(t.common.size.width, crate::geometry::Length::Auto),
                 }
             }

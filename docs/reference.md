@@ -80,10 +80,11 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `Anchor` bitflags: `TOP` (`Top`), `BOTTOM` (`Bottom`), `LEFT` (`Left`), `RIGHT` (`Right`).
 - `KeyboardInteractivity`: `None`, `OnDemand`, `Exclusive`.
 - `InputMode`: `Full`, `Selective`, `PassThrough`.
+- `BufferRetention`: `Retain`, `ReleaseAfterCommit`.
 - `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`.
 - `Surface<M>` (`surface::builder`):
   - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::memo(key, dep, build)`.
-  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
+  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.buffer_retention`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
 - `Surfaces<M>` (`surface::collection`): `new()`, `push(surface)`, `extend(surfaces)`, `len()`, `is_empty()`, `map(f)`.
 - `OutputId(pub u64)` (`new`, `get`), `Output` (`primary()`, `named(name)`, `id(OutputId)`, `all()`), `OutputInfo`, `Transform`, `resolve_outputs`, `select_primary_output`.
 
@@ -111,9 +112,9 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `FontWeight`: `Thin`, `Light`, `Normal`, `Medium`, `SemiBold`, `Bold`, `ExtraBold` (`to_numeric`).
   - `FontStyle`: `Normal`, `Italic`.
   - `Font`: `sans`, `monospace`, `family`, `weight`, `style`.
-  - `TextAlign`: `Left`, `Center`, `Right`.
-  - `Text<M>`: `new`, `font_size`, `line_height`, `color`, `font`, `align`, `map`.
-  - `TextCursorMetrics` (`size`, `cursor_x`, `cursor_y`, `line_height`) and `TextLayoutOptions` (`new`, `line_height`, `max_width`, `align`).
+  - `TextAlign`: `Left`, `Center`, `Right`; `TextBoundsMode`: `Typographic`, `Optical`.
+  - `Text<M>`: `new`, `font_size`, `line_height`, `color`, `font`, `align`, `bounds_mode`, `optical_bounds`, `map`.
+  - `TextCursorMetrics` (`size`, `cursor_x`, `cursor_y`, `line_height`) and `TextLayoutOptions` (`new`, `line_height`, `max_width`, `align`, `bounds_mode`).
   - `SharedStr`: `EMPTY`, `from_static`, `from_str_inline_or_arc`, `format_inline`, `as_str`, `is_inline`, `is_static`.
 - **Images & Assets (`image`, `asset::types`)**:
   - `AssetId(pub u64)` (`new`, `get`), `ImageAsset`, `DecodedImage`, `DecodedGifFrame`, `ImageFormat` (`Png`, `Svg`, `Gif`, `Webp`).

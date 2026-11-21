@@ -426,6 +426,7 @@ impl GpuTextureCache {
         color.a.hash(&mut h);
         s.font.hash(&mut h);
         s.align.hash(&mut h);
+        s.bounds_mode.hash(&mut h);
         params.scale.as_120ths().hash(&mut h);
         tex_w.hash(&mut h);
         tex_h.hash(&mut h);

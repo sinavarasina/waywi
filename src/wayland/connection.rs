@@ -393,6 +393,12 @@ impl WaylandState {
                 SurfaceRole::Xdg(window) => apply_xdg_spec(window, spec),
             }
             surf.spec = spec.clone();
+            if surf.spec.buffer_retention == crate::surface::BufferRetention::ReleaseAfterCommit
+                && !surf.pending_redraw
+                && surf.pool.all_idle()
+            {
+                surf.pool.shrink_and_unmap();
+            }
             let wl_id = surf.wl_surface_id.clone();
             surf.role.wl_surface().commit();
             #[cfg(feature = "ime")]

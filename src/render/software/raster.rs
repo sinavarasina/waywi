@@ -113,6 +113,7 @@ impl SoftwareRenderer {
                 color,
                 font,
                 align,
+                bounds_mode,
                 wrap_to_width,
             } => {
                 #[cfg(feature = "text")]
@@ -134,6 +135,7 @@ impl SoftwareRenderer {
                             max_width,
                             font,
                             align: *align,
+                            bounds_mode: *bounds_mode,
                         },
                         wrap_to_width: *wrap_to_width,
                         scale,
@@ -156,6 +158,7 @@ impl SoftwareRenderer {
                         color,
                         font,
                         align,
+                        bounds_mode,
                         wrap_to_width,
                         frame_seq,
                     );

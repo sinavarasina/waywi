@@ -95,3 +95,15 @@ pub enum TextAlign {
     Center,
     Right,
 }
+
+/// Bounding-box metric used to measure and position [`Text`](super::element::Text) elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextBoundsMode {
+    /// Standard typographic advance width and line-height box (default; preserves consistent
+    /// baselines for words, numbers, and paragraphs).
+    #[default]
+    Typographic,
+    /// Tight actual glyph ink bounding box measured from rasterized glyph extents (ideal for
+    /// centered single icon glyphs such as Nerd Font PUA symbols, arrows, or badges).
+    Optical,
+}

@@ -48,11 +48,17 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlotUserData> for WaylandState {
         if let wl_buffer::Event::Release = event
             && let Some(surf) = state.surfaces.get_mut(&data.key)
             && surf.pool.mark_released(data.slot, data.generation)
-            && surf.pending_redraw
         {
-            state
-                .events
-                .push_back(WaylandEvent::BufferReleased { key: data.key });
+            if surf.pending_redraw {
+                state
+                    .events
+                    .push_back(WaylandEvent::BufferReleased { key: data.key });
+            } else if surf.spec.buffer_retention
+                == crate::surface::BufferRetention::ReleaseAfterCommit
+                && surf.pool.all_idle()
+            {
+                surf.pool.shrink_and_unmap();
+            }
         }
     }
 }

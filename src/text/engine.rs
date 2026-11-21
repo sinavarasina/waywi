@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 #[cfg(feature = "text")]
-use super::font::{Font, FontStyle, TextAlign};
+use super::font::{Font, FontStyle, TextAlign, TextBoundsMode};
 #[cfg(feature = "text")]
 use super::shared_str::SharedStr;
 #[cfg(feature = "text")]
@@ -49,12 +49,14 @@ struct TextShapeKey {
     scale_120: u32,
     font: Font,
     align: TextAlign,
+    bounds_mode: TextBoundsMode,
 }
 
 #[cfg(feature = "text")]
 struct CachedTextBuffer {
     buffer: cosmic_text::Buffer,
     logical_size: LogicalSize,
+    draw_offset_px: (i32, i32),
     last_used_frame: u64,
 }
 
@@ -195,6 +197,7 @@ impl TextEngine {
             scale_120: params.scale.as_120ths(),
             font: s.font.clone(),
             align: s.align,
+            bounds_mode: s.bounds_mode,
         }
     }
 
@@ -211,6 +214,7 @@ impl TextEngine {
         }
 
         let font_system = &mut self.font_system;
+        let swash_cache = &mut self.swash_cache;
         let scale = params.scale.as_f32();
         let entry = self.buffer_cache.entry(key).or_insert_with(|| {
             let fs_px = (s.font_size.0.max(1.0) * scale).max(1.0);
@@ -265,14 +269,52 @@ impl TextEngine {
                 line_count += 1;
             }
             let total_h = (line_count.max(1) as f32) * lh_px;
-            let logical_size = LogicalSize::new(
+            let mut logical_size = LogicalSize::new(
                 LogicalPx((max_w / scale).ceil()),
                 LogicalPx((total_h / scale).ceil()),
             );
+            let mut draw_offset_px = (0_i32, 0_i32);
+
+            if s.bounds_mode == TextBoundsMode::Optical && !params.content.is_empty() {
+                let mut min_x = i32::MAX;
+                let mut min_y = i32::MAX;
+                let mut max_x = i32::MIN;
+                let mut max_y = i32::MIN;
+                let probe_color = cosmic_text::Color::rgba(255, 255, 255, 255);
+                buffer.draw(font_system, swash_cache, probe_color, |px, py, w, h, c| {
+                    if c.a() > 0 && w > 0 && h > 0 {
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px + w as i32);
+                        max_y = max_y.max(py + h as i32);
+                    }
+                });
+                if min_x < max_x && min_y < max_y {
+                    let ink_w_px = (max_x - min_x) as f32;
+                    let ink_h_px = (max_y - min_y) as f32;
+                    logical_size = LogicalSize::new(
+                        LogicalPx((ink_w_px / scale).ceil()),
+                        LogicalPx((ink_h_px / scale).ceil()),
+                    );
+                    let offset_x = if let Some(box_w) = width_px
+                        && params.wrap_to_width
+                    {
+                        match s.align {
+                            TextAlign::Left => -min_x,
+                            TextAlign::Center => ((box_w - ink_w_px) * 0.5).round() as i32 - min_x,
+                            TextAlign::Right => (box_w - ink_w_px).round() as i32 - min_x,
+                        }
+                    } else {
+                        -min_x
+                    };
+                    draw_offset_px = (offset_x, -min_y);
+                }
+            }
 
             CachedTextBuffer {
                 buffer,
                 logical_size,
+                draw_offset_px,
                 last_used_frame: frame_seq,
             }
         });
@@ -308,8 +350,8 @@ impl TextEngine {
         let cached = buffer_cache.get_mut(&key).expect("shaped buffer cached");
         let base_alpha = (f32::from(color.a) * opacity.clamp(0.0, 1.0)).round() as u8;
         let text_color = cosmic_text::Color::rgba(color.r, color.g, color.b, base_alpha);
-        let ox = (origin.0 * scale_f).round() as i32;
-        let oy = (origin.1 * scale_f).round() as i32;
+        let ox = (origin.0 * scale_f).round() as i32 + cached.draw_offset_px.0;
+        let oy = (origin.1 * scale_f).round() as i32 + cached.draw_offset_px.1;
 
         cached.buffer.draw(
             font_system,
@@ -390,6 +432,7 @@ mod tests {
                     max_width: None,
                     font: &font,
                     align: TextAlign::Left,
+                    bounds_mode: TextBoundsMode::Typographic,
                 },
                 1,
             );
@@ -407,6 +450,7 @@ mod tests {
                         max_width: Some(measured.width),
                         font: &font,
                         align: TextAlign::Left,
+                        bounds_mode: TextBoundsMode::Typographic,
                     },
                     wrap_to_width: false,
                     scale,
@@ -433,6 +477,7 @@ mod tests {
             max_width: None,
             font: &font,
             align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
         };
 
         let m_empty = engine.measure_text_cursor(&SharedStr::EMPTY, style, 0, 1);
@@ -465,5 +510,78 @@ mod tests {
         assert!(line1.cursor_y.0 >= line1.line_height.0 - 0.01);
         assert_eq!(line1.cursor_x, LogicalPx::ZERO);
         assert!(line1_end.cursor_x.0 > 0.0);
+    }
+
+    #[test]
+    fn optical_bounds_tightly_frames_rendered_ink_at_origin_zero() {
+        let mut engine = TextEngine::new();
+        let font = Font::sans();
+        let content = SharedStr::from("O");
+        let typo_style = TextMeasureStyle {
+            font_size: LogicalPx(24.0),
+            line_height_multiplier: 1.4,
+            max_width: None,
+            font: &font,
+            align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
+        };
+        let optical_style = TextMeasureStyle {
+            bounds_mode: TextBoundsMode::Optical,
+            ..typo_style
+        };
+
+        let typo_size = engine.measure_text(&content, typo_style, 1);
+        let opt_size = engine.measure_text(&content, optical_style, 1);
+        assert!(opt_size.width.0 > 0.0 && opt_size.height.0 > 0.0);
+        // Tight optical ink height must be strictly smaller than generous 1.4x typographic line height.
+        assert!(opt_size.height.0 < typo_size.height.0);
+
+        let w = (opt_size.width.0.ceil() as u32) + 8;
+        let h = (opt_size.height.0.ceil() as u32) + 8;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let mut target = TextRasterTarget {
+            dst: &mut buf,
+            width: w,
+            height: h,
+            clip: crate::geometry::BufferRect {
+                x: 0,
+                y: 0,
+                width: w as i32,
+                height: h as i32,
+            },
+        };
+        engine.draw_text_premultiplied_rgba(
+            &mut target,
+            (4.0, 4.0),
+            TextDrawParams {
+                content: &content,
+                style: optical_style,
+                wrap_to_width: false,
+                scale: ScaleFactor::ONE,
+            },
+            Color::WHITE,
+            1.0,
+            2,
+        );
+
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                if buf[((y * w + x) * 4 + 3) as usize] > 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        // Rendered ink starts flush at the requested origin (4, 4) and fits inside opt_size!
+        assert_eq!(min_x, 4);
+        assert_eq!(min_y, 4);
+        assert_eq!(max_x - min_x + 1, opt_size.width.0.ceil() as u32);
+        assert_eq!(max_y - min_y + 1, opt_size.height.0.ceil() as u32);
     }
 }

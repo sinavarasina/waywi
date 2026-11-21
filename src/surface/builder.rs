@@ -7,7 +7,8 @@ use crate::render::{Color, Element, check_memo, set_memo_surface_hash};
 use crate::text::SharedStr;
 
 use super::types::{
-    Anchor, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind,
+    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, SurfaceKey,
+    SurfaceKind,
 };
 
 /// Wayland surface specification returned from `view(state)`.
@@ -24,6 +25,7 @@ pub struct Surface<M = ()> {
     pub(crate) exclusive_zone: i32,
     pub(crate) keyboard_interactivity: KeyboardInteractivity,
     pub(crate) input_mode: InputMode,
+    pub(crate) buffer_retention: BufferRetention,
     pub(crate) visible: bool,
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
@@ -79,6 +81,7 @@ impl<M: 'static> Surface<M> {
             exclusive_zone: 0,
             keyboard_interactivity: KeyboardInteractivity::None,
             input_mode,
+            buffer_retention: BufferRetention::Retain,
             visible: true,
             background: Color::TRANSPARENT,
             title: SharedStr::from_static("waywi"),
@@ -182,6 +185,16 @@ impl<M: 'static> Surface<M> {
 
     pub fn input_mode(mut self, mode: InputMode) -> Self {
         self.input_mode = mode;
+        self
+    }
+
+    /// Configures how client-side `wl_shm` buffers are retained after compositor presentation.
+    ///
+    /// Use [`BufferRetention::ReleaseAfterCommit`] for static wallpapers or large rarely-updated
+    /// surfaces so client SHM memory drops back to zero bytes once the compositor releases the
+    /// committed buffer.
+    pub fn buffer_retention(mut self, retention: BufferRetention) -> Self {
+        self.buffer_retention = retention;
         self
     }
 
@@ -320,6 +333,7 @@ impl<M: 'static> Surface<M> {
             exclusive_zone: self.exclusive_zone,
             keyboard_interactivity: self.keyboard_interactivity,
             input_mode: self.input_mode,
+            buffer_retention: self.buffer_retention,
             visible: self.visible,
             background: self.background,
             title: self.title,

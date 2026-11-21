@@ -6,7 +6,7 @@ pub mod shared_str;
 pub use element::Text;
 #[cfg(feature = "text")]
 pub(crate) use engine::TextEngine;
-pub use font::{Font, FontStyle, FontWeight, TextAlign};
+pub use font::{Font, FontStyle, FontWeight, TextAlign, TextBoundsMode};
 pub use shared_str::SharedStr;
 
 /// Measured layout bounds and visual cursor coordinates for shaped text.
@@ -35,6 +35,8 @@ pub struct TextLayoutOptions {
     pub max_width: Option<crate::geometry::LogicalPx>,
     /// Horizontal text alignment within `max_width`.
     pub align: TextAlign,
+    /// Bounding-box metric (`Typographic` default or tight `Optical` ink bounds).
+    pub bounds_mode: TextBoundsMode,
 }
 
 impl Default for TextLayoutOptions {
@@ -45,6 +47,7 @@ impl Default for TextLayoutOptions {
             line_height_multiplier: 1.25,
             max_width: None,
             align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
         }
     }
 }
@@ -80,6 +83,13 @@ impl TextLayoutOptions {
         self.align = align;
         self
     }
+
+    /// Sets the bounding-box measurement mode (`Typographic` or `Optical`).
+    #[must_use]
+    pub fn bounds_mode(mut self, mode: TextBoundsMode) -> Self {
+        self.bounds_mode = mode;
+        self
+    }
 }
 
 /// Grouped typography parameters passed when shaping/measuring text.
@@ -90,6 +100,7 @@ pub(crate) struct TextMeasureStyle<'a> {
     pub(crate) max_width: Option<crate::geometry::LogicalPx>,
     pub(crate) font: &'a Font,
     pub(crate) align: TextAlign,
+    pub(crate) bounds_mode: TextBoundsMode,
 }
 
 impl<'a> TextMeasureStyle<'a> {
@@ -102,6 +113,7 @@ impl<'a> TextMeasureStyle<'a> {
             max_width: opts.max_width,
             font: &opts.font,
             align: opts.align,
+            bounds_mode: opts.bounds_mode,
         }
     }
 }

@@ -76,6 +76,7 @@ impl<M: 'static> Element<M> {
                 color: t.color,
                 font: t.font,
                 align: t.align,
+                bounds_mode: t.bounds_mode,
             }),
             ElementKind::Image(img) => ElementKind::Image(Image {
                 common: img.common.map_with(mapper),

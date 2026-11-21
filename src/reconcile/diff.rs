@@ -233,6 +233,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             exclusive_zone: surf.exclusive_zone,
             keyboard_interactivity: surf.keyboard_interactivity,
             input_mode: surf.input_mode,
+            buffer_retention: surf.buffer_retention,
             background: surf.background,
             title: surf.title,
             namespace: surf.namespace,
@@ -260,6 +261,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.keyboard_interactivity != spec.keyboard_interactivity
                 || prev.spec.title != spec.title
                 || prev.spec.logical_size != spec.logical_size
+                || prev.spec.buffer_retention != spec.buffer_retention
                 || prev.spec.ime != spec.ime
                 || prev.scale != scale;
             full_redraw = prev.full_redraw

@@ -84,6 +84,18 @@ pub enum InputMode {
     PassThrough,
 }
 
+/// Client-side SHM buffer memory retention policy for a [`Surface`](super::Surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BufferRetention {
+    /// Keep allocated `wl_shm` buffers mapped across frames for low-latency redraws (default).
+    #[default]
+    Retain,
+    /// Unmap and destroy client-side `wl_shm` buffers once the compositor sends
+    /// `wl_buffer.release` and no redraw is pending (ideal for static wallpapers and large
+    /// rarely-updated surfaces to minimize steady-state RSS).
+    ReleaseAfterCommit,
+}
+
 /// High-level Wayland surface intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SurfaceKind {

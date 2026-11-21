@@ -6,7 +6,7 @@ use crate::input::{ElementKey, EventHandlers, HitTestNode, NodeId};
 use crate::render::canvas::Painter;
 use crate::render::style::{Border, Color, CornerRadius};
 use crate::sprite::{SpriteSheet, SpriteSourceState, SpriteTimeline};
-use crate::text::{Font, SharedStr, TextAlign};
+use crate::text::{Font, SharedStr, TextAlign, TextBoundsMode};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PaintPayload {
@@ -22,6 +22,7 @@ pub(crate) enum PaintPayload {
         color: Color,
         font: Font,
         align: TextAlign,
+        bounds_mode: TextBoundsMode,
         wrap_to_width: bool,
     },
     Image {
@@ -114,6 +115,7 @@ pub(crate) enum RetainedVisual {
         color: Color,
         font: Font,
         align: TextAlign,
+        bounds_mode: TextBoundsMode,
         wrap_to_width: bool,
     },
     Image {
@@ -163,6 +165,7 @@ impl RetainedVisual {
                     color: c1,
                     font: fn1,
                     align: a1,
+                    bounds_mode: bm1,
                     wrap_to_width: w1,
                 },
                 Self::Text {
@@ -172,6 +175,7 @@ impl RetainedVisual {
                     color: c2,
                     font: fn2,
                     align: a2,
+                    bounds_mode: bm2,
                     wrap_to_width: w2,
                 },
             ) => {
@@ -181,6 +185,7 @@ impl RetainedVisual {
                     || c1 != c2
                     || fn1 != fn2
                     || a1 != a2
+                    || bm1 != bm2
                     || w1 != w2
             }
             (
@@ -285,6 +290,7 @@ fn collect_node_recursive<M: Clone + 'static>(
             color,
             font,
             align,
+            bounds_mode,
             wrap_to_width,
         } => Some(PaintPayload::Text {
             content: content.clone(),
@@ -293,6 +299,7 @@ fn collect_node_recursive<M: Clone + 'static>(
             color: *color,
             font: font.clone(),
             align: *align,
+            bounds_mode: *bounds_mode,
             wrap_to_width: *wrap_to_width,
         }),
         RetainedVisual::Image {
