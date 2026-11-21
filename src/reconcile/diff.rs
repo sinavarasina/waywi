@@ -5,6 +5,7 @@ use crate::asset::AssetCache;
 use crate::display::{Output, OutputInfo, resolve_outputs};
 use crate::geometry::{Affine2D, Length, LogicalPx, LogicalSize, Rect as GeoRect, ScaleFactor};
 use crate::input::NodeId;
+use crate::render::retained::PaintPayload;
 use crate::render::{RenderBackend, RetainedNode, collect_draw_and_hit};
 use crate::surface::{InputMode, SurfaceKind, Surfaces};
 
@@ -380,7 +381,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             if surface.next_animation_deadline.is_none() {
                 continue;
             }
-            let mut surf_changed = false;
+            let mut changed_frames: Vec<(NodeId, usize)> = Vec::new();
             let mut surf_deadline: Option<Instant> = None;
             let mut surf_dirty_rects = Vec::new();
 
@@ -388,7 +389,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 tick_node_animations(
                     node,
                     now,
-                    &mut surf_changed,
+                    &mut changed_frames,
                     &mut surf_dirty_rects,
                     &mut surf_deadline,
                     &mut emitted_messages,
@@ -400,14 +401,18 @@ impl<M: Clone + 'static> Reconciler<M> {
                 next_deadline = Some(next_deadline.map_or(dl, |p| p.min(dl)));
             }
 
-            if surf_changed {
-                surface.commands.clear();
-                surface.hit_nodes.clear();
-                collect_draw_and_hit(
-                    &surface.roots,
-                    &mut surface.commands,
-                    &mut surface.hit_nodes,
-                );
+            if !changed_frames.is_empty() {
+                for cmd in &mut surface.commands {
+                    if let PaintPayload::Sprite {
+                        ref mut frame_index,
+                        ..
+                    } = cmd.payload
+                        && let Some(&(_, next_frame)) =
+                            changed_frames.iter().find(|&&(nid, _)| nid == cmd.node_id)
+                    {
+                        *frame_index = next_frame;
+                    }
+                }
                 surface.dirty_logical_rects.extend(surf_dirty_rects);
                 surface.needs_redraw = true;
                 dirty_surfaces.push(rk);

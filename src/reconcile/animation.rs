@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::geometry::Rect as GeoRect;
+use crate::input::NodeId;
 use crate::render::{RetainedNode, RetainedVisual};
 use crate::sprite::SpriteSourceState;
 
@@ -27,7 +28,7 @@ pub(crate) fn collect_subtree_deadlines<M>(node: &RetainedNode<M>, out: &mut Opt
 pub(crate) fn tick_node_animations<M: Clone>(
     node: &mut RetainedNode<M>,
     now: Instant,
-    changed: &mut bool,
+    changed_frames: &mut Vec<(NodeId, usize)>,
     dirty_rects: &mut Vec<GeoRect>,
     next_deadline: &mut Option<Instant>,
     emitted_messages: &mut Vec<M>,
@@ -60,7 +61,7 @@ pub(crate) fn tick_node_animations<M: Clone>(
         );
         if adv.frame_changed {
             *resolved_frame = adv.frame;
-            *changed = true;
+            changed_frames.push((node.node_id, adv.frame));
             dirty_rects.push(node.world_bounds);
         }
         if adv.just_finished
@@ -76,7 +77,7 @@ pub(crate) fn tick_node_animations<M: Clone>(
         tick_node_animations(
             ch,
             now,
-            changed,
+            changed_frames,
             dirty_rects,
             next_deadline,
             emitted_messages,
