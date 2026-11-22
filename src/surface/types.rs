@@ -2,6 +2,8 @@ use std::hash::{Hash, Hasher};
 
 use bitflags::bitflags;
 
+use crate::geometry::{LogicalPx, Rect as GeoRect};
+
 /// Stable key identifying a declared Wayland surface across `view(state)` updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SurfaceKey(pub u64);
@@ -107,4 +109,143 @@ pub enum SurfaceKind {
     Overlay,
     /// Explicit fallback XDG toplevel window (`xdg_wm_base`) when layer-shell is unavailable.
     Window,
+    /// Compositor-positioned XDG popup (`xdg_popup` + `xdg_positioner`) attached to a parent
+    /// layer-shell (`zwlr_layer_surface_v1.get_popup`), toplevel window, or parent popup.
+    Popup,
+}
+
+/// Anchor point on the parent surface's anchor rectangle (`xdg_positioner.set_anchor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PopupAnchor {
+    None,
+    Top,
+    #[default]
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    BottomLeft,
+    TopRight,
+    BottomRight,
+}
+
+/// Direction in which the popup grows away from the anchor point (`xdg_positioner.set_gravity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PopupGravity {
+    None,
+    Top,
+    #[default]
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    BottomLeft,
+    TopRight,
+    BottomRight,
+}
+
+bitflags! {
+    /// Compositor repositioning flags applied when an `xdg_popup` would otherwise be clipped by
+    /// an output edge (`xdg_positioner.set_constraint_adjustment`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct PopupConstraintAdjustment: u32 {
+        const SLIDE_X  = 1 << 0;
+        const SLIDE_Y  = 1 << 1;
+        const FLIP_X   = 1 << 2;
+        const FLIP_Y   = 1 << 3;
+        const RESIZE_X = 1 << 4;
+        const RESIZE_Y = 1 << 5;
+    }
+}
+
+impl Default for PopupConstraintAdjustment {
+    #[inline]
+    fn default() -> Self {
+        Self::FLIP_X | Self::FLIP_Y | Self::SLIDE_X | Self::SLIDE_Y
+    }
+}
+
+/// Positioning rules passed to `xdg_positioner` for [`Surface::popup`](super::Surface::popup).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopupPositioner {
+    /// Rectangle in the parent surface's logical coordinates that the popup anchors to.
+    pub anchor_rect: GeoRect,
+    /// Point on `anchor_rect` where the popup attaches.
+    pub anchor: PopupAnchor,
+    /// Direction in which the popup extends from the anchor point.
+    pub gravity: PopupGravity,
+    /// Logical `(dx, dy)` offset applied after anchor/gravity placement.
+    pub offset_x: LogicalPx,
+    pub offset_y: LogicalPx,
+    /// Constraint-adjustment flags when near monitor edges (default: flip + slide on X and Y).
+    pub constraint_adjustment: PopupConstraintAdjustment,
+    /// Request reactive repositioning (`xdg_positioner.set_reactive`, `xdg_wm_base >= 3`).
+    pub reactive: bool,
+}
+
+impl Default for PopupPositioner {
+    fn default() -> Self {
+        Self {
+            anchor_rect: GeoRect::from_xywh(0.0, 0.0, 1.0, 1.0),
+            anchor: PopupAnchor::BottomLeft,
+            gravity: PopupGravity::BottomRight,
+            offset_x: LogicalPx::ZERO,
+            offset_y: LogicalPx::ZERO,
+            constraint_adjustment: PopupConstraintAdjustment::default(),
+            reactive: true,
+        }
+    }
+}
+
+impl PopupPositioner {
+    /// Creates a positioner anchored to `anchor_rect` in the parent surface's logical coordinates.
+    #[must_use]
+    pub fn new(anchor_rect: GeoRect) -> Self {
+        Self {
+            anchor_rect,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub const fn anchor(mut self, anchor: PopupAnchor) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    #[must_use]
+    pub const fn gravity(mut self, gravity: PopupGravity) -> Self {
+        self.gravity = gravity;
+        self
+    }
+
+    #[must_use]
+    pub const fn offset(mut self, dx: LogicalPx, dy: LogicalPx) -> Self {
+        self.offset_x = dx;
+        self.offset_y = dy;
+        self
+    }
+
+    #[must_use]
+    pub const fn constraint_adjustment(mut self, flags: PopupConstraintAdjustment) -> Self {
+        self.constraint_adjustment = flags;
+        self
+    }
+
+    #[must_use]
+    pub const fn reactive(mut self, reactive: bool) -> Self {
+        self.reactive = reactive;
+        self
+    }
+}
+
+/// Internal popup attachment specification stored on `Surface<M>` and `SurfaceSpec`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PopupSpec {
+    pub(crate) parent: SurfaceKey,
+    pub(crate) positioner: PopupPositioner,
+    pub(crate) grab: bool,
+    /// Declared logical size resolved during reconciliation so dynamic popup resizing triggers
+    /// `xdg_popup.reposition` without conflicting with the compositor's configured render size.
+    pub(crate) desired_size: Option<crate::geometry::LogicalSize>,
 }

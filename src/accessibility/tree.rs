@@ -224,6 +224,7 @@ pub(crate) fn build_tree_update<M: 'static>(
 
         let default_role = match surf.spec.kind {
             SurfaceKind::Window => Role::Window,
+            SurfaceKind::Popup => Role::Menu,
             SurfaceKind::Panel | SurfaceKind::Floating | SurfaceKind::Overlay => Role::Pane,
         };
         let mut s_node = Node::new(surf.spec.a11y.role.map_or(default_role, map_explicit_role));
@@ -475,6 +476,7 @@ mod tests {
                 keyboard_interactivity: KeyboardInteractivity::None,
                 input_mode: InputMode::Full,
                 buffer_retention: crate::surface::BufferRetention::Retain,
+                popup: None,
                 background: crate::render::Color::BLACK,
                 title: SharedStr::from_static("Top Panel"),
                 namespace: SharedStr::from_static("waywi"),

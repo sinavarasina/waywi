@@ -9,8 +9,56 @@ use std::process::{Child, Command, Stdio};
 
 use crate::error::{Result, WaywiError};
 
+/// Parsed `[Desktop Action <id>]` sub-action metadata from an XDG `.desktop` file (e.g.,
+/// `"New Private Window"`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DesktopAction {
+    /// Action identifier from `Actions=` / `[Desktop Action <id>]`.
+    pub id: String,
+    /// Localized display label (`Name=`).
+    pub name: String,
+    /// Optional action icon name or path (`Icon=`).
+    pub icon: Option<String>,
+    /// Optional action command line (`Exec=`).
+    pub exec: Option<String>,
+}
+
+impl DesktopAction {
+    /// Parses this action's `Exec=` into an argument vector compatible with `Command::new`,
+    /// expanding `%c` / `%k` / `%i` (falling back to `entry`'s icon when the action omits `Icon=`)
+    /// and stripping file/URL field codes.
+    #[must_use]
+    pub fn exec_argv(&self, entry: &DesktopEntry) -> Option<Vec<String>> {
+        let icon = self.icon.as_deref().or(entry.icon.as_deref());
+        expand_exec_argv(self.exec.as_deref()?, &self.name, icon, &entry.path)
+    }
+
+    /// Spawns this action detached in its own session (reaping on exit).
+    pub fn launch_detached(&self, entry: &DesktopEntry) -> Result<()> {
+        self.launch_with_token(entry, None)
+    }
+
+    /// Spawns this action detached with an optional Wayland `XDG_ACTIVATION_TOKEN` passed to the
+    /// child process environment.
+    pub fn launch_with_token(
+        &self,
+        entry: &DesktopEntry,
+        activation_token: Option<&str>,
+    ) -> Result<()> {
+        let argv = self.exec_argv(entry).ok_or_else(|| {
+            WaywiError::InvalidState(format!(
+                "desktop action `{}` on `{}` has no Exec command",
+                self.id, entry.id
+            ))
+        })?;
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        let env_vars = activation_env_vars(activation_token);
+        super::spawn_detached_with_env(&argv[0], &args, entry.valid_working_dir(), &env_vars)
+    }
+}
+
 /// Parsed `[Desktop Entry]` application metadata from an XDG `.desktop` file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DesktopEntry {
     pub id: String,
     pub path: PathBuf,
@@ -29,6 +77,10 @@ pub struct DesktopEntry {
     pub only_show_in: Vec<String>,
     pub not_show_in: Vec<String>,
     pub startup_wm_class: Option<String>,
+    /// `true` when `DBusActivatable=true` is declared per freedesktop `org.freedesktop.Application`.
+    pub dbus_activatable: bool,
+    /// Ordered `[Desktop Action <id>]` sub-actions declared in `Actions=`.
+    pub actions: Vec<DesktopAction>,
 }
 
 /// Ranked launcher search hit produced by [`search_desktop_entries`].
@@ -44,29 +96,48 @@ impl DesktopEntry {
     /// and expanding `%c` / `%k` / `%i` where present.
     #[must_use]
     pub fn exec_argv(&self) -> Option<Vec<String>> {
-        let raw = self.exec.as_deref()?.trim();
-        if raw.is_empty() {
+        expand_exec_argv(
+            self.exec.as_deref()?,
+            &self.name,
+            self.icon.as_deref(),
+            &self.path,
+        )
+    }
+
+    /// Returns the `org.freedesktop.Application` D-Bus well-known bus name (e.g.
+    /// `"org.gnome.TextEditor"`) when `dbus_activatable` is `true` and `self.id` is a valid
+    /// reverse-DNS desktop ID.
+    #[must_use]
+    pub fn dbus_service_name(&self) -> Option<&str> {
+        if !self.dbus_activatable {
             return None;
         }
-        let tokens = split_exec_tokens(raw);
-        let mut argv = Vec::with_capacity(tokens.len());
-        for tok in tokens {
-            match tok.as_str() {
-                "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => {}
-                "%i" => {
-                    if let Some(ref icon) = self.icon
-                        && !icon.is_empty()
-                    {
-                        argv.push("--icon".to_owned());
-                        argv.push(icon.clone());
-                    }
-                }
-                "%c" => argv.push(self.name.clone()),
-                "%k" => argv.push(self.path.to_string_lossy().into_owned()),
-                _ => argv.push(tok.replace("%%", "%")),
+        let base = self.id.strip_suffix(".desktop").unwrap_or(self.id.as_str());
+        is_valid_dbus_well_known_name(base).then_some(base)
+    }
+
+    /// Returns the `org.freedesktop.Application` D-Bus object path (e.g.
+    /// `"/org/gnome/TextEditor"`) derived from [`Self::dbus_service_name`] per the freedesktop
+    /// Desktop Entry Specification.
+    #[must_use]
+    pub fn dbus_object_path(&self) -> Option<String> {
+        let name = self.dbus_service_name()?;
+        let mut path = String::with_capacity(name.len() + 1);
+        path.push('/');
+        for ch in name.chars() {
+            match ch {
+                '.' => path.push('/'),
+                '-' => path.push('_'),
+                other => path.push(other),
             }
         }
-        if argv.is_empty() { None } else { Some(argv) }
+        Some(path)
+    }
+
+    /// Looks up a declared `[Desktop Action <id>]` by its action identifier.
+    #[must_use]
+    pub fn action(&self, action_id: &str) -> Option<&DesktopAction> {
+        self.actions.iter().find(|a| a.id == action_id)
     }
 
     /// Returns `true` when `TryExec=` is absent or resolves to an existing executable file.
@@ -160,12 +231,96 @@ impl DesktopEntry {
     /// Spawns this application detached, using `terminal` when `self.terminal` is `true` (or
     /// auto-detecting the system terminal when `terminal` is `None`).
     pub fn launch_with_terminal(&self, terminal: Option<&str>) -> Result<()> {
+        self.launch_with_terminal_and_token(terminal, None)
+    }
+
+    /// Spawns this application detached with an optional Wayland `XDG_ACTIVATION_TOKEN` passed to
+    /// the child process environment (along with `DESKTOP_STARTUP_ID` for legacy toolkits).
+    pub fn launch_with_token(&self, activation_token: Option<&str>) -> Result<()> {
+        self.launch_with_terminal_and_token(None, activation_token)
+    }
+
+    /// Spawns this application detached with explicit optional `terminal` override and optional
+    /// Wayland `XDG_ACTIVATION_TOKEN`.
+    pub fn launch_with_terminal_and_token(
+        &self,
+        terminal: Option<&str>,
+        activation_token: Option<&str>,
+    ) -> Result<()> {
         let path_dirs = split_env_path();
         let env_terminal = env::var("TERMINAL").ok();
         let argv = self.resolve_argv_with(terminal, &path_dirs, env_terminal.as_deref())?;
         let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        super::spawn_detached_in(&argv[0], &args, self.valid_working_dir())
+        let env_vars = activation_env_vars(activation_token);
+        super::spawn_detached_with_env(&argv[0], &args, self.valid_working_dir(), &env_vars)
     }
+
+    /// Launches a declared `[Desktop Action <action_id>]` detached with an optional Wayland
+    /// `XDG_ACTIVATION_TOKEN`.
+    pub fn launch_action(&self, action_id: &str, activation_token: Option<&str>) -> Result<()> {
+        let action = self.action(action_id).ok_or_else(|| {
+            WaywiError::InvalidState(format!(
+                "desktop entry `{}` has no action `{action_id}`",
+                self.id
+            ))
+        })?;
+        action.launch_with_token(self, activation_token)
+    }
+}
+
+fn activation_env_vars(token: Option<&str>) -> Vec<(&'static str, &str)> {
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tok) => vec![("XDG_ACTIVATION_TOKEN", tok), ("DESKTOP_STARTUP_ID", tok)],
+        None => Vec::new(),
+    }
+}
+
+fn expand_exec_argv(
+    raw: &str,
+    name: &str,
+    icon: Option<&str>,
+    desktop_path: &Path,
+) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens = split_exec_tokens(trimmed);
+    let mut argv = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        match tok.as_str() {
+            "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => {}
+            "%i" => {
+                if let Some(ic) = icon
+                    && !ic.is_empty()
+                {
+                    argv.push("--icon".to_owned());
+                    argv.push(ic.to_owned());
+                }
+            }
+            "%c" => argv.push(name.to_owned()),
+            "%k" => argv.push(desktop_path.to_string_lossy().into_owned()),
+            _ => argv.push(tok.replace("%%", "%")),
+        }
+    }
+    if argv.is_empty() { None } else { Some(argv) }
+}
+
+fn is_valid_dbus_well_known_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 || !name.contains('.') {
+        return false;
+    }
+    name.split('.').all(|seg| {
+        let mut bytes = seg.bytes();
+        let Some(first) = bytes.next() else {
+            return false;
+        };
+        if first.is_ascii_digit() {
+            return false;
+        }
+        (first.is_ascii_alphabetic() || matches!(first, b'_' | b'-'))
+            && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    })
 }
 
 /// Filters `entries` to applications visible in a standard launcher on the current desktop,
@@ -419,12 +574,19 @@ fn collect_dir_entries(
     }
 }
 
-/// Parses `[Desktop Entry]` text into a [`DesktopEntry`], returning `None` unless `Type=Application`
-/// and a non-empty `Name` are present.
+/// Parses `[Desktop Entry]` and `[Desktop Action ...]` sections into a [`DesktopEntry`],
+/// returning `None` unless `Type=Application` and a non-empty `Name` are present.
 #[must_use]
 pub fn parse_desktop_entry(contents: &str, id: &str, path: &Path) -> Option<DesktopEntry> {
-    let mut in_main_section = false;
+    enum Section {
+        Other,
+        Main,
+        Action(String),
+    }
+
+    let mut section = Section::Other;
     let mut fields: HashMap<String, String> = HashMap::new();
+    let mut action_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
     let locale = env::var("LC_MESSAGES")
         .or_else(|_| env::var("LANG"))
         .unwrap_or_default();
@@ -443,12 +605,25 @@ pub fn parse_desktop_entry(contents: &str, id: &str, path: &Path) -> Option<Desk
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_main_section = line == "[Desktop Entry]";
+            if line == "[Desktop Entry]" {
+                section = Section::Main;
+            } else if let Some(action_id) = line
+                .strip_prefix("[Desktop Action ")
+                .and_then(|s| s.strip_suffix(']'))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                section = Section::Action(action_id.to_owned());
+            } else {
+                section = Section::Other;
+            }
             continue;
         }
-        if !in_main_section {
-            continue;
-        }
+        let target_map = match section {
+            Section::Other => continue,
+            Section::Main => &mut fields,
+            Section::Action(ref action_id) => action_fields.entry(action_id.clone()).or_default(),
+        };
         let Some((raw_key, raw_val)) = line.split_once('=') else {
             continue;
         };
@@ -461,28 +636,27 @@ pub fn parse_desktop_entry(contents: &str, id: &str, path: &Path) -> Option<Desk
             if (!short_locale.is_empty() && loc_clean == short_locale)
                 || (!lang_only.is_empty()
                     && loc_clean == lang_only
-                    && !fields.contains_key(base_key))
+                    && !target_map.contains_key(base_key))
             {
-                fields.insert(format!("{base_key}#loc"), val);
+                target_map.insert(format!("{base_key}#loc"), val);
             }
             continue;
         }
-        fields.insert(key.to_owned(), val);
+        target_map.insert(key.to_owned(), val);
     }
 
     if fields.get("Type").map(String::as_str) != Some("Application") {
         return None;
     }
 
-    let get_loc = |k: &str| -> Option<String> {
-        fields
-            .get(&format!("{k}#loc"))
-            .or_else(|| fields.get(k))
+    let get_loc_from = |map: &HashMap<String, String>, k: &str| -> Option<String> {
+        map.get(&format!("{k}#loc"))
+            .or_else(|| map.get(k))
             .filter(|v| !v.is_empty())
             .cloned()
     };
 
-    let name = get_loc("Name")?;
+    let name = get_loc_from(&fields, "Name")?;
     let parse_bool = |k: &str| {
         fields
             .get(k)
@@ -501,12 +675,30 @@ pub fn parse_desktop_entry(contents: &str, id: &str, path: &Path) -> Option<Desk
             .unwrap_or_default()
     };
 
+    let mut seen_actions = HashSet::new();
+    let mut actions = Vec::new();
+    for action_id in parse_list("Actions") {
+        if !seen_actions.insert(action_id.clone()) {
+            continue;
+        }
+        if let Some(af) = action_fields.get(&action_id)
+            && let Some(action_name) = get_loc_from(af, "Name")
+        {
+            actions.push(DesktopAction {
+                id: action_id,
+                name: action_name,
+                icon: af.get("Icon").filter(|v| !v.is_empty()).cloned(),
+                exec: af.get("Exec").filter(|v| !v.is_empty()).cloned(),
+            });
+        }
+    }
+
     Some(DesktopEntry {
         id: id.to_owned(),
         path: path.to_path_buf(),
         name,
-        generic_name: get_loc("GenericName"),
-        comment: get_loc("Comment"),
+        generic_name: get_loc_from(&fields, "GenericName"),
+        comment: get_loc_from(&fields, "Comment"),
         exec: fields.get("Exec").filter(|v| !v.is_empty()).cloned(),
         try_exec: fields.get("TryExec").filter(|v| !v.is_empty()).cloned(),
         working_dir: fields
@@ -525,6 +717,8 @@ pub fn parse_desktop_entry(contents: &str, id: &str, path: &Path) -> Option<Desk
             .get("StartupWMClass")
             .filter(|v| !v.is_empty())
             .cloned(),
+        dbus_activatable: parse_bool("DBusActivatable"),
+        actions,
     })
 }
 
@@ -1106,5 +1300,68 @@ Terminal=false
         counts.insert("zen.desktop".to_owned(), 5);
         let weighted = search_entries_with_ctx(&all, "", Some(&counts), &mut ctx);
         assert_eq!(weighted[0].entry.id, "zen.desktop");
+    }
+
+    #[test]
+    fn parses_desktop_actions_and_dbus_activatable_metadata() {
+        let src = "\
+[Desktop Entry]
+Type=Application
+Name=Browser
+Icon=web-browser
+Exec=browser %u
+DBusActivatable=true
+Actions=new-private-window;new-window;missing-action;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=browser --new-window %i
+
+[Desktop Action new-private-window]
+Name=New Private Window
+Icon=view-private
+Exec=browser --private-window %c
+
+[Desktop Action undeclared]
+Name=Ignored Action
+Exec=browser --ignored
+";
+        let entry = parse_desktop_entry(
+            src,
+            "org.example.my-browser.desktop",
+            Path::new("/usr/share/applications/org.example.my-browser.desktop"),
+        )
+        .unwrap();
+        assert!(entry.dbus_activatable);
+        assert_eq!(entry.dbus_service_name(), Some("org.example.my-browser"));
+        assert_eq!(
+            entry.dbus_object_path().as_deref(),
+            Some("/org/example/my_browser")
+        );
+
+        // Preserves Actions= declaration order and ignores missing/undeclared sections.
+        assert_eq!(entry.actions.len(), 2);
+        assert_eq!(entry.actions[0].id, "new-private-window");
+        assert_eq!(entry.actions[0].name, "New Private Window");
+        assert_eq!(entry.actions[0].icon.as_deref(), Some("view-private"));
+        assert_eq!(
+            entry.actions[0].exec_argv(&entry),
+            Some(vec![
+                "browser".to_owned(),
+                "--private-window".to_owned(),
+                "New Private Window".to_owned(),
+            ])
+        );
+        assert_eq!(entry.actions[1].id, "new-window");
+        assert_eq!(
+            entry.actions[1].exec_argv(&entry),
+            Some(vec![
+                "browser".to_owned(),
+                "--new-window".to_owned(),
+                "--icon".to_owned(),
+                "web-browser".to_owned(),
+            ])
+        );
+        assert!(entry.action("undeclared").is_none());
     }
 }

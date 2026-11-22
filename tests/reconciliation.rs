@@ -855,3 +855,135 @@ fn headless_runtime_routes_ime_events_and_reconciles_ime_config() {
             > seq_after_ime
     );
 }
+
+#[test]
+fn headless_popup_dismiss_and_xdg_activation_capabilities() {
+    #[derive(Clone)]
+    enum Msg {
+        Dismissed,
+        RequestToken,
+        GotToken(std::result::Result<String, String>),
+    }
+
+    #[derive(Default)]
+    struct State {
+        popup_open: bool,
+        dismissed_count: usize,
+        last_token: Option<std::result::Result<String, String>>,
+    }
+
+    struct PopupAndActApp;
+
+    impl Application for PopupAndActApp {
+        type State = State;
+        type Message = Msg;
+
+        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            Ok(State {
+                popup_open: true,
+                ..State::default()
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                Msg::Dismissed => {
+                    state.dismissed_count += 1;
+                    state.popup_open = false;
+                }
+                Msg::RequestToken => {
+                    ctx.request_activation_token(Some("org.waywi.Test"), |res| {
+                        Msg::GotToken(res.map_err(|e| format!("{e}")))
+                    });
+                }
+                Msg::GotToken(res) => {
+                    if let Ok(ref tok) = res {
+                        ctx.activate_surface("bar", tok.clone())?;
+                    }
+                    state.last_token = Some(res);
+                }
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::panel("bar", Output::Primary)
+                    .size(Size::px(800.logical_px(), 32.logical_px())),
+            );
+            if state.popup_open {
+                s.push(
+                    Surface::popup("menu", "bar")
+                        .size(Size::px(160.logical_px(), 96.logical_px()))
+                        .anchor_rect(GeoRect::from_xywh(10.0, 0.0, 60.0, 32.0))
+                        .popup_anchor(PopupAnchor::BottomLeft)
+                        .popup_gravity(PopupGravity::BottomRight)
+                        .on_close(Msg::Dismissed),
+                );
+            }
+            s
+        }
+    }
+
+    // 1. With Capability::XdgActivation enabled: token succeeds and activation is recorded.
+    let mut caps_enabled = Capabilities::from_compile_features();
+    caps_enabled.set(Capability::XdgActivation, true);
+    let outputs = vec![OutputInfo {
+        id: OutputId(1),
+        logical_size: LogicalSize::new(800.logical_px(), 600.logical_px()),
+        ..OutputInfo::default()
+    }];
+    let mut rt = HeadlessRuntime::<PopupAndActApp>::new(caps_enabled, outputs.clone()).unwrap();
+    assert_eq!(rt.surface_count(), 2);
+    assert_eq!(
+        rt.surface_logical_size("menu"),
+        Some(LogicalSize::new(160.logical_px(), 96.logical_px()))
+    );
+
+    // Dismissing popup fires on_close without setting quit_requested.
+    assert!(rt.simulate_popup_dismiss("menu"));
+    rt.step().unwrap();
+    assert_eq!(rt.state().dismissed_count, 1);
+    assert!(!rt.quit_requested());
+    assert_eq!(rt.surface_count(), 1);
+
+    // Request activation token + activate_surface.
+    rt.enqueue(Msg::RequestToken);
+    rt.step().unwrap();
+    rt.step().unwrap();
+    assert_eq!(
+        rt.state()
+            .last_token
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(String::as_str),
+        Some("headless-activation-token-1")
+    );
+    assert_eq!(
+        rt.activated_surfaces(),
+        &[(
+            "bar".into_surface_key(),
+            "headless-activation-token-1".to_owned()
+        )]
+    );
+
+    // 2. With Capability::XdgActivation disabled: honest UnsupportedCapability error.
+    let mut caps_disabled = Capabilities::from_compile_features();
+    caps_disabled.set(Capability::XdgActivation, false);
+    let mut rt2 = HeadlessRuntime::<PopupAndActApp>::new(caps_disabled, outputs).unwrap();
+    rt2.enqueue(Msg::RequestToken);
+    rt2.step().unwrap();
+    rt2.step().unwrap();
+    assert!(
+        rt2.state()
+            .last_token
+            .as_ref()
+            .is_some_and(std::result::Result::is_err)
+    );
+    assert!(rt2.activated_surfaces().is_empty());
+}

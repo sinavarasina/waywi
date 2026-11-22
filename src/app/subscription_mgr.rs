@@ -103,6 +103,8 @@ pub(crate) struct LoopInbox<M> {
     #[cfg(feature = "dbus")]
     pub(crate) dbus_geoclue: VecDeque<crate::dbus::GeoClueSnapshot>,
     #[cfg(feature = "dbus")]
+    pub(crate) dbus_portal_settings: VecDeque<crate::dbus::PortalSettingsSnapshot>,
+    #[cfg(feature = "dbus")]
     pub(crate) dbus_mpris: VecDeque<crate::dbus::MprisEvent>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus_action_results: VecDeque<crate::dbus::DbusActionResult>,
@@ -151,6 +153,8 @@ impl<M> Default for LoopInbox<M> {
             dbus_geoclue: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_mpris: VecDeque::new(),
+            #[cfg(feature = "dbus")]
+            dbus_portal_settings: VecDeque::new(),
             #[cfg(feature = "dbus")]
             dbus_action_results: VecDeque::new(),
             #[cfg(feature = "global-shortcuts")]
@@ -268,6 +272,12 @@ pub(crate) struct SubscriptionManager<M> {
     #[cfg(feature = "dbus")]
     dbus_geoclue_worker: Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
     #[cfg(feature = "dbus")]
+    pub(crate) dbus_portal_settings_subs:
+        Vec<FrameSharedFn<crate::dbus::PortalSettingsSnapshot, M>>,
+    #[cfg(feature = "dbus")]
+    dbus_portal_settings_worker:
+        Option<(crate::dbus::ServiceWatchWorker, calloop::RegistrationToken)>,
+    #[cfg(feature = "dbus")]
     pub(crate) dbus_mpris_subs: Vec<FrameSharedFn<crate::dbus::MprisEvent, M>>,
     #[cfg(feature = "dbus")]
     dbus_mpris_worker: Option<(crate::dbus::MprisWorker, calloop::RegistrationToken)>,
@@ -379,6 +389,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             #[cfg(feature = "dbus")]
             dbus_geoclue_worker: None,
             #[cfg(feature = "dbus")]
+            dbus_portal_settings_subs: Vec::new(),
+            #[cfg(feature = "dbus")]
+            dbus_portal_settings_worker: None,
+            #[cfg(feature = "dbus")]
             dbus_mpris_subs: Vec::new(),
             #[cfg(feature = "dbus")]
             dbus_mpris_worker: None,
@@ -451,6 +465,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_modem_subs.clear();
             self.dbus_screensaver_subs.clear();
             self.dbus_geoclue_subs.clear();
+            self.dbus_portal_settings_subs.clear();
             self.dbus_mpris_subs.clear();
             self.dbus_action_result_subs.clear();
         }
@@ -566,6 +581,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusGeoClue { map, .. } => {
                     self.dbus_geoclue_subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusPortalSettings { map, .. } => {
+                    self.dbus_portal_settings_subs.push(map.clone());
                 }
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusMpris { map, .. } => {
@@ -917,6 +936,17 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 );
             }
             {
+                let inbox_cl = Rc::clone(inbox);
+                sync_shared_dbus_worker(
+                    !self.dbus_portal_settings_subs.is_empty(),
+                    &mut self.dbus_portal_settings_worker,
+                    loop_handle,
+                    &sess_bus,
+                    move |ev| inbox_cl.borrow_mut().dbus_portal_settings.push_back(ev),
+                    crate::dbus::spawn_portal_settings_worker,
+                );
+            }
+            {
                 let active = !self.dbus_mpris_subs.is_empty();
                 if !active && let Ok(mut g) = dbus_client.cache.mpris.write() {
                     *g = None;
@@ -1103,6 +1133,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 self.dbus_modem_worker,
                 self.dbus_screensaver_worker,
                 self.dbus_geoclue_worker,
+                self.dbus_portal_settings_worker,
                 self.dbus_mpris_worker,
                 self.dbus_action_result_worker,
             );

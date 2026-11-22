@@ -11,6 +11,7 @@ use crate::input::{
     ScrollEvent, hit_test, hit_test_scroll,
 };
 use crate::render::{Color, DrawCommand, RetainedNode};
+use crate::surface::types::PopupSpec;
 use crate::surface::{
     Anchor, BufferRetention, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind,
 };
@@ -36,6 +37,7 @@ pub(crate) struct SurfaceSpec {
     pub(crate) keyboard_interactivity: KeyboardInteractivity,
     pub(crate) input_mode: InputMode,
     pub(crate) buffer_retention: BufferRetention,
+    pub(crate) popup: Option<PopupSpec>,
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
     pub(crate) namespace: SharedStr,

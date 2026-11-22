@@ -206,7 +206,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 .get(&rk)
                 .copied()
                 .map(|cfg| match surf.kind {
-                    SurfaceKind::Window => cfg,
+                    SurfaceKind::Window | SurfaceKind::Popup => cfg,
                     SurfaceKind::Panel | SurfaceKind::Floating | SurfaceKind::Overlay => {
                         LogicalSize::new(
                             if matches!(surf.size.width, Length::Fill) {
@@ -224,6 +224,11 @@ impl<M: Clone + 'static> Reconciler<M> {
                 });
         let target_size = configured.unwrap_or(declared_size);
 
+        let popup = surf.popup.map(|mut p| {
+            p.desired_size = Some(declared_size);
+            p
+        });
+
         let spec = SurfaceSpec {
             kind: surf.kind,
             output_id,
@@ -235,6 +240,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             keyboard_interactivity: surf.keyboard_interactivity,
             input_mode: surf.input_mode,
             buffer_retention: surf.buffer_retention,
+            popup,
             background: surf.background,
             title: surf.title,
             namespace: surf.namespace,
@@ -263,6 +269,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.title != spec.title
                 || prev.spec.logical_size != spec.logical_size
                 || prev.spec.buffer_retention != spec.buffer_retention
+                || prev.spec.popup != spec.popup
                 || prev.spec.ime != spec.ime
                 || prev.scale != scale;
             full_redraw = prev.full_redraw

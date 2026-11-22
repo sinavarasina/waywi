@@ -7,9 +7,10 @@ pub use crate::capabilities::{Capabilities, Capability};
 #[cfg(feature = "clipboard")]
 pub use crate::clipboard::{Clipboard, ClipboardEvent, ClipboardSelection, ClipboardSnapshot};
 pub use crate::desktop::{
-    DesktopEntry, DesktopSearchMatch, XdgIconLookup, filter_launcher_entries, resolve_icon_path,
-    scan_desktop_entries, search_desktop_entries, search_desktop_entries_with_weights,
-    spawn_detached, spawn_detached_in, spawn_shell_detached,
+    DesktopAction, DesktopEntry, DesktopSearchMatch, XdgBaseDirs, XdgIconLookup, XdgUserDirs,
+    filter_launcher_entries, resolve_icon_path, scan_desktop_entries, search_desktop_entries,
+    search_desktop_entries_with_weights, spawn_detached, spawn_detached_in,
+    spawn_detached_with_env, spawn_shell_detached,
 };
 pub use crate::display::{Output, OutputId, OutputInfo};
 pub use crate::effect::EffectCtx;
@@ -34,8 +35,9 @@ pub use crate::render::{
 pub use crate::sprite::{Fps, FpsExt, Frames, PlaybackMode, Sprite, SpriteFrame, SpriteSheet};
 pub use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionKey, Subscriptions};
 pub use crate::surface::{
-    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, Surface,
-    SurfaceKey, SurfaceKind, Surfaces,
+    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, PopupAnchor,
+    PopupConstraintAdjustment, PopupGravity, PopupPositioner, Surface, SurfaceKey, SurfaceKind,
+    Surfaces,
 };
 pub use crate::system::{
     BacklightDevice, BatteryInfo, BrightnessSnapshot, ByteSize, CalendarDayCell, CalendarMonth,
@@ -85,7 +87,8 @@ pub use crate::dbus::{
     ModemSnapshot, ModemState, MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot,
     NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo, NmDeviceType,
     NmSavedConnection, NmState, NmWifiSecurity, NotificationCapabilities, NotificationCloseReason,
-    NotificationEvent, NotificationImageData, NotificationUrgency, PowerActionSupport,
+    NotificationEvent, NotificationImageData, NotificationUrgency, PortalAccentColor,
+    PortalColorScheme, PortalContrast, PortalSettingsSnapshot, PowerActionSupport,
     PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
     TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
     UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice, UPowerDeviceKind,

@@ -4,7 +4,9 @@ use smithay_client_toolkit::seat::keyboard::{
     KeyEvent as SctkKeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers as SctkModifiers,
     RawModifiers,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent as SctkPointerEvent, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    PointerEvent as SctkPointerEvent, PointerEventKind, PointerHandler,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability as SeatCapability, SeatHandler, SeatState};
 use wayland_client::protocol::{wl_keyboard, wl_pointer, wl_seat, wl_surface, wl_touch};
@@ -106,6 +108,11 @@ impl PointerHandler for WaylandState {
             let Some(&key) = self.surface_by_obj.get(&ev.surface.id()) else {
                 continue;
             };
+            if let PointerEventKind::Press { serial, .. } = ev.kind
+                && let Some(seat) = self.seat_state.seats().next()
+            {
+                self.last_input_serial = Some((seat, serial, ev.surface.clone()));
+            }
             match map_pointer_event(ev) {
                 MappedPointerAction::Enter { x, y } => {
                     self.events.push_back(WaylandEvent::PointerEnter {
@@ -197,10 +204,15 @@ impl KeyboardHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
+        serial: u32,
         event: SctkKeyEvent,
     ) {
         if let Some(key) = self.focused_keyboard_surface {
+            if let Some(seat) = self.seat_state.seats().next()
+                && let Some(surf) = self.surfaces.get(&key)
+            {
+                self.last_input_serial = Some((seat, serial, surf.role.wl_surface().clone()));
+            }
             self.events.push_back(WaylandEvent::KeyboardKey {
                 key,
                 pressed: true,
@@ -294,13 +306,16 @@ impl TouchHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
-        _serial: u32,
+        serial: u32,
         _time: u32,
         surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
     ) {
         if let Some(&key) = self.surface_by_obj.get(&surface.id()) {
+            if let Some(seat) = self.seat_state.seats().next() {
+                self.last_input_serial = Some((seat, serial, surface));
+            }
             self.active_touches.insert(id, key);
             self.events.push_back(WaylandEvent::TouchDown {
                 key,

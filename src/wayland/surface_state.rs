@@ -1,8 +1,10 @@
+use smithay_client_toolkit::activation::RequestDataExt;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::LayerSurface;
+use smithay_client_toolkit::shell::xdg::popup::Popup;
 use smithay_client_toolkit::shell::xdg::window::Window;
 use wayland_client::backend::ObjectId;
-use wayland_client::protocol::wl_surface;
+use wayland_client::protocol::{wl_seat, wl_surface};
 
 #[cfg(feature = "fractional-scale")]
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
@@ -14,10 +16,36 @@ use crate::input::{Key, Modifiers, MouseButton};
 use crate::reconcile::{RetainedSurfaceKey, SurfaceSpec};
 use crate::wayland::shm_pool::SurfaceShmPool;
 
+/// User data attached to each `xdg_activation_token_v1` request.
+#[derive(Debug, Clone)]
+pub(crate) struct ActivationRequestData {
+    pub(crate) request_id: u64,
+    pub(crate) app_id: Option<String>,
+    pub(crate) seat_and_serial: Option<(wl_seat::WlSeat, u32)>,
+    pub(crate) surface: Option<wl_surface::WlSurface>,
+}
+
+impl RequestDataExt for ActivationRequestData {
+    fn app_id(&self) -> Option<&str> {
+        self.app_id.as_deref()
+    }
+
+    fn seat_and_serial(&self) -> Option<(&wl_seat::WlSeat, u32)> {
+        self.seat_and_serial
+            .as_ref()
+            .map(|(s, serial)| (s, *serial))
+    }
+
+    fn surface(&self) -> Option<&wl_surface::WlSurface> {
+        self.surface.as_ref()
+    }
+}
+
 /// Wayland compositor role backing a retained surface.
 pub(crate) enum SurfaceRole {
     Layer(LayerSurface),
     Xdg(Window),
+    Popup(Popup),
 }
 
 impl SurfaceRole {
@@ -25,6 +53,7 @@ impl SurfaceRole {
         match self {
             Self::Layer(l) => l.wl_surface(),
             Self::Xdg(w) => w.wl_surface(),
+            Self::Popup(p) => p.wl_surface(),
         }
     }
 }
@@ -43,6 +72,7 @@ pub(crate) struct LiveWaylandSurface {
     pub(crate) scale: ScaleFactor,
     pub(crate) frame_pending: bool,
     pub(crate) pending_redraw: bool,
+    pub(crate) reposition_token: u32,
     pub(crate) spec: SurfaceSpec,
 }
 
@@ -80,6 +110,10 @@ pub(crate) enum WaylandEvent {
     },
     BufferReleased {
         key: RetainedSurfaceKey,
+    },
+    ActivationToken {
+        request_id: u64,
+        token: String,
     },
     PointerEnter {
         key: RetainedSurfaceKey,

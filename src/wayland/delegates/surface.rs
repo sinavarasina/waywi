@@ -1,5 +1,6 @@
 //! Wayland surface lifecycle, outputs, layer-shell, xdg-window, SHM, and registry delegates.
 
+use smithay_client_toolkit::activation::ActivationHandler;
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -9,6 +10,7 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupConfigure, PopupHandler};
 use smithay_client_toolkit::shell::xdg::window::{Window, WindowConfigure, WindowHandler};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use wayland_client::protocol::{wl_output, wl_surface};
@@ -16,7 +18,7 @@ use wayland_client::{Connection, Proxy, QueueHandle};
 
 use crate::geometry::{LogicalPx, LogicalSize, ScaleFactor};
 use crate::wayland::connection::WaylandState;
-use crate::wayland::surface_state::WaylandEvent;
+use crate::wayland::surface_state::{ActivationRequestData, WaylandEvent};
 
 fn handle_surface_configure(
     state: &mut WaylandState,
@@ -196,6 +198,40 @@ impl WindowHandler for WaylandState {
             configure.new_size.0.map(u32::from),
             configure.new_size.1.map(u32::from),
         );
+    }
+}
+
+impl PopupHandler for WaylandState {
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        popup: &Popup,
+        config: PopupConfigure,
+    ) {
+        handle_surface_configure(
+            self,
+            popup.wl_surface(),
+            u32::try_from(config.width).ok().filter(|&v| v > 0),
+            u32::try_from(config.height).ok().filter(|&v| v > 0),
+        );
+    }
+
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
+        if let Some(&key) = self.surface_by_obj.get(&popup.wl_surface().id()) {
+            self.events.push_back(WaylandEvent::SurfaceClosed { key });
+        }
+    }
+}
+
+impl ActivationHandler for WaylandState {
+    type RequestData = ActivationRequestData;
+
+    fn new_token(&mut self, token: String, data: &Self::RequestData) {
+        self.events.push_back(WaylandEvent::ActivationToken {
+            request_id: data.request_id,
+            token,
+        });
     }
 }
 

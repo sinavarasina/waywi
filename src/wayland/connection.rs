@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
+use smithay_client_toolkit::activation::ActivationState;
 use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::globals::ProvidesBoundGlobal;
 use smithay_client_toolkit::output::OutputState;
@@ -10,7 +11,7 @@ use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shm::Shm;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_touch};
+use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch};
 use wayland_client::{Connection, EventQueue, Proxy, QueueHandle};
 
 #[cfg(feature = "fractional-scale")]
@@ -24,12 +25,16 @@ use crate::error::{Result, WaywiError};
 use crate::geometry::{BufferRect, GeoRect, LogicalSize, ScaleFactor};
 use crate::input::Modifiers;
 use crate::reconcile::{RetainedSurfaceKey, SurfaceSpec};
-use crate::surface::{InputMode, SurfaceKind};
+use crate::surface::{InputMode, SurfaceKey, SurfaceKind};
 use crate::wayland::layer_shell::{apply_layer_spec, create_layer_surface};
 use crate::wayland::output::collect_outputs;
 use crate::wayland::shm_pool::{AcquireSlot, SurfaceShmPool};
-use crate::wayland::surface_state::{LiveWaylandSurface, SurfaceRole, WaylandEvent};
-use crate::wayland::xdg_shell::{apply_xdg_spec, create_xdg_window};
+use crate::wayland::surface_state::{
+    ActivationRequestData, LiveWaylandSurface, SurfaceRole, WaylandEvent,
+};
+use crate::wayland::xdg_shell::{
+    apply_xdg_spec, create_xdg_popup, create_xdg_window, reposition_xdg_popup,
+};
 
 /// Complete SCTK + Wayland protocol state dispatched from `calloop`.
 pub(crate) struct WaylandState {
@@ -40,6 +45,7 @@ pub(crate) struct WaylandState {
     pub(crate) shm: Shm,
     pub(crate) layer_shell: Option<LayerShell>,
     pub(crate) xdg_shell: Option<XdgShell>,
+    pub(crate) activation: Option<ActivationState>,
     #[cfg(feature = "fractional-scale")]
     pub(crate) viewporter: Option<wp_viewporter::WpViewporter>,
     #[cfg(feature = "fractional-scale")]
@@ -64,6 +70,7 @@ pub(crate) struct WaylandState {
     pub(crate) has_pointer: bool,
     pub(crate) has_touch: bool,
     pub(crate) focused_keyboard_surface: Option<RetainedSurfaceKey>,
+    pub(crate) last_input_serial: Option<(wl_seat::WlSeat, u32, wl_surface::WlSurface)>,
     pub(crate) active_touches: HashMap<i32, RetainedSurfaceKey>,
     pub(crate) modifiers: Modifiers,
     pub(crate) keyboard_layouts: Vec<String>,
@@ -86,6 +93,7 @@ impl WaylandState {
             .map_err(|e| WaywiError::WaylandConnection(format!("wl_shm unavailable: {e}")))?;
         let layer_shell = LayerShell::bind(&globals, &qh).ok();
         let xdg_shell = XdgShell::bind(&globals, &qh).ok();
+        let activation = ActivationState::bind(&globals, &qh).ok();
 
         #[cfg(feature = "fractional-scale")]
         let viewporter = globals
@@ -118,6 +126,7 @@ impl WaylandState {
             shm,
             layer_shell,
             xdg_shell,
+            activation,
             #[cfg(feature = "fractional-scale")]
             viewporter,
             #[cfg(feature = "fractional-scale")]
@@ -139,6 +148,7 @@ impl WaylandState {
             has_pointer: false,
             has_touch: false,
             focused_keyboard_surface: None,
+            last_input_serial: None,
             active_touches: HashMap::new(),
             modifiers: Modifiers::empty(),
             keyboard_layouts: Vec::new(),
@@ -211,6 +221,7 @@ impl WaylandState {
         caps.set(Capability::Wayland, true);
         caps.set(Capability::LayerShell, self.layer_shell.is_some());
         caps.set(Capability::XdgShell, self.xdg_shell.is_some());
+        caps.set(Capability::XdgActivation, self.activation.is_some());
         #[cfg(feature = "fractional-scale")]
         {
             caps.set(Capability::Viewporter, self.viewporter.is_some());
@@ -279,6 +290,56 @@ impl WaylandState {
         caps
     }
 
+    /// Requests a Wayland `xdg_activation_v1` focus-handoff token asynchronously.
+    ///
+    /// Returns `false` if the compositor does not advertise `xdg_activation_v1`.
+    pub(crate) fn request_activation_token(
+        &self,
+        qh: &QueueHandle<Self>,
+        request_id: u64,
+        app_id: Option<String>,
+    ) -> bool {
+        let Some(ref activation) = self.activation else {
+            return false;
+        };
+        let (seat_and_serial, surface) = match &self.last_input_serial {
+            Some((seat, serial, surf)) => (Some((seat.clone(), *serial)), Some(surf.clone())),
+            None => {
+                let fallback_surf = self
+                    .focused_keyboard_surface
+                    .and_then(|rk| self.surfaces.get(&rk))
+                    .map(|s| s.role.wl_surface().clone());
+                (None, fallback_surf)
+            }
+        };
+        activation.request_token_with_data(
+            qh,
+            ActivationRequestData {
+                request_id,
+                app_id,
+                seat_and_serial,
+                surface,
+            },
+        );
+        true
+    }
+
+    /// Activates the live Wayland surface matching `surface_key` with `token`.
+    pub(crate) fn activate_surface(&self, surface_key: SurfaceKey, token: String) -> bool {
+        let Some(ref activation) = self.activation else {
+            return false;
+        };
+        let Some((_, surf)) = self
+            .surfaces
+            .iter()
+            .find(|(rk, _)| rk.surface_key == surface_key)
+        else {
+            return false;
+        };
+        activation.activate::<Self>(surf.role.wl_surface(), token);
+        true
+    }
+
     pub(crate) fn create_surface(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -328,6 +389,45 @@ impl WaylandState {
                     .ok_or(WaywiError::UnsupportedCapability(Capability::XdgShell))?;
                 SurfaceRole::Xdg(create_xdg_window(xdg, qh, wl_surface, spec))
             }
+            SurfaceKind::Popup => {
+                let xdg = self
+                    .xdg_shell
+                    .as_ref()
+                    .ok_or(WaywiError::UnsupportedCapability(Capability::XdgShell))?;
+                let popup_spec = spec.popup.ok_or_else(|| {
+                    WaywiError::SurfaceError("SurfaceKind::Popup missing popup spec".to_owned())
+                })?;
+                let exact_parent = RetainedSurfaceKey {
+                    surface_key: popup_spec.parent,
+                    output_id: key.output_id,
+                };
+                let parent_surf = self
+                    .surfaces
+                    .get(&exact_parent)
+                    .or_else(|| {
+                        self.surfaces
+                            .iter()
+                            .find(|(rk, _)| rk.surface_key == popup_spec.parent)
+                            .map(|(_, s)| s)
+                    })
+                    .ok_or_else(|| {
+                        WaywiError::SurfaceError(
+                            "xdg_popup parent surface is not currently mapped".to_owned(),
+                        )
+                    })?;
+                let grab = self
+                    .last_input_serial
+                    .as_ref()
+                    .map(|(seat, serial, _)| (seat, *serial));
+                SurfaceRole::Popup(create_xdg_popup(
+                    xdg,
+                    qh,
+                    wl_surface,
+                    spec,
+                    &parent_surf.role,
+                    grab,
+                )?)
+            }
             SurfaceKind::Panel | SurfaceKind::Floating | SurfaceKind::Overlay => {
                 let layer_shell = self
                     .layer_shell
@@ -359,6 +459,7 @@ impl WaylandState {
                 scale: initial_scale,
                 frame_pending: false,
                 pending_redraw: true,
+                reposition_token: 0,
                 spec: spec.clone(),
             },
         );
@@ -391,6 +492,15 @@ impl WaylandState {
             match &surf.role {
                 SurfaceRole::Layer(layer) => apply_layer_spec(layer, spec),
                 SurfaceRole::Xdg(window) => apply_xdg_spec(window, spec),
+                SurfaceRole::Popup(popup) => {
+                    if (surf.spec.popup != spec.popup
+                        || surf.spec.logical_size != spec.logical_size)
+                        && let Some(ref xdg) = self.xdg_shell
+                    {
+                        surf.reposition_token = surf.reposition_token.wrapping_add(1);
+                        reposition_xdg_popup(xdg, popup, spec, surf.reposition_token)?;
+                    }
+                }
             }
             surf.spec = spec.clone();
             if surf.spec.buffer_retention == crate::surface::BufferRetention::ReleaseAfterCommit
@@ -419,11 +529,21 @@ impl WaylandState {
             if self.focused_keyboard_surface == Some(key) {
                 self.focused_keyboard_surface = None;
             }
+            if self
+                .last_input_serial
+                .as_ref()
+                .is_some_and(|(_, _, s)| s.id() == surf.wl_surface_id)
+            {
+                self.last_input_serial = None;
+            }
             self.active_touches.retain(|_, v| *v != key);
-            // Detach buffer and drop the memfd (without truncating it) before dropping role/surface.
-            let wl = surf.role.wl_surface();
-            wl.attach(None, 0, 0);
-            wl.commit();
+            // Detach buffer for toplevel/layer surfaces before dropping; xdg_popup must be
+            // destroyed directly without attaching a null buffer per xdg-shell protocol rules.
+            if !matches!(surf.role, SurfaceRole::Popup(_)) {
+                let wl = surf.role.wl_surface();
+                wl.attach(None, 0, 0);
+                wl.commit();
+            }
             surf.pool.shrink_and_unmap();
         }
     }

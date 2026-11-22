@@ -14,6 +14,7 @@ pub mod modem;
 pub mod mpris;
 pub mod network_manager;
 pub mod notifications;
+pub mod portal_settings;
 pub mod power_profiles;
 pub mod tray;
 pub mod types;
@@ -54,6 +55,10 @@ pub(crate) use notifications::NotificationServerWorker;
 pub use notifications::{
     DesktopNotification, NotificationCapabilities, NotificationCloseReason, NotificationEvent,
     NotificationImageData, NotificationUrgency,
+};
+pub(crate) use portal_settings::spawn_portal_settings_worker;
+pub use portal_settings::{
+    PortalAccentColor, PortalColorScheme, PortalContrast, PortalSettingsSnapshot,
 };
 pub(crate) use power_profiles::PowerProfilesWorker;
 pub use power_profiles::{PowerProfileHold, PowerProfileKind, PowerProfileSnapshot};

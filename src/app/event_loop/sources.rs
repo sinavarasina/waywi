@@ -177,6 +177,11 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         );
         fanout_broadcast(
             &rt.inbox,
+            |inbox| inbox.dbus_portal_settings.drain(..).collect(),
+            &rt.sub_mgr.dbus_portal_settings_subs,
+        );
+        fanout_broadcast(
+            &rt.inbox,
             |inbox| inbox.dbus_mpris.drain(..).collect(),
             &rt.sub_mgr.dbus_mpris_subs,
         );

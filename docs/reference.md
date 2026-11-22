@@ -28,14 +28,14 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `RendererPreference` (`render::backend`): `Auto`, `Software`, `Gpu`.
 - `HeadlessRuntime<A: Application>` (`app::headless`):
   - Constructors: `new(capabilities, outputs)`, `new_with_renderer(...)`.
-  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_surface_configure(...)`.
-  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `arena_heap_fallbacks()`, `asset_pixels_resident(asset)`, `decoded_asset_bytes()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
+  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_popup_dismiss(...)`, `simulate_surface_configure(...)`.
+  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `activated_surfaces()`, `arena_heap_fallbacks()`, `asset_pixels_resident(asset)`, `decoded_asset_bytes()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
 
 ## Effects (`effect`)
 
 `EffectCtx<'a>` (`effect::context`) is passed into `Application::init` and `Application::update`:
 
-- **Lifecycle & runtime**: `quit()`, `capabilities() -> &Capabilities`, `outputs() -> &[OutputInfo]`, `after<M>(delay, make)` (`M: Send + 'static`), `system() -> &mut SystemProviders`.
+- **Lifecycle & runtime**: `quit()`, `capabilities() -> &Capabilities`, `outputs() -> &[OutputInfo]`, `after<M>(delay, make)` (`M: Send + 'static`), `request_activation_token<M>(app_id, map)` (`xdg-activation-v1`), `activate_surface(surface_key, token)` (`xdg-activation-v1`), `system() -> &mut SystemProviders`.
 - **Image & sprite assets**: `load_image(path)`, `load_image_sized(path, min_svg_px)`, `load_image_bytes(bytes)`, `load_image_bytes_sized(bytes, min_svg_px)`, `load_rgba_image(width, height, stride, pixels)`, `load_image_async(source, map)`, `set_asset_retention(asset, retention) -> bool`, `asset_retention(asset) -> Option<AssetRetention>`, `evict_asset_pixels(asset) -> bool`, `reload_asset(asset, path)`, `unload_asset(asset) -> bool`.
 - **Audio (`audio` / `audio-playback`)**: `audio() -> Result<&AudioClient>`, `player() -> Result<&AudioPlayer>`, `load_sound(path)`, `load_sound_bytes(bytes)`, `load_sound_preset(preset)`, `load_system_sound(name)`, `play_sound(sound)`, `play_sound_volume(sound, volume)`, `play_sound_preset(preset, volume)`, `play_system_sound(name, volume)`, `stop_sounds()`.
 - **Compositors**: `hyprland()` (`hyprland-ipc`), `sway()` (`sway-ipc`), `compositor() -> Result<CompositorClient<'_>>`.
@@ -48,7 +48,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `Result<T>`: `std::result::Result<T, WaywiError>`.
 - `ErrorKind`: `NotAvailable`, `NotSupported`, `TemporarilyUnavailable`, `PermissionDenied`, `OperationFailed`, `InvalidState`, `Timeout`, `Shutdown`.
 - `WaywiError` (`.kind(&self) -> ErrorKind`): `WaylandConnection`, `UnsupportedCapability(Capability)`, `OutputUnavailable`, `SurfaceError`, `RenderError`, `AssetDecode`, `UnsupportedAssetFormat`, `ProviderUnavailable`, `PermissionDenied`, `IpcError`, `DbusError`, `AudioError`, `InvalidGeometry`, `InvalidState`, `Timeout`, `Io(std::io::Error)`, `Shutdown`, `Custom`.
-- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `TextInput`, `KeyboardLayout`.
+- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `XdgActivation`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `TextInput`, `KeyboardLayout`.
 - `Capabilities`: `new()`, `from_compile_features()`, `has(cap)`, `set(cap, enabled)`, `require(cap) -> Result<()>`, `iter()`.
 
 ## Geometry & Units (`geometry`)
@@ -81,10 +81,11 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `KeyboardInteractivity`: `None`, `OnDemand`, `Exclusive`.
 - `InputMode`: `Full`, `Selective`, `PassThrough`.
 - `BufferRetention`: `Retain`, `ReleaseAfterCommit`.
-- `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`.
+- `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`, `Popup`.
+- Popup positioning (`surface::types`): `PopupAnchor` (`None`, `Top`, `Bottom`, `Left`, `Right`, `TopLeft`, `BottomLeft`, `TopRight`, `BottomRight`), `PopupGravity` (`None`, `Top`, `Bottom`, `Left`, `Right`, `TopLeft`, `BottomLeft`, `TopRight`, `BottomRight`), `PopupConstraintAdjustment` (`SLIDE_X`, `SLIDE_Y`, `FLIP_X`, `FLIP_Y`, `RESIZE_X`, `RESIZE_Y`), `PopupPositioner` (`new(anchor_rect)`, `anchor`, `gravity`, `offset`, `constraint_adjustment`, `reactive`).
 - `Surface<M>` (`surface::builder`):
-  - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::memo(key, dep, build)`.
-  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.buffer_retention`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
+  - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::popup(key, parent_surface)`, `Surface::memo(key, dep, build)`.
+  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.buffer_retention`, `.output`, `.positioner`, `.anchor_rect`, `.popup_anchor`, `.popup_gravity`, `.popup_offset`, `.popup_constraints`, `.popup_reactive`, `.popup_grab`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.map`.
 - `Surfaces<M>` (`surface::collection`): `new()`, `push(surface)`, `extend(surfaces)`, `len()`, `is_empty()`, `map(f)`.
 - `OutputId(pub u64)` (`new`, `get`), `Output` (`primary()`, `named(name)`, `id(OutputId)`, `all()`), `OutputInfo`, `Transform`, `resolve_outputs`, `select_primary_output`.
 
@@ -173,10 +174,12 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 
 ## Desktop Utilities (`desktop`)
 
-- `DesktopEntry`: `exec_argv()`, `try_exec_available()`, `should_show_in_launcher()`, `terminal_argv(terminal)`, `launch()`, `launch_detached()`, `launch_with_terminal(terminal)`.
+- `DesktopEntry` (`dbus_activatable`, `actions: Vec<DesktopAction>`): `exec_argv()`, `try_exec_available()`, `should_show_in_launcher()`, `dbus_service_name()`, `dbus_object_path()`, `action(id)`, `terminal_argv(terminal)`, `launch()`, `launch_detached()`, `launch_with_token(token)`, `launch_with_terminal(terminal)`, `launch_with_terminal_and_token(terminal, token)`, `launch_action(action_id, token)`.
+- `DesktopAction` (`[Desktop Action <id>]`): `id`, `name`, `icon`, `exec`, `exec_argv()`, `launch_detached()`, `launch_with_token(token)`.
 - Entry discovery & search: `default_application_dirs()`, `scan_desktop_entries()`, `scan_desktop_entries_in(dirs)`, `filter_launcher_entries(entries)`, `DesktopSearchMatch`, `search_desktop_entries(entries, query)`, `search_desktop_entries_with_weights(entries, query, launch_counts)`, `find_desktop_entry(id_or_wm_class)`, `parse_desktop_entry(contents, id, path)`.
+- XDG Base & User Directories (`desktop::xdg`): `XdgBaseDirs` (`from_env`, `from_lookup`, `all_config_dirs`, `all_data_dirs`, `find_config_file`, `find_data_file`), `XdgUserDirs` (`load`, `parse`), and helpers `xdg_config_home`, `xdg_config_dirs`, `xdg_data_home`, `xdg_data_dirs`, `xdg_cache_home`, `xdg_state_home`, `xdg_runtime_dir`.
 - Icons (`desktop::icons`): `IconDirSpec`, `IconThemeInfo`, `XdgIconLookup` (`new`, `with_dirs`, `resolve`), `resolve_icon_path`, `default_icon_dirs`, `detect_active_icon_theme`, `parse_icon_theme_index`.
-- Process execution: `spawn_detached(program, args)`, `spawn_detached_in(program, args, working_dir)`, `spawn_shell_detached(command)`.
+- Process execution: `spawn_detached(program, args)`, `spawn_detached_in(program, args, working_dir)`, `spawn_detached_with_env(program, args, working_dir, extra_env)`, `spawn_shell_detached(command)`.
 
 ## Audio (`audio`)
 
@@ -222,4 +225,5 @@ Available when the `dbus` Cargo feature is enabled (`global_shortcuts` also expo
 - **Bluetooth (`bluetooth`)**: `BluetoothAdapter`, `BluetoothDevice`, `BluetoothSnapshot`, `BluetoothTransportFilter` (`Auto`, `BrEdr`, `Le`; `as_str`), `BluetoothAgentRequest` (`RequestPinCode`, `DisplayPinCode`, `RequestPasskey`, `DisplayPasskey`, `RequestConfirmation`, `RequestAuthorization`, `AuthorizeService`), `BluetoothAgentEvent` (`Registered`, `Request`, `Cancelled`, `Released`, `Error`), `Dbus::{bluetooth, bluetooth_agent}`, `DbusClient::{bluetooth_snapshot, set_bluetooth_powered, set_bluetooth_discoverable, set_bluetooth_discoverable_timeout, set_bluetooth_pairable, set_bluetooth_pairable_timeout, set_bluetooth_adapter_alias, set_bluetooth_discovery_filter, start_bluetooth_discovery, stop_bluetooth_discovery, connect_bluetooth_device, connect_bluetooth_device_profile, disconnect_bluetooth_device, disconnect_bluetooth_device_profile, pair_bluetooth_device, cancel_bluetooth_pairing, trust_bluetooth_device, block_bluetooth_device, set_bluetooth_device_alias, remove_bluetooth_device, bluetooth_agent_confirm, bluetooth_agent_reply_pincode, bluetooth_agent_reply_passkey, bluetooth_agent_reject}`.
 - **ModemManager (`modem`)**: `ModemState`, `ModemAccessTech`, `ModemRegistrationState`, `ModemInfo`, `ModemSnapshot`, `Dbus::modem`, `DbusClient::{modem_snapshot, enable_modem}`, `decode_access_tech_bitmask`.
 - **ScreenSaver & GeoClue2 (`idle_privacy`)**: `ScreenSaverSnapshot`, `GeoClueSnapshot`, `Dbus::{screensaver, geoclue}`, `DbusClient::{screensaver_active, lock_screensaver, inhibit_screensaver, uninhibit_screensaver, geoclue_in_use}`.
+- **Portal Settings (`portal_settings`)**: `PortalColorScheme` (`NoPreference`, `PreferDark`, `PreferLight`; `from_portal_u32`), `PortalContrast` (`NoPreference`, `High`; `from_portal_u32`), `PortalAccentColor` (`r`, `g`, `b`; `from_rgb_f64`, `to_color`), `PortalSettingsSnapshot`, `Dbus::portal_settings`, `DbusClient::{portal_settings_snapshot, portal_setting}`.
 - **Global Shortcuts (`global_shortcuts`, feature `global-shortcuts`)**: `GlobalShortcutDescriptor` (`new`, `preferred_trigger`), `BoundGlobalShortcut`, `GlobalShortcutEvent`, `GlobalShortcuts::subscribe`, `Dbus::global_shortcuts`, `DbusClient::has_global_shortcuts_portal`.

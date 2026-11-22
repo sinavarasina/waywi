@@ -6,9 +6,12 @@ use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
 use crate::error::{Result, WaywiError};
 use crate::image::ImageAsset;
+use crate::surface::{IntoSurfaceKey, SurfaceKey};
 use crate::system::{PrivacySnapshot, SystemProviders};
 
-use super::worker::{AsyncAssetWorker, BoxedAssetCallback, BoxedMsgFactory};
+use super::worker::{
+    AsyncAssetWorker, BoxedActivationCallback, BoxedAssetCallback, BoxedMsgFactory,
+};
 
 #[cfg(feature = "clipboard")]
 pub(crate) type ClipboardSetter<'a> =
@@ -35,6 +38,8 @@ pub struct EffectCtx<'a> {
     pub(crate) system: &'a mut SystemProviders,
     pub(crate) pending_after: &'a mut Vec<(Duration, BoxedMsgFactory)>,
     pub(crate) reloaded_assets: &'a mut Vec<(AssetId, u64)>,
+    pub(crate) pending_activation_requests: &'a mut Vec<(Option<String>, BoxedActivationCallback)>,
+    pub(crate) pending_surface_activations: &'a mut Vec<(SurfaceKey, String)>,
 
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     pub(crate) audio: &'a crate::audio::AudioClient,
@@ -200,6 +205,46 @@ impl<'a> EffectCtx<'a> {
     ) {
         self.pending_after
             .push((delay, Box::new(move || Box::new(make_msg()))));
+    }
+
+    /// Requests a Wayland `xdg_activation_v1` focus-handoff token asynchronously (non-blocking).
+    ///
+    /// When the compositor issues the token, `map(Ok(token))` is delivered to
+    /// [`Application::update`](crate::app::Application::update), where it can be passed to
+    /// [`DesktopEntry::launch_with_token`](crate::desktop::DesktopEntry::launch_with_token) or
+    /// [`Self::activate_surface`]. If the compositor does not advertise `xdg_activation_v1`,
+    /// `map(Err(WaywiError::UnsupportedCapability(Capability::XdgActivation)))` is delivered.
+    pub fn request_activation_token<M: Send + 'static>(
+        &mut self,
+        app_id: Option<&str>,
+        map: impl FnOnce(Result<String>) -> M + Send + 'static,
+    ) {
+        let app_id = app_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        self.pending_activation_requests
+            .push((app_id, Box::new(move |res| Box::new(map(res)))));
+    }
+
+    /// Requests compositor activation/focus for a live WayWi surface using a Wayland
+    /// `xdg_activation_v1` token (e.g. received from another client or
+    /// [`Self::request_activation_token`]).
+    pub fn activate_surface(
+        &mut self,
+        surface_key: impl IntoSurfaceKey,
+        token: impl Into<String>,
+    ) -> Result<()> {
+        self.capabilities.require(Capability::XdgActivation)?;
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(WaywiError::InvalidState(
+                "xdg_activation_v1 token must not be empty".to_owned(),
+            ));
+        }
+        self.pending_surface_activations
+            .push((surface_key.into_surface_key(), token));
+        Ok(())
     }
 
     /// Accesses the active audio control handle (`set_volume_linear`, `toggle_mute`, etc.).

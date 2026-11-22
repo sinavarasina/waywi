@@ -13,6 +13,42 @@ use super::super::runner::Application;
 use super::super::subscription_mgr::{SubscriptionClients, flatten_specs};
 use super::LoopRuntime;
 
+/// Orders `keys` so child `xdg_popup` surfaces are always destroyed before their parent surfaces,
+/// including nested popup chains (`submenu -> menu -> parent`).
+fn order_keys_children_first(
+    wl: &WaylandState,
+    keys: &[RetainedSurfaceKey],
+) -> Vec<RetainedSurfaceKey> {
+    let mut remaining: Vec<RetainedSurfaceKey> = keys.to_vec();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let mut next = Vec::new();
+        let mut progressed = false;
+        for &rk in &remaining {
+            let has_live_child_in_set = remaining.iter().any(|&other| {
+                other != rk
+                    && wl
+                        .surfaces
+                        .get(&other)
+                        .and_then(|s| s.spec.popup.as_ref())
+                        .is_some_and(|p| p.parent == rk.surface_key)
+            });
+            if has_live_child_in_set {
+                next.push(rk);
+            } else {
+                ordered.push(rk);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            ordered.extend(next);
+            break;
+        }
+        remaining = next;
+    }
+    ordered
+}
+
 /// Phase 4: synchronize the view tree, retained Wayland surfaces, and subscriptions.
 pub(crate) fn sync_view_and_subscriptions<A: Application>(
     rt: &mut LoopRuntime<A::Message>,
@@ -81,16 +117,43 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
     };
     rt.memo_store.prune_stale();
 
-    for rk in &report.removed_surfaces {
-        wl.destroy_surface(*rk);
-        rt.renderer.drop_surface_target(*rk);
-        rt.configured_sizes.remove(rk);
-        rt.surface_scales.remove(rk);
+    // Destroy xdg_popup surfaces before parent surfaces per Wayland xdg_shell ordering rules.
+    for rk in order_keys_children_first(wl, &report.removed_surfaces) {
+        wl.destroy_surface(rk);
+        rt.renderer.drop_surface_target(rk);
+        rt.configured_sizes.remove(&rk);
+        rt.surface_scales.remove(&rk);
     }
-    for rk in &report.created_surfaces {
-        if let Some(surf) = rt.reconciler.surfaces.get(rk) {
-            wl.create_surface(&rt.qh, *rk, &surf.spec)?;
+    // Create parent surfaces before child xdg_popup surfaces (supporting nested popups).
+    let mut pending_create: Vec<RetainedSurfaceKey> = report.created_surfaces.clone();
+    while !pending_create.is_empty() {
+        let mut deferred = Vec::new();
+        let mut progressed = false;
+        for rk in pending_create {
+            let Some(surf) = rt.reconciler.surfaces.get(&rk) else {
+                continue;
+            };
+            let waiting_on_parent = surf
+                .spec
+                .popup
+                .as_ref()
+                .is_some_and(|p| !wl.surfaces.keys().any(|live| live.surface_key == p.parent));
+            if waiting_on_parent {
+                deferred.push(rk);
+            } else {
+                wl.create_surface(&rt.qh, rk, &surf.spec)?;
+                progressed = true;
+            }
         }
+        if !progressed {
+            for rk in deferred {
+                if let Some(surf) = rt.reconciler.surfaces.get(&rk) {
+                    wl.create_surface(&rt.qh, rk, &surf.spec)?;
+                }
+            }
+            break;
+        }
+        pending_create = deferred;
     }
     for rk in &report.updated_surfaces {
         if let Some(surf) = rt.reconciler.surfaces.get(rk) {
@@ -215,14 +278,14 @@ pub(crate) fn compute_wakeup_timeout<M: Clone + 'static>(
         .map(|dl| dl.saturating_duration_since(now_sleep))
 }
 
-/// Graceful teardown: destroy all mapped surfaces, clean up subscriptions, and flush Wayland.
+/// Graceful teardown: destroy all mapped surfaces (popups first), clean up subscriptions, and flush Wayland.
 pub(crate) fn shutdown_surfaces<M: Clone + 'static>(
     rt: &mut LoopRuntime<M>,
     wl: &mut WaylandState,
     conn: &Connection,
 ) {
     let active_keys: Vec<RetainedSurfaceKey> = wl.surfaces.keys().copied().collect();
-    for rk in active_keys {
+    for rk in order_keys_children_first(wl, &active_keys) {
         wl.destroy_surface(rk);
     }
     rt.sub_mgr.cleanup(&rt.loop_handle);

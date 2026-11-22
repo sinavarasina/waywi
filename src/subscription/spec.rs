@@ -185,6 +185,11 @@ pub(crate) enum SubscriptionSpec<M> {
         map: FrameSharedFn<crate::dbus::GeoClueSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
+    DbusPortalSettings {
+        key: SubscriptionKey,
+        map: FrameSharedFn<crate::dbus::PortalSettingsSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
     DbusMpris {
         key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::MprisEvent, M>,
@@ -385,6 +390,8 @@ impl<M: 'static> Subscription<M> {
             DbusScreenSaver { key },
             #[cfg(feature = "dbus")]
             DbusGeoClue { key },
+            #[cfg(feature = "dbus")]
+            DbusPortalSettings { key },
             #[cfg(feature = "dbus")]
             DbusMpris { key },
             #[cfg(feature = "dbus")]

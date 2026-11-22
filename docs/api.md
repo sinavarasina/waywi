@@ -7,7 +7,7 @@ Core types are re-exported from `waywi::prelude::*`.
 Implement `Application`:
 
 - `init(ctx: &mut EffectCtx<'_>) -> Result<Self::State>`: runs after Wayland connection and `Capabilities` probing.
-- `update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()>`: mutates state and triggers imperative actions (`ctx.quit()`, `ctx.after(...)`, asset loading, `ctx.system()`, `ctx.audio()`, `ctx.hyprland()`, `ctx.sway()`, `ctx.compositor()`, `ctx.dbus()`).
+- `update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()>`: mutates state and triggers imperative actions (`ctx.quit()`, `ctx.after(...)`, `ctx.request_activation_token(...)`, `ctx.activate_surface(...)`, asset loading, `ctx.system()`, `ctx.audio()`, `ctx.hyprland()`, `ctx.sway()`, `ctx.compositor()`, `ctx.dbus()`).
 - `view(state: &Self::State) -> Surfaces<Self::Message>`: returns surface definitions for the current state.
 - `subscriptions(state: &Self::State) -> Subscriptions<Self::Message>`: lists active timers, system samplers, and protocol/IPC streams. Unlisted keys stop automatically.
 
@@ -22,7 +22,7 @@ Implement `Application`:
 
 ## Surfaces & Elements
 
-- Surfaces: `Surface::floating` (widget bounds), `Surface::panel` (edge-anchored with `.exclusive_zone(...)`), `Surface::overlay` (full-output layer), `Surface::window` (`xdg_toplevel`), `Surface::memo`, with `.buffer_retention(BufferRetention::Retain | ReleaseAfterCommit)` for static surfaces.
+- Surfaces: `Surface::floating` (widget bounds), `Surface::panel` (edge-anchored with `.exclusive_zone(...)`), `Surface::overlay` (full-output layer), `Surface::window` (`xdg_toplevel`), `Surface::popup` (`xdg_popup` + `xdg_positioner` attached to layer-shell, window, or nested popup parents), `Surface::memo`, with `.buffer_retention(BufferRetention::Retain | ReleaseAfterCommit)` for static surfaces.
 - Containers & primitives: `Row`, `Column`, `Group`, `Clip`, `Rect`, `Text` (with `.bounds_mode(TextBoundsMode::Typographic | Optical)` / `.optical_bounds(...)`), `Image` (with `.source_rect`, `.region`, `.flip_x`, `.flip_y`, `.filter`), `Sprite` (with `SpriteSheet` grids/regions, timed/sequence/range frames, `.on_animation_end`), `Canvas`, `Element::memo`.
 - Event hooks: `.on_click(...)`, `.on_hover(...)`, `.on_leave(...)`, `.on_scroll(...)`, `.on_pointer_down(...)`, `.on_pointer_up(...)`, `.on_pointer_move(...)`, `.on_key(...)`, `.ime(...)` / `.on_ime(...)`, plus optional `.on_click_sound(...)` / `.on_hover_sound(...)`, and headless `TextInputState` / `ScrollState` controllers (pairable with `ctx.measure_text_cursor(...)` for proportional cursor placement).
 - Accessibility hooks: `.accessible_role(...)`, `.accessible_label(...)`, `.accessible_description(...)`, `.accessible_value(...)`, `.accessible_hidden(...)`.

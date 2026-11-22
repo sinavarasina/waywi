@@ -41,6 +41,8 @@ pub struct HeadlessRuntime<A: Application> {
     inbox: VecDeque<A::Message>,
     quit_requested: bool,
     frame_buffers: HashMap<RetainedSurfaceKey, Vec<u8>>,
+    activation_seq: u64,
+    activated_surfaces: Vec<(crate::surface::SurfaceKey, String)>,
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     audio: crate::audio::AudioClient,
     #[cfg(any(
@@ -84,6 +86,8 @@ impl<A: Application> HeadlessRuntime<A> {
         let mut quit_requested = false;
         let mut pending_after = Vec::new();
         let mut reloaded_assets = Vec::new();
+        let mut pending_activation_requests = Vec::new();
+        let mut pending_surface_activations = Vec::new();
 
         #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
         let audio = crate::audio::AudioClient::new();
@@ -118,6 +122,8 @@ impl<A: Application> HeadlessRuntime<A> {
                 system: &mut system,
                 pending_after: &mut pending_after,
                 reloaded_assets: &mut reloaded_assets,
+                pending_activation_requests: &mut pending_activation_requests,
+                pending_surface_activations: &mut pending_surface_activations,
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 audio: &audio,
                 #[cfg(any(
@@ -166,6 +172,8 @@ impl<A: Application> HeadlessRuntime<A> {
             inbox: VecDeque::new(),
             quit_requested,
             frame_buffers: HashMap::new(),
+            activation_seq: 0,
+            activated_surfaces: Vec::new(),
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
             audio,
             #[cfg(any(
@@ -184,8 +192,35 @@ impl<A: Application> HeadlessRuntime<A> {
             #[cfg(feature = "accessibility")]
             a11y_tree_state: crate::accessibility::AccessibilityTreeState::default(),
         };
+        rt.drain_activation_effects(pending_activation_requests, pending_surface_activations);
         rt.step_at(now)?;
         Ok(rt)
+    }
+
+    fn drain_activation_effects(
+        &mut self,
+        requests: Vec<(Option<String>, crate::effect::BoxedActivationCallback)>,
+        activations: Vec<(crate::surface::SurfaceKey, String)>,
+    ) {
+        let supported = self
+            .capabilities
+            .has(crate::capabilities::Capability::XdgActivation);
+        for (_app_id, callback) in requests {
+            let result = if supported {
+                self.activation_seq = self.activation_seq.saturating_add(1);
+                Ok(format!("headless-activation-token-{}", self.activation_seq))
+            } else {
+                Err(crate::error::WaywiError::UnsupportedCapability(
+                    crate::capabilities::Capability::XdgActivation,
+                ))
+            };
+            if let Ok(msg) = callback(result).downcast::<A::Message>() {
+                self.inbox.push_back(*msg);
+            }
+        }
+        if supported {
+            self.activated_surfaces.extend(activations);
+        }
     }
 
     pub fn enqueue(&mut self, msg: A::Message) {
@@ -211,6 +246,8 @@ impl<A: Application> HeadlessRuntime<A> {
         while let Some(msg) = self.inbox.pop_front() {
             let mut pending_after = Vec::new();
             let mut reloaded_assets = Vec::new();
+            let mut pending_activation_requests = Vec::new();
+            let mut pending_surface_activations = Vec::new();
             #[cfg(feature = "text")]
             let frame_seq = self.reconciler.frame_seq;
             #[cfg(feature = "text")]
@@ -229,6 +266,8 @@ impl<A: Application> HeadlessRuntime<A> {
                 system: &mut self.system,
                 pending_after: &mut pending_after,
                 reloaded_assets: &mut reloaded_assets,
+                pending_activation_requests: &mut pending_activation_requests,
+                pending_surface_activations: &mut pending_surface_activations,
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 audio: &self.audio,
                 #[cfg(any(
@@ -258,6 +297,7 @@ impl<A: Application> HeadlessRuntime<A> {
             for (aid, rev) in reloaded_assets {
                 self.reconciler.invalidate_asset(aid, rev);
             }
+            self.drain_activation_effects(pending_activation_requests, pending_surface_activations);
         }
 
         let _arena_guard = self.arena.enter_scope();
@@ -589,6 +629,33 @@ impl<A: Application> HeadlessRuntime<A> {
     ) -> Option<LogicalSize> {
         self.surface_by_key(surface_key)
             .map(|s| s.effective_logical_size())
+    }
+
+    /// Simulates a compositor `xdg_popup.popup_done` dismissal on a popup surface, firing its
+    /// `on_close` message without requesting application exit.
+    pub fn simulate_popup_dismiss(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> bool {
+        let Some(surf) = self.surface_by_key(surface_key) else {
+            return false;
+        };
+        if surf.spec.kind != crate::surface::SurfaceKind::Popup {
+            return false;
+        }
+        if let Some(msg) = surf.on_close.clone() {
+            self.inbox.push_back(msg);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns all `(SurfaceKey, token)` pairs recorded via [`EffectCtx::activate_surface`] when
+    /// [`Capability::XdgActivation`](crate::capabilities::Capability::XdgActivation) is enabled.
+    #[must_use]
+    pub fn activated_surfaces(&self) -> &[(crate::surface::SurfaceKey, String)] {
+        &self.activated_surfaces
     }
 
     /// Simulates a compositor `configure` event updating `configured_sizes` for a surface.

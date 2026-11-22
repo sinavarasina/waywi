@@ -1,14 +1,14 @@
 use crate::accessibility::{AccessibleProps, AccessibleRole};
 use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
-use crate::geometry::{Edges, Length, LogicalPx, Size};
+use crate::geometry::{Edges, Length, LogicalPx, Rect as GeoRect, Size};
 use crate::input::{ElementKey, ImeConfig, ImeEvent, KeyEvent, PointerEvent};
 use crate::render::{Color, Element, check_memo, set_memo_surface_hash};
 use crate::text::SharedStr;
 
 use super::types::{
-    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, SurfaceKey,
-    SurfaceKind,
+    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, PopupAnchor,
+    PopupConstraintAdjustment, PopupGravity, PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind,
 };
 
 /// Wayland surface specification returned from `view(state)`.
@@ -26,6 +26,7 @@ pub struct Surface<M = ()> {
     pub(crate) keyboard_interactivity: KeyboardInteractivity,
     pub(crate) input_mode: InputMode,
     pub(crate) buffer_retention: BufferRetention,
+    pub(crate) popup: Option<PopupSpec>,
     pub(crate) visible: bool,
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
@@ -69,6 +70,12 @@ impl<M: 'static> Surface<M> {
                 InputMode::Full,
                 Layer::Top,
             ),
+            SurfaceKind::Popup => (
+                Anchor::empty(),
+                Size::px(LogicalPx(200.0), LogicalPx(120.0)),
+                InputMode::Full,
+                Layer::Overlay,
+            ),
         };
         Self {
             key,
@@ -82,6 +89,7 @@ impl<M: 'static> Surface<M> {
             keyboard_interactivity: KeyboardInteractivity::None,
             input_mode,
             buffer_retention: BufferRetention::Retain,
+            popup: None,
             visible: true,
             background: Color::TRANSPARENT,
             title: SharedStr::from_static("waywi"),
@@ -121,6 +129,96 @@ impl<M: 'static> Surface<M> {
     /// Intended as an honest fallback when `Capability::LayerShell` is unavailable.
     pub fn window(key: impl IntoSurfaceKey) -> Self {
         Self::new_base(key.into_surface_key(), SurfaceKind::Window, Output::Primary)
+    }
+
+    /// Declares a compositor-positioned XDG popup (`xdg_popup` + `xdg_positioner`) attached to
+    /// `parent_surface` (which may be a layer-shell panel/floating/overlay surface via
+    /// `zwlr_layer_surface_v1.get_popup`, an `xdg_toplevel` window, or another `xdg_popup`).
+    ///
+    /// By default, `popup_grab` is `true` so clicking outside or pressing `Escape` causes the
+    /// compositor to send `xdg_popup.popup_done` and trigger [`Self::on_close`].
+    pub fn popup(key: impl IntoSurfaceKey, parent_surface: impl IntoSurfaceKey) -> Self {
+        let mut surf = Self::new_base(key.into_surface_key(), SurfaceKind::Popup, Output::Primary);
+        surf.popup = Some(PopupSpec {
+            parent: parent_surface.into_surface_key(),
+            positioner: PopupPositioner::default(),
+            grab: true,
+            desired_size: None,
+        });
+        surf
+    }
+
+    /// Targets a specific output when matching a multi-output parent surface for [`Self::popup`].
+    pub fn output(mut self, output: Output) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// Replaces the full [`PopupPositioner`] for a [`Self::popup`] surface.
+    pub fn positioner(mut self, positioner: PopupPositioner) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner = positioner;
+        }
+        self
+    }
+
+    /// Sets the parent-local logical anchor rectangle for a [`Self::popup`] surface.
+    pub fn anchor_rect(mut self, rect: GeoRect) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.anchor_rect = rect;
+        }
+        self
+    }
+
+    /// Sets the anchor point on the parent anchor rectangle for a [`Self::popup`] surface.
+    pub fn popup_anchor(mut self, anchor: PopupAnchor) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.anchor = anchor;
+        }
+        self
+    }
+
+    /// Sets the growth gravity direction for a [`Self::popup`] surface.
+    pub fn popup_gravity(mut self, gravity: PopupGravity) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.gravity = gravity;
+        }
+        self
+    }
+
+    /// Sets the logical `(dx, dy)` offset for a [`Self::popup`] surface.
+    pub fn popup_offset(mut self, dx: LogicalPx, dy: LogicalPx) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.offset_x = dx;
+            spec.positioner.offset_y = dy;
+        }
+        self
+    }
+
+    /// Sets compositor edge constraint-adjustment flags (`FLIP`/`SLIDE`/`RESIZE`) for a
+    /// [`Self::popup`] surface.
+    pub fn popup_constraints(mut self, flags: PopupConstraintAdjustment) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.constraint_adjustment = flags;
+        }
+        self
+    }
+
+    /// Enables or disables `xdg_positioner.set_reactive` on a [`Self::popup`] surface.
+    pub fn popup_reactive(mut self, reactive: bool) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.positioner.reactive = reactive;
+        }
+        self
+    }
+
+    /// Controls whether a [`Self::popup`] surface requests an implicit compositor grab
+    /// (`xdg_popup.grab`) using the most recent seat input serial (default `true`).
+    pub fn popup_grab(mut self, grab: bool) -> Self {
+        if let Some(ref mut spec) = self.popup {
+            spec.grab = grab;
+        }
+        self
     }
 
     /// Keyed surface memoization boundary.
@@ -334,6 +432,7 @@ impl<M: 'static> Surface<M> {
             keyboard_interactivity: self.keyboard_interactivity,
             input_mode: self.input_mode,
             buffer_retention: self.buffer_retention,
+            popup: self.popup,
             visible: self.visible,
             background: self.background,
             title: self.title,

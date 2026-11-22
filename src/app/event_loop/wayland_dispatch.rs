@@ -6,6 +6,7 @@ use crate::app::subscription_mgr::LoopInbox;
 use crate::geometry::{LogicalPx, Point};
 use crate::input::{Key, KeyEvent, Modifiers, MouseButton, ScrollEvent};
 use crate::reconcile::{PointerDispatch, RetainedSurfaceKey};
+use crate::render::RenderBackend;
 use crate::wayland::{WaylandEvent, WaylandState};
 
 use super::LoopRuntime;
@@ -178,12 +179,30 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceClosed { key } => {
+                let is_popup = rt
+                    .reconciler
+                    .surfaces
+                    .get(&key)
+                    .is_some_and(|s| s.spec.kind == crate::surface::SurfaceKind::Popup);
+                if is_popup {
+                    wl.destroy_surface(key);
+                    rt.renderer.drop_surface_target(key);
+                    rt.configured_sizes.remove(&key);
+                    rt.surface_scales.remove(&key);
+                }
                 if let Some(surf) = rt.reconciler.surfaces.get(&key)
                     && let Some(msg) = &surf.on_close
                 {
                     push_message(&rt.inbox, msg.clone());
-                } else {
+                } else if !is_popup {
                     rt.quit_requested = true;
+                }
+            }
+            WaylandEvent::ActivationToken { request_id, token } => {
+                if let Some(cb) = rt.pending_activation_callbacks.remove(&request_id)
+                    && let Ok(msg) = cb(Ok(token)).downcast::<M>()
+                {
+                    push_message(&rt.inbox, *msg);
                 }
             }
             WaylandEvent::SurfaceFrame { key } => {

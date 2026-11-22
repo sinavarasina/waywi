@@ -10,8 +10,10 @@ pub enum Capability {
     Wayland,
     /// `zwlr_layer_shell_v1` protocol for panels, compact floating surfaces, and overlays.
     LayerShell,
-    /// `xdg_wm_base` protocol for explicit fallback toplevel windows.
+    /// `xdg_wm_base` protocol for explicit fallback toplevel windows and `xdg_popup` menus.
     XdgShell,
+    /// `xdg_activation_v1` protocol for Wayland focus-handoff activation tokens.
+    XdgActivation,
     /// `wp_fractional_scale_v1` + `wp_viewporter` fractional scaling support.
     FractionalScale,
     /// `wp_viewporter` destination scaling support.

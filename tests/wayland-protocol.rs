@@ -1,8 +1,6 @@
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-#[cfg(feature = "ime")]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wayland_client::Connection;
@@ -10,8 +8,11 @@ use wayland_client::Connection;
 use wayland_protocols::wp::text_input::zv3::server::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
-#[cfg(feature = "ime")]
-use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1};
+use wayland_protocols::xdg::shell::server::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
+use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::backend::ClientData;
 use wayland_server::protocol::{
     wl_buffer, wl_compositor, wl_output, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
@@ -23,12 +24,12 @@ use waywi::capabilities::Capability;
 use waywi::display::Output;
 use waywi::effect::EffectCtx;
 use waywi::error::{Result, WaywiError};
-#[cfg(feature = "ime")]
-use waywi::geometry::GeoRect;
-use waywi::geometry::{LogicalPxExt, ScaleFactor, Size};
+use waywi::geometry::{GeoRect, LogicalPxExt, ScaleFactor, Size};
 #[cfg(feature = "ime")]
 use waywi::input::{ImeConfig, ImeContentPurpose, ImeEvent, TextInputState};
-use waywi::surface::{Surface, Surfaces};
+use waywi::surface::{
+    Anchor, PopupAnchor, PopupConstraintAdjustment, PopupGravity, Surface, Surfaces,
+};
 use waywi::{App, Application};
 
 #[cfg(feature = "ime")]
@@ -40,6 +41,39 @@ struct MockImeTrace {
     surrounding_updates: Vec<(String, i32, i32)>,
     content_purposes: Vec<u32>,
     sent_batches: bool,
+}
+
+#[derive(Default, Clone, Debug)]
+struct MockPositionerSnapshot {
+    size: Option<(i32, i32)>,
+    anchor_rect: Option<(i32, i32, i32, i32)>,
+    anchor: Option<u32>,
+    gravity: Option<u32>,
+    offset: Option<(i32, i32)>,
+    constraint_adjustment: Option<u32>,
+    reactive: bool,
+}
+
+#[derive(Default, Debug)]
+struct MockXdgTrace {
+    token_app_ids: Vec<String>,
+    token_commits: usize,
+    activations: Vec<String>,
+    layer_get_popup_before_commit: Option<bool>,
+    popup_created_positioners: Vec<MockPositionerSnapshot>,
+    popup_reposition_tokens: Vec<u32>,
+    popup_reposition_offsets: Vec<Option<(i32, i32)>>,
+    popup_destroyed: bool,
+    popup_null_buffer_attached: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+struct MockServerConfig {
+    enable_xdg_shell: bool,
+    enable_layer_shell: bool,
+    enable_xdg_activation: bool,
+    #[cfg(feature = "ime")]
+    enable_ime: bool,
 }
 
 struct DummyClientData;
@@ -56,6 +90,20 @@ impl ClientData for DummyClientData {
 struct MockCompositor {
     wl_surfaces_created: usize,
     last_wl_surface: Option<wl_surface::WlSurface>,
+    popup_wl_surface_id: Option<wayland_server::backend::ObjectId>,
+    popup_committed: bool,
+    popup_xdg_surface: Option<xdg_surface::XdgSurface>,
+    popup_resource: Option<xdg_popup::XdgPopup>,
+    popup_done_sent: bool,
+    current_positioner: MockPositionerSnapshot,
+    positioners:
+        std::collections::HashMap<wayland_server::backend::ObjectId, MockPositionerSnapshot>,
+    xdg_surface_to_wl: std::collections::HashMap<
+        wayland_server::backend::ObjectId,
+        wayland_server::backend::ObjectId,
+    >,
+    pending_token_app_id: Option<String>,
+    xdg_trace: Arc<Mutex<MockXdgTrace>>,
     #[cfg(feature = "ime")]
     text_inputs: Vec<zwp_text_input_v3::ZwpTextInputV3>,
     #[cfg(feature = "ime")]
@@ -109,16 +157,29 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for MockCompositor {
 
 impl Dispatch<wl_surface::WlSurface, ()> for MockCompositor {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &wl_surface::WlSurface,
+        resource: &wl_surface::WlSurface,
         request: wl_surface::Request,
         _data: &(),
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        if let wl_surface::Request::Frame { callback } = request {
-            data_init.init(callback, ());
+        match request {
+            wl_surface::Request::Frame { callback } => {
+                data_init.init(callback, ());
+            }
+            wl_surface::Request::Attach { buffer: None, .. }
+                if state.popup_wl_surface_id.as_ref() == Some(&resource.id()) =>
+            {
+                state.xdg_trace.lock().unwrap().popup_null_buffer_attached = true;
+            }
+            wl_surface::Request::Commit
+                if state.popup_wl_surface_id.as_ref() == Some(&resource.id()) =>
+            {
+                state.popup_committed = true;
+            }
+            _ => {}
         }
     }
 }
@@ -341,7 +402,6 @@ impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for MockComposito
     }
 }
 
-#[cfg(feature = "ime")]
 impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
     fn bind(
         _state: &mut Self,
@@ -355,10 +415,9 @@ impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
     }
 }
 
-#[cfg(feature = "ime")]
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &xdg_wm_base::XdgWmBase,
         request: xdg_wm_base::Request,
@@ -367,8 +426,15 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            xdg_wm_base::Request::GetXdgSurface { id, surface: _ } => {
-                data_init.init(id, ());
+            xdg_wm_base::Request::CreatePositioner { id } => {
+                let pos = data_init.init(id, ());
+                state
+                    .positioners
+                    .insert(pos.id(), MockPositionerSnapshot::default());
+            }
+            xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                let xdg_surf = data_init.init(id, ());
+                state.xdg_surface_to_wl.insert(xdg_surf.id(), surface.id());
             }
             xdg_wm_base::Request::Pong { .. } => {}
             _ => {}
@@ -376,7 +442,56 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
     }
 }
 
-#[cfg(feature = "ime")]
+impl Dispatch<xdg_positioner::XdgPositioner, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &xdg_positioner::XdgPositioner,
+        request: xdg_positioner::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        let entry = state.positioners.entry(resource.id()).or_default();
+        match request {
+            xdg_positioner::Request::SetSize { width, height } => {
+                entry.size = Some((width, height));
+            }
+            xdg_positioner::Request::SetAnchorRect {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                entry.anchor_rect = Some((x, y, width, height));
+            }
+            xdg_positioner::Request::SetAnchor {
+                anchor: wayland_server::WEnum::Value(a),
+            } => {
+                entry.anchor = Some(a as u32);
+            }
+            xdg_positioner::Request::SetGravity {
+                gravity: wayland_server::WEnum::Value(g),
+            } => {
+                entry.gravity = Some(g as u32);
+            }
+            xdg_positioner::Request::SetOffset { x, y } => {
+                entry.offset = Some((x, y));
+            }
+            xdg_positioner::Request::SetConstraintAdjustment {
+                constraint_adjustment,
+            } => {
+                entry.constraint_adjustment = Some(constraint_adjustment.into());
+            }
+            xdg_positioner::Request::SetReactive => {
+                entry.reactive = true;
+            }
+            _ => {}
+        }
+        state.current_positioner = entry.clone();
+    }
+}
+
 impl Dispatch<xdg_surface::XdgSurface, ()> for MockCompositor {
     fn request(
         state: &mut Self,
@@ -393,7 +508,37 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for MockCompositor {
                 toplevel.configure(320, 64, Vec::new());
                 resource.configure(1);
             }
+            xdg_surface::Request::GetPopup {
+                id,
+                parent,
+                positioner,
+            } => {
+                let popup = data_init.init(id, ());
+                let snap = state
+                    .positioners
+                    .get(&positioner.id())
+                    .cloned()
+                    .unwrap_or_default();
+                let (w, h) = snap.size.unwrap_or((180, 120));
+                state
+                    .xdg_trace
+                    .lock()
+                    .unwrap()
+                    .popup_created_positioners
+                    .push(snap);
+                if let Some(wl_id) = state.xdg_surface_to_wl.get(&resource.id()).cloned() {
+                    state.popup_wl_surface_id = Some(wl_id);
+                    state.popup_committed = false;
+                }
+                state.popup_xdg_surface = Some(resource.clone());
+                state.popup_resource = Some(popup.clone());
+                if parent.is_some() {
+                    popup.configure(0, 0, w, h);
+                    resource.configure(10);
+                }
+            }
             xdg_surface::Request::AckConfigure { .. } => {
+                #[cfg(feature = "ime")]
                 if let Some(ref wl_surf) = state.last_wl_surface {
                     for ti in &state.text_inputs {
                         ti.enter(wl_surf);
@@ -405,7 +550,6 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for MockCompositor {
     }
 }
 
-#[cfg(feature = "ime")]
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for MockCompositor {
     fn request(
         _state: &mut Self,
@@ -416,6 +560,164 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for MockCompositor {
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &xdg_popup::XdgPopup,
+        request: xdg_popup::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_popup::Request::Reposition { positioner, token } => {
+                let snap = state
+                    .positioners
+                    .get(&positioner.id())
+                    .cloned()
+                    .unwrap_or_default();
+                let (w, h) = snap.size.unwrap_or((180, 120));
+                {
+                    let mut trace = state.xdg_trace.lock().unwrap();
+                    trace.popup_reposition_tokens.push(token);
+                    trace.popup_reposition_offsets.push(snap.offset);
+                }
+                resource.repositioned(token);
+                resource.configure(24, 48, w, h);
+                if let Some(ref xdg_surf) = state.popup_xdg_surface {
+                    xdg_surf.configure(11);
+                }
+                if !state.popup_done_sent {
+                    state.popup_done_sent = true;
+                    resource.popup_done();
+                }
+            }
+            xdg_popup::Request::Destroy => {
+                state.xdg_trace.lock().unwrap().popup_destroyed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl GlobalDispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        request: zwlr_layer_shell_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwlr_layer_shell_v1::Request::GetLayerSurface { id, .. } = request {
+            let layer = data_init.init(id, ());
+            layer.configure(1, 1920, 32);
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        request: zwlr_layer_surface_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwlr_layer_surface_v1::Request::GetPopup { popup } = request {
+            state
+                .xdg_trace
+                .lock()
+                .unwrap()
+                .layer_get_popup_before_commit = Some(!state.popup_committed);
+            let (w, h) = state.current_positioner.size.unwrap_or((180, 120));
+            popup.configure(16, 40, w, h);
+            if let Some(ref xdg_surf) = state.popup_xdg_surface {
+                xdg_surf.configure(10);
+            }
+        }
+    }
+}
+
+impl GlobalDispatch<xdg_activation_v1::XdgActivationV1, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<xdg_activation_v1::XdgActivationV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &xdg_activation_v1::XdgActivationV1,
+        request: xdg_activation_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_activation_v1::Request::GetActivationToken { id } => {
+                data_init.init(id, ());
+            }
+            xdg_activation_v1::Request::Activate { token, surface: _ } => {
+                state.xdg_trace.lock().unwrap().activations.push(token);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &xdg_activation_token_v1::XdgActivationTokenV1,
+        request: xdg_activation_token_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_activation_token_v1::Request::SetAppId { app_id } => {
+                state.pending_token_app_id = Some(app_id);
+            }
+            xdg_activation_token_v1::Request::Commit => {
+                let mut trace = state.xdg_trace.lock().unwrap();
+                trace.token_commits += 1;
+                if let Some(app_id) = state.pending_token_app_id.take() {
+                    trace.token_app_ids.push(app_id);
+                }
+                resource.done("waywi-test-token-77".into());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -522,7 +824,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for MockCompositor {
 }
 
 fn spawn_mock_compositor() -> (Connection, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
-    let (conn, stop, handle, _) = spawn_mock_compositor_with(false);
+    let (conn, stop, handle, _, _) = spawn_mock_compositor_configured(MockServerConfig::default());
     (conn, stop, handle)
 }
 
@@ -531,6 +833,7 @@ type OptTrace = Option<Arc<Mutex<MockImeTrace>>>;
 #[cfg(not(feature = "ime"))]
 type OptTrace = Option<()>;
 
+#[cfg(feature = "ime")]
 fn spawn_mock_compositor_with(
     enable_shell_and_ime: bool,
 ) -> (
@@ -539,11 +842,32 @@ fn spawn_mock_compositor_with(
     std::thread::JoinHandle<()>,
     OptTrace,
 ) {
+    let (conn, stop, handle, ime_trace, _) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: enable_shell_and_ime,
+        enable_ime: enable_shell_and_ime,
+        ..MockServerConfig::default()
+    });
+    (conn, stop, handle, ime_trace)
+}
+
+fn spawn_mock_compositor_configured(
+    cfg: MockServerConfig,
+) -> (
+    Connection,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+    OptTrace,
+    Arc<Mutex<MockXdgTrace>>,
+) {
     let (server_sock, client_sock) = UnixStream::pair().expect("socketpair");
     let stop = Arc::new(AtomicBool::new(false));
     let stop_srv = Arc::clone(&stop);
+    let xdg_trace = Arc::new(Mutex::new(MockXdgTrace::default()));
+    let xdg_trace_srv = Arc::clone(&xdg_trace);
     #[cfg(feature = "ime")]
-    let ime_trace = enable_shell_and_ime.then(|| Arc::new(Mutex::new(MockImeTrace::default())));
+    let ime_trace = cfg
+        .enable_ime
+        .then(|| Arc::new(Mutex::new(MockImeTrace::default())));
     #[cfg(not(feature = "ime"))]
     let ime_trace: OptTrace = None;
     #[cfg(feature = "ime")]
@@ -556,22 +880,38 @@ fn spawn_mock_compositor_with(
         dh.create_global::<MockCompositor, wl_shm::WlShm, _>(1, ());
         dh.create_global::<MockCompositor, wl_output::WlOutput, _>(4, ());
         dh.create_global::<MockCompositor, wl_seat::WlSeat, _>(7, ());
+        if cfg.enable_xdg_shell {
+            dh.create_global::<MockCompositor, xdg_wm_base::XdgWmBase, _>(5, ());
+        }
+        if cfg.enable_layer_shell {
+            dh.create_global::<MockCompositor, zwlr_layer_shell_v1::ZwlrLayerShellV1, _>(4, ());
+        }
+        if cfg.enable_xdg_activation {
+            dh.create_global::<MockCompositor, xdg_activation_v1::XdgActivationV1, _>(1, ());
+        }
         #[cfg(feature = "ime")]
-        if enable_shell_and_ime {
-            dh.create_global::<MockCompositor, xdg_wm_base::XdgWmBase, _>(2, ());
+        if cfg.enable_ime {
             dh.create_global::<MockCompositor, zwp_text_input_manager_v3::ZwpTextInputManagerV3, _>(
                 1,
                 (),
             );
         }
-        #[cfg(not(feature = "ime"))]
-        let _ = enable_shell_and_ime;
         dh.insert_client(server_sock, Arc::new(DummyClientData))
             .expect("insert_client");
 
         let mut state = MockCompositor {
             wl_surfaces_created: 0,
             last_wl_surface: None,
+            popup_wl_surface_id: None,
+            popup_committed: false,
+            popup_xdg_surface: None,
+            popup_resource: None,
+            popup_done_sent: false,
+            current_positioner: MockPositionerSnapshot::default(),
+            positioners: std::collections::HashMap::new(),
+            xdg_surface_to_wl: std::collections::HashMap::new(),
+            pending_token_app_id: None,
+            xdg_trace: xdg_trace_srv,
             #[cfg(feature = "ime")]
             text_inputs: Vec::new(),
             #[cfg(feature = "ime")]
@@ -594,7 +934,7 @@ fn spawn_mock_compositor_with(
     });
 
     let conn = Connection::from_socket(client_sock).expect("Connection::from_socket");
-    (conn, stop, handle, ime_trace)
+    (conn, stop, handle, ime_trace, xdg_trace)
 }
 
 #[test]
@@ -810,5 +1150,268 @@ fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
             .surrounding_updates
             .iter()
             .any(|(txt, cur, anc)| txt == "日本" && *cur == 6 && *anc == 6)
+    );
+}
+
+#[test]
+fn socketpair_xdg_activation_v1_token_and_activate_roundtrip() {
+    #[derive(Clone)]
+    enum ActMsg {
+        RequestToken,
+        GotToken(Option<String>),
+        Quit,
+    }
+
+    static OBSERVED_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+    struct ActApp;
+
+    impl Application for ActApp {
+        type State = ();
+        type Message = ActMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            assert!(ctx.capabilities().has(Capability::XdgShell));
+            assert!(ctx.capabilities().has(Capability::XdgActivation));
+            // Trigger token request once the initial toplevel surface is mapped.
+            ctx.after(Duration::from_millis(20), || ActMsg::RequestToken);
+            // Failsafe timeout so protocol regressions fail assertions instead of hanging.
+            ctx.after(Duration::from_secs(5), || ActMsg::Quit);
+            Ok(())
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                ActMsg::RequestToken => {
+                    ctx.request_activation_token(Some("org.waywi.TestLauncher"), |res| {
+                        ActMsg::GotToken(res.ok())
+                    });
+                }
+                ActMsg::GotToken(tok) => {
+                    *OBSERVED_TOKEN.lock().unwrap() = tok.clone();
+                    if let Some(t) = tok {
+                        ctx.activate_surface("act-win", t)?;
+                    }
+                    ctx.after(Duration::from_millis(30), || ActMsg::Quit);
+                }
+                ActMsg::Quit => {
+                    ctx.quit();
+                }
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(Surface::window("act-win").size(Size::px(240.logical_px(), 80.logical_px())));
+            s
+        }
+    }
+
+    let (conn, stop, srv, _, xdg_trace) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_xdg_activation: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<ActApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "ActApp failed: {res:?}");
+
+    assert_eq!(
+        OBSERVED_TOKEN.lock().unwrap().as_deref(),
+        Some("waywi-test-token-77")
+    );
+    let trace = xdg_trace.lock().unwrap();
+    assert_eq!(trace.token_commits, 1);
+    assert_eq!(trace.token_app_ids, vec!["org.waywi.TestLauncher"]);
+    assert_eq!(trace.activations, vec!["waywi-test-token-77"]);
+}
+
+#[test]
+fn socketpair_missing_xdg_activation_delivers_unsupported_capability() {
+    #[derive(Clone)]
+    enum MissingActMsg {
+        GotResult(bool),
+    }
+
+    static SAW_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+    struct MissingActApp;
+
+    impl Application for MissingActApp {
+        type State = ();
+        type Message = MissingActMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            assert!(!ctx.capabilities().has(Capability::XdgActivation));
+            ctx.request_activation_token(Some("org.waywi.Launcher"), |res| {
+                MissingActMsg::GotResult(matches!(
+                    res,
+                    Err(WaywiError::UnsupportedCapability(Capability::XdgActivation))
+                ))
+            });
+            Ok(())
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            let MissingActMsg::GotResult(is_unsupported) = msg;
+            SAW_UNSUPPORTED.store(is_unsupported, Ordering::Relaxed);
+            ctx.quit();
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            Surfaces::new()
+        }
+    }
+
+    let (conn, stop, srv) = spawn_mock_compositor();
+    let res = App::new().run_on_connection::<MissingActApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "MissingActApp failed: {res:?}");
+    assert!(SAW_UNSUPPORTED.load(Ordering::Relaxed));
+}
+
+#[test]
+fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
+    #[derive(Clone)]
+    enum PopupMsg {
+        Reposition,
+        Dismissed,
+        Quit,
+    }
+
+    struct PopupState {
+        open: bool,
+        offset_y: i32,
+        dismissed: bool,
+    }
+
+    static OBSERVED_DISMISSED: AtomicBool = AtomicBool::new(false);
+
+    struct LayerPopupApp;
+
+    impl Application for LayerPopupApp {
+        type State = PopupState;
+        type Message = PopupMsg;
+
+        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            assert!(ctx.capabilities().has(Capability::LayerShell));
+            assert!(ctx.capabilities().has(Capability::XdgShell));
+            // Give initial layer + popup creation & configure one tick before repositioning.
+            ctx.after(Duration::from_millis(30), || PopupMsg::Reposition);
+            // Failsafe timeout so protocol regressions fail assertions instead of hanging.
+            ctx.after(Duration::from_secs(5), || PopupMsg::Quit);
+            Ok(PopupState {
+                open: true,
+                offset_y: 8,
+                dismissed: false,
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_>,
+        ) -> Result<()> {
+            match msg {
+                PopupMsg::Reposition => {
+                    state.offset_y = 20;
+                }
+                PopupMsg::Dismissed => {
+                    state.dismissed = true;
+                    state.open = false;
+                    OBSERVED_DISMISSED.store(true, Ordering::Relaxed);
+                    // Wait briefly so view sync + destroy flushes cleanly before quitting.
+                    ctx.after(Duration::from_millis(30), || PopupMsg::Quit);
+                }
+                PopupMsg::Quit => {
+                    ctx.quit();
+                }
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::panel("bar", Output::Primary)
+                    .anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT)
+                    .size(Size::px(1920.logical_px(), 32.logical_px())),
+            );
+            if state.open {
+                s.push(
+                    Surface::popup("menu", "bar")
+                        .size(Size::px(180.logical_px(), 120.logical_px()))
+                        .anchor_rect(GeoRect::from_xywh(12.0, 0.0, 80.0, 32.0))
+                        .popup_anchor(PopupAnchor::BottomLeft)
+                        .popup_gravity(PopupGravity::BottomRight)
+                        .popup_offset(4.logical_px(), state.offset_y.logical_px())
+                        .popup_constraints(
+                            PopupConstraintAdjustment::FLIP_Y | PopupConstraintAdjustment::SLIDE_X,
+                        )
+                        .popup_reactive(true)
+                        .on_close(PopupMsg::Dismissed),
+                );
+            }
+            s
+        }
+    }
+
+    let (conn, stop, srv, _, xdg_trace) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_layer_shell: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<LayerPopupApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "LayerPopupApp failed: {res:?}");
+    assert!(
+        OBSERVED_DISMISSED.load(Ordering::Relaxed),
+        "expected popup_done to deliver on_close message"
+    );
+
+    let trace = xdg_trace.lock().unwrap();
+    assert_eq!(
+        trace.layer_get_popup_before_commit,
+        Some(true),
+        "zwlr_layer_surface_v1.get_popup must be sent before popup wl_surface.commit"
+    );
+    assert_eq!(trace.popup_created_positioners.len(), 1);
+    let pos = &trace.popup_created_positioners[0];
+    assert_eq!(pos.size, Some((180, 120)));
+    assert_eq!(pos.anchor_rect, Some((12, 0, 80, 32)));
+    assert_eq!(pos.anchor, Some(xdg_positioner::Anchor::BottomLeft as u32));
+    assert_eq!(
+        pos.gravity,
+        Some(xdg_positioner::Gravity::BottomRight as u32)
+    );
+    assert_eq!(pos.offset, Some((4, 8)));
+    assert_eq!(
+        pos.constraint_adjustment,
+        Some(
+            (xdg_positioner::ConstraintAdjustment::FlipY
+                | xdg_positioner::ConstraintAdjustment::SlideX)
+                .bits()
+        )
+    );
+    assert!(pos.reactive);
+    assert_eq!(trace.popup_reposition_tokens, vec![1]);
+    assert_eq!(trace.popup_reposition_offsets, vec![Some((4, 20))]);
+    assert!(trace.popup_destroyed, "expected xdg_popup.destroy on close");
+    assert!(
+        !trace.popup_null_buffer_attached,
+        "xdg_popup must not attach a null buffer before destroy"
     );
 }

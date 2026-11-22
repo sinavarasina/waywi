@@ -15,6 +15,8 @@ use crate::image::ImageAsset;
 pub(crate) type BoxedMsgFactory = Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>;
 pub(crate) type BoxedAssetCallback =
     Box<dyn FnOnce(Result<ImageAsset>) -> Box<dyn Any + Send> + Send>;
+pub(crate) type BoxedActivationCallback =
+    Box<dyn FnOnce(Result<String>) -> Box<dyn Any + Send> + Send>;
 
 pub(crate) struct AsyncAssetCompletion {
     pub(crate) path: PathBuf,

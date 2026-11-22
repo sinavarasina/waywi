@@ -14,8 +14,8 @@ use wayland_client::{Connection, QueueHandle};
 
 use crate::arena::FrameArenaPool;
 use crate::asset::{AssetCache, AssetId};
-use crate::capabilities::Capabilities;
-use crate::effect::{AsyncAssetWorker, BoxedMsgFactory, EffectCtx};
+use crate::capabilities::{Capabilities, Capability};
+use crate::effect::{AsyncAssetWorker, BoxedActivationCallback, BoxedMsgFactory, EffectCtx};
 use crate::error::{Result, WaywiError};
 use crate::geometry::{LogicalSize, Point, ScaleFactor};
 use crate::reconcile::{Reconciler, RetainedSurfaceKey};
@@ -45,6 +45,8 @@ pub(crate) struct LoopRuntime<M: Clone + 'static> {
     pub(crate) configured_sizes: HashMap<RetainedSurfaceKey, LogicalSize>,
     pub(crate) surface_scales: HashMap<RetainedSurfaceKey, ScaleFactor>,
     pub(crate) touch_positions: HashMap<i32, Point>,
+    pub(crate) next_activation_req_id: u64,
+    pub(crate) pending_activation_callbacks: HashMap<u64, BoxedActivationCallback>,
     pub(crate) inbox: Rc<RefCell<LoopInbox<M>>>,
     pub(crate) sub_mgr: SubscriptionManager<M>,
     pub(crate) quit_requested: bool,
@@ -161,6 +163,8 @@ impl<M: Clone + 'static> LoopRuntime<M> {
             configured_sizes: HashMap::new(),
             surface_scales: HashMap::new(),
             touch_positions: HashMap::new(),
+            next_activation_req_id: 1,
+            pending_activation_callbacks: HashMap::new(),
             inbox: Rc::new(RefCell::new(LoopInbox::default())),
             sub_mgr: SubscriptionManager::new(),
             quit_requested: false,
@@ -198,6 +202,9 @@ impl<M: Clone + 'static> LoopRuntime<M> {
     ) -> R {
         let mut pending_after: Vec<(Duration, BoxedMsgFactory)> = Vec::new();
         let mut reloaded_assets: Vec<(AssetId, u64)> = Vec::new();
+        let mut pending_activation_requests: Vec<(Option<String>, BoxedActivationCallback)> =
+            Vec::new();
+        let mut pending_surface_activations: Vec<(crate::surface::SurfaceKey, String)> = Vec::new();
         let outputs_copy = wl.outputs.clone();
         #[cfg(feature = "clipboard")]
         let qh_ref = &self.qh;
@@ -225,6 +232,8 @@ impl<M: Clone + 'static> LoopRuntime<M> {
                 system: &mut self.system,
                 pending_after: &mut pending_after,
                 reloaded_assets: &mut reloaded_assets,
+                pending_activation_requests: &mut pending_activation_requests,
+                pending_surface_activations: &mut pending_surface_activations,
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 audio: &self.audio_client,
                 #[cfg(any(
@@ -255,6 +264,29 @@ impl<M: Clone + 'static> LoopRuntime<M> {
         }
         for (aid, rev) in reloaded_assets {
             self.reconciler.invalidate_asset(aid, rev);
+        }
+        let mut flush_wayland = false;
+        for (app_id, cb) in pending_activation_requests {
+            let req_id = self.next_activation_req_id;
+            self.next_activation_req_id = self.next_activation_req_id.wrapping_add(1);
+            if wl.request_activation_token(&self.qh, req_id, app_id) {
+                self.pending_activation_callbacks.insert(req_id, cb);
+                flush_wayland = true;
+            } else if let Ok(msg) = cb(Err(WaywiError::UnsupportedCapability(
+                Capability::XdgActivation,
+            )))
+            .downcast::<M>()
+            {
+                self.inbox.borrow_mut().messages.push_back(*msg);
+            }
+        }
+        for (surface_key, token) in pending_surface_activations {
+            if wl.activate_surface(surface_key, token) {
+                flush_wayland = true;
+            }
+        }
+        if flush_wayland {
+            let _ = self.conn.flush();
         }
         res
     }

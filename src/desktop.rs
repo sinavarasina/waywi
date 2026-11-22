@@ -1,21 +1,27 @@
-//! XDG Desktop Entry parser/launcher and Icon Theme resolver.
+//! XDG Base Directories, User Directories, Desktop Entry parser/launcher, and Icon Theme resolver.
 //!
-//! Provides specification-compliant `.desktop` application discovery (`[Desktop Entry]`),
-//! freedesktop `Exec=` command unquoting/field-code expansion, and XDG Icon Theme lookup
-//! across user and system icon themes with `index.theme` inheritance.
+//! Provides XDG Base Directory Specification v0.8 paths (`XdgBaseDirs`, `XdgUserDirs`),
+//! specification-compliant `.desktop` application discovery (`[Desktop Entry]` and
+//! `[Desktop Action ...]`), freedesktop `Exec=` command unquoting/field-code expansion,
+//! `DBusActivatable` metadata, `XDG_ACTIVATION_TOKEN` handoff, and XDG Icon Theme lookup across
+//! user and system icon themes with `index.theme` inheritance.
 
 pub mod entry;
 pub mod icons;
-pub(crate) mod xdg;
+pub mod xdg;
 
 pub use entry::{
-    DesktopEntry, DesktopSearchMatch, default_application_dirs, filter_launcher_entries,
-    find_desktop_entry, parse_desktop_entry, scan_desktop_entries, scan_desktop_entries_in,
-    search_desktop_entries, search_desktop_entries_with_weights,
+    DesktopAction, DesktopEntry, DesktopSearchMatch, default_application_dirs,
+    filter_launcher_entries, find_desktop_entry, parse_desktop_entry, scan_desktop_entries,
+    scan_desktop_entries_in, search_desktop_entries, search_desktop_entries_with_weights,
 };
 pub use icons::{
     IconThemeInfo, XdgIconLookup, default_icon_dirs, detect_active_icon_theme,
     parse_icon_theme_index, resolve_icon_path,
+};
+pub use xdg::{
+    XdgBaseDirs, XdgUserDirs, xdg_cache_home, xdg_config_dirs, xdg_config_home, xdg_data_dirs,
+    xdg_data_home, xdg_runtime_dir, xdg_state_home,
 };
 
 /// Spawns `program` with `args` detached in its own session (`setsid`) with stdio redirected to
@@ -31,6 +37,18 @@ pub fn spawn_detached_in(
     args: &[&str],
     working_dir: Option<&std::path::Path>,
 ) -> crate::error::Result<()> {
+    spawn_detached_with_env(program, args, working_dir, &[])
+}
+
+/// Spawns `program` with `args`, optional `working_dir`, and child-only environment variables
+/// (such as `XDG_ACTIVATION_TOKEN`) detached in its own session (`setsid`), reaping the child on
+/// exit.
+pub fn spawn_detached_with_env(
+    program: &str,
+    args: &[&str],
+    working_dir: Option<&std::path::Path>,
+    env_vars: &[(&str, &str)],
+) -> crate::error::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -41,6 +59,9 @@ pub fn spawn_detached_in(
         .stderr(Stdio::null());
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+    for &(k, v) in env_vars {
+        cmd.env(k, v);
     }
     // SAFETY: `setsid()` is async-signal-safe and called in `pre_exec` before exec.
     unsafe {
