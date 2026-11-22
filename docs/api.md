@@ -18,12 +18,12 @@ Implement `Application`:
 - `Percent(f32)` (`.percent()`, `.of(...)`): percentage lengths and offsets.
 - `Size`: `Size::px(w, h)`, `Size::new(width, height)`, `Size::fill()`, `Size::auto()`.
 - `Position`: `Auto`, `absolute(x, y)`, `relative_to_surface(px, py)`, `relative_to_parent(px, py)` with `.with_offset(dx, dy)` and `ElementAnchor`.
-- `Transform`: `identity()`, `translate(dx, dy)`, `scale(s)`, `scale_xy(sx, sy)`, `rotate_deg(deg)`, `rotate_rad(rad)`.
+- `Transform`: `identity()`, `translate(dx, dy)`, `scale(s)`, `scale_xy(sx, sy)`, `rotate_deg(deg)`, `rotate_rad(rad)`, `pivot(ElementAnchor)`, `pivot_point(px, py)`.
 
 ## Surfaces & Elements
 
-- Surfaces: `Surface::floating` (widget bounds), `Surface::panel` (edge-anchored with `.exclusive_zone(...)`), `Surface::overlay` (full-output layer), `Surface::window` (`xdg_toplevel`), `Surface::memo`.
-- Containers & primitives: `Row`, `Column`, `Group`, `Clip`, `Rect`, `Text`, `Image`, `Sprite`, `Canvas`, `Element::memo`.
+- Surfaces: `Surface::floating` (widget bounds), `Surface::panel` (edge-anchored with `.exclusive_zone(...)`), `Surface::overlay` (full-output layer), `Surface::window` (`xdg_toplevel`), `Surface::memo`, with `.buffer_retention(BufferRetention::Retain | ReleaseAfterCommit)` for static surfaces.
+- Containers & primitives: `Row`, `Column`, `Group`, `Clip`, `Rect`, `Text` (with `.bounds_mode(TextBoundsMode::Typographic | Optical)` / `.optical_bounds(...)`), `Image` (with `.source_rect`, `.region`, `.flip_x`, `.flip_y`, `.filter`), `Sprite` (with `SpriteSheet` grids/regions, timed/sequence/range frames, `.on_animation_end`), `Canvas`, `Element::memo`.
 - Event hooks: `.on_click(...)`, `.on_hover(...)`, `.on_leave(...)`, `.on_scroll(...)`, `.on_pointer_down(...)`, `.on_pointer_up(...)`, `.on_pointer_move(...)`, `.on_key(...)`, `.ime(...)` / `.on_ime(...)`, plus optional `.on_click_sound(...)` / `.on_hover_sound(...)`, and headless `TextInputState` / `ScrollState` controllers (pairable with `ctx.measure_text_cursor(...)` for proportional cursor placement).
 - Accessibility hooks: `.accessible_role(...)`, `.accessible_label(...)`, `.accessible_description(...)`, `.accessible_value(...)`, `.accessible_hidden(...)`.
 - Composition: components use `.map(...)` on elements, surfaces, and subscriptions to lift child messages.

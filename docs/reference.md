@@ -29,7 +29,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `HeadlessRuntime<A: Application>` (`app::headless`):
   - Constructors: `new(capabilities, outputs)`, `new_with_renderer(...)`.
   - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_surface_configure(...)`.
-  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `arena_heap_fallbacks()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
+  - Inspection & accessibility: `capabilities()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `arena_heap_fallbacks()`, `asset_pixels_resident(asset)`, `decoded_asset_bytes()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
 
 ## Effects (`effect`)
 
@@ -181,9 +181,9 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 ## Audio (`audio`)
 
 - **Audio mixer (`pipewire`, `pulseaudio`, or `alsa`)**:
-  - `AudioDevice`, `AudioStream` (`id`, `name`, `binary`, `icon_name`, `app_id`, `sink_id`, `linear`, `db`, `muted`), `AudioCapture` (`id`, `name`, `binary`, `icon_name`, `app_id`, `source_id`, `linear`, `db`, `muted`), `AudioSnapshot` (`percent()`, `source_percent()`), `AudioEvent`.
+  - `AudioDevice`, `AudioStream` (`id`, `name`, `binary`, `icon_name`, `app_id`, `sink_id`, `linear`, `db`, `muted`), `AudioCapture` (`id`, `name`, `binary`, `icon_name`, `app_id`, `source_id`, `linear`, `db`, `muted`), `AudioSnapshot` (`percent()`, `source_percent()`, `stream_percent(id)`, `capture_percent(id)`), `AudioEvent`.
   - `Audio::subscribe(map)`, `Audio::subscribe_events(map)`.
-  - `AudioClient` (`new`, `snapshot`, `set_volume_linear`, `set_muted`, `toggle_mute`, `select_device`, `set_source_volume_linear`, `set_source_muted`, `toggle_source_mute`, `select_source`).
+  - `AudioClient` (`new`, `snapshot`, `set_volume_linear`, `set_muted`, `toggle_mute`, `select_device`, `set_source_volume_linear`, `set_source_muted`, `toggle_source_mute`, `select_source`, `set_stream_volume_linear`, `set_stream_muted`, `toggle_stream_mute`, `set_capture_volume_linear`, `set_capture_muted`, `toggle_capture_mute`).
 - **Audio playback (`audio-playback` or native backend)**:
   - `SoundAsset`, `SoundPreset` (`Click`, `DragTick`, `Hover`, `Notification`, `Warning`).
   - `SoundData`: `from_pcm_f32`, `duration`, `from_file`, `from_bytes`, `from_bytes_with_hint`, `from_wav_bytes`, `tone`, `from_preset`, `to_stereo_48k`.

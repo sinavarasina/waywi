@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.9] - 2026-11-22
+
+### Added
+- **Reclaimable asset cache & on-demand re-decoding (`asset`, `effect`, `image`)**: Added `AssetRetention` (`KeepDecoded` default, `ReclaimAfterPresent`), `EffectCtx::{set_asset_retention, asset_retention, evict_asset_pixels}`, and `HeadlessRuntime::{asset_pixels_resident, decoded_asset_bytes}`. Path-backed assets drop decoded RGBA8 pixels to 0 bytes (and byte-backed assets keep only compressed encoded bytes) after presentation or explicit eviction, while preserving handles, dimensions, and revisions and transparently re-decoding `Image` and `Sprite` assets before any future redraw (including resize, hotplug, or hidden sprites reappearing). Multi-output commits decode shared reclaimable assets once per pass, and raw pixel assets (`load_rgba_image`) honestly reject eviction/reclaim.
+- **SHM release-after-commit & software scratch auto-shrink (`surface`, `wayland`, `renderer-software`)**: Added `BufferRetention` (`Retain` default, `ReleaseAfterCommit`) and `Surface::buffer_retention(...)` so static surfaces (such as `Layer::Background` wallpapers) call `SurfaceShmPool::shrink_and_unmap()` once `wl_buffer.release` marks all slots idle with no redraw pending, releasing client-side SHM pools to 0 bytes without truncating backing `memfd`s. `SoftwareRenderer` also caps retained scratch buffers (`scratch_rgba`, `scratch_sprite_cell`) at `2 MiB` after large tile draws.
+- **Optical / ink text bounds (`text`, `renderer-software`, `renderer-gpu`)**: Added `TextBoundsMode` (`Typographic` default, `Optical`), `Text::{bounds_mode, optical_bounds}`, and `TextLayoutOptions::bounds_mode` to measure actual rasterized glyph ink extents once per cache miss and center PUA / Nerd Font icons accurately across both Software and GPU renderers with zero overhead for standard typographic text.
+- **Expanded `systemd-logind` power actions & `Can*` capability queries (`dbus`)**: Added `PowerActionSupport` (`Yes`, `Challenge`, `No`, `NotAvailable`; `from_logind_str`, `is_supported`, `needs_auth`), `LogindPowerCapabilities` (populated concurrently on `LogindSnapshot::power_capabilities` and `DbusClient::logind_power_capabilities`), and non-blocking `DbusClient::{hybrid_sleep, suspend_then_hibernate, reboot_to_firmware_setup, soft_reboot, halt, terminate_session}` with action deduplication and a 25s interactive Polkit timeout.
+- **Full XDG Desktop Notifications v1.2 hints & configurable capabilities (`dbus`)**: Added `NotificationCapabilities` bitflags (`ACTION_ICONS`, `ACTIONS`, `BODY`, `BODY_HYPERLINKS`, `BODY_IMAGES`, `BODY_MARKUP`, `ICON_MULTI`, `ICON_STATIC`, `PERSISTENCE`, `SOUND`), `Dbus::notifications_with_capabilities`, and `DbusClient::{set_notification_capabilities, notification_capabilities}` backed by lock-free `AtomicU16`. Parsed all official XDG v1.2 hints into `DesktopNotification` (`category`, `action_icons`, `resident`, `transient`, `suppress_sound`, `sound_name`, `sound_file`, `position`) and implemented `Default` on `DesktopNotification`.
+- **Upgraded sprites, texture atlases, resampling filters & transform pivots (`sprite`, `image`, `geometry`, `render`)**: Added `SourceRect`, `ImageFilter::{Bilinear, Bicubic, Nearest}`, `Image::{source_rect, region, flip_x, flip_y, filter}`, `Sprite::{flip_x, flip_y, filter, on_animation_end}`, `SpriteFrame`, `Frames::{Range, Sequence, Timed}`, `SpriteSheet::{from_regions, regions, region_of, timed_animation}` with unbounded `Arc<Vec<AnimationDef>>` and `SharedStr` names, `Transform::{pivot, pivot_point}`, reusable `SoftwareRenderer::scratch_sprite_cell`, and mipmapped GPU textures (`GENERATE_MIPMAPS`) with normalized cache keys.
+
+### Changed
+- **In-place sprite animation updates (`reconcile`)**: `Reconciler::tick_animations` now patches `PaintPayload::Sprite::frame_index` in-place on retained `DrawCommand`s by `NodeId` instead of rebuilding `commands` and `hit_nodes` on every animation frame.
+- **`DesktopNotification` fields (`dbus`)**: Struct literals constructing `DesktopNotification` directly should include `..Default::default()` to cover the new XDG v1.2 hint fields.
+- **Documentation**: Updated `docs/api.md`, `docs/integrations.md`, `docs/performance.md`, `docs/reference.md`, and `docs/wayland.md` for all new v0.1.9 APIs and retention policies.
+
+### Fixed
+- Fixed memoized sprite animation deadline calculation (`collect_subtree_deadlines` now preserves `SpriteTimeline::next_deadline` instead of resetting to the first frame duration) and improved `Fps::frame_duration` precision to `f64`.
+- Fixed software bitmap renderer flip/rotate affine translation offsets, `prev.affine != affine` dirty detection in retained node reconciliation, and preservation of unpresented animation dirty rects across `Reconciler::reconcile_surface_instance`.
+
 ## [0.1.8] - 2026-11-21
 
 ### Added
