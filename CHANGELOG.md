@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2026-11-23
+
+### Added
+- **`org.freedesktop.portal.Settings` support (`dbus`)**: Added pure-mechanism appearance queries and zero-polling `SettingChanged` subscriptions via `PortalColorScheme`, `PortalContrast`, `PortalAccentColor` (with finite `0.0..=1.0` validation and `.to_color()`), `PortalSettingsSnapshot`, `Dbus::portal_settings`, `DbusClient::portal_settings_snapshot`, and raw `DbusClient::portal_setting(namespace, key)`.
+- **Wayland `xdg-activation-v1` focus handoff (`wayland`, `effect`, `capabilities`)**: Added `Capability::XdgActivation`, non-blocking `EffectCtx::request_activation_token` (attaching recent input seat/serial/surface when available), `EffectCtx::activate_surface`, honest `WaywiError::UnsupportedCapability(Capability::XdgActivation)` delivery when unavailable, and `HeadlessRuntime::activated_surfaces`.
+- **Wayland `xdg-popup` & `zwlr_layer_surface_v1.get_popup` (`surface`, `wayland`, `reconcile`)**: Added `SurfaceKind::Popup`, `Surface::popup(key, parent_surface)`, `PopupAnchor`, `PopupGravity`, `PopupConstraintAdjustment`, `PopupPositioner`, layer-shell `get_popup` attachment before initial `wl_surface.commit`, `xdg_popup.reposition` (`xdg_wm_base >= 3`) on positioner or size updates, parent-first creation / child-first destruction ordering (including nested popups), `xdg_popup.popup_done` routing to `Surface::on_close` without requesting application exit, and `HeadlessRuntime::simulate_popup_dismiss`.
+- **Public XDG Base/User Directories & Desktop Entry completeness (`desktop`)**: Exposed `pub mod desktop::xdg` with XDG Base Directory Spec v0.8 helpers (`XdgBaseDirs`, `xdg_config_home`, `xdg_config_dirs`, `xdg_data_home`, `xdg_data_dirs`, `xdg_cache_home`, `xdg_state_home`, `xdg_runtime_dir` rejecting relative paths) and `~/.config/user-dirs.dirs` parsing (`XdgUserDirs`), added `spawn_detached_with_env`, and extended `DesktopEntry` with `[Desktop Action <id>]` (`DesktopAction`), `dbus_activatable`, `dbus_service_name`, `dbus_object_path`, `action`, and `XDG_ACTIVATION_TOKEN` launch helpers (`launch_with_token`, `launch_with_terminal_and_token`, `launch_action`).
+- **Hyprland v0.57+ workspace metadata, rules & tiling layouts (`hyprland-ipc`, `compositor`)**: Added `WorkspaceType`, `HyprlandLayout` (`Dwindle`, `Master`, `Monocle`, `Scrolling`, `Custom`, `Unknown`), `WorkspaceRuleInfo`, extended `WorkspaceInfo`, `WorkspaceRefJson`, `CompositorWorkspace`, and `SwayWorkspace`, and added `HyprlandClient::{workspace_rules, default_layout, set_default_layout, layout_message, switch_workspace_relative, switch_workspace_previous, move_workspace_to_monitor, rename_workspace}` with HyprLua fallback support.
+
+### Changed
+- **Batched Hyprland workspace queries (`hyprland-ipc`)**: `HyprlandClient::workspaces` now batches `j/activeworkspace` and `j/workspaces` into a single `[[BATCH]]` IPC roundtrip with automatic non-batch fallback.
+- **`DesktopEntry` fields (`desktop`)**: `DesktopEntry` now implements `Default` and includes `dbus_activatable` and `actions`; struct literals constructing `DesktopEntry` directly should include `..Default::default()`.
+- **Documentation**: Updated `docs/api.md`, `docs/integrations.md`, `docs/reference.md`, and `docs/wayland.md` for all v0.1.10 APIs.
+
+### Fixed
+- Fixed Hyprland v0.57+ workspace JSON and `socket2` `*v2` event parsing when special or named workspaces omit numeric `id` fields, preserving string addresses such as `special:magic` and preventing `WorkspaceId(0)` focus/tracking collisions.
+- Fixed `WorkspaceInfo::target_spec` for renamed numbered workspaces on older Hyprland releases and `name:`-prefixed named workspaces, aligned `HyprlandClient::rename_workspace` with `hl.dsp.workspace.rename({ workspace, name? })` (supporting empty-name reset), and allowed relative monitor selectors (e.g., `+1`) in `move_workspace_to_monitor`.
+- Stopped attaching a null buffer before destroying `xdg_popup` surfaces to stay compliant with `xdg-shell` protocol rules, and ensured popup positioner/size changes mark `config_dirty` during reconciliation.
+
 ## [0.1.9] - 2026-11-22
 
 ### Added
