@@ -67,13 +67,28 @@ impl HyprlandClient {
 
     /// Queries all workspaces (`j/workspaces`), marking the active workspace as `focused`.
     ///
+    /// Uses a single `[[BATCH]]j/activeworkspace;j/workspaces` Unix socket roundtrip when
+    /// supported, transparently falling back to separate queries on older servers.
+    ///
     /// Supports both legacy numeric workspace IDs and Hyprland v0.57+ string-addressed special
     /// and named workspaces (which omit `"id"`), exposing per-workspace `tiledLayout` (`layout`),
     /// `workspace_type`, `address`, `has_fullscreen`, `is_persistent`, and last-window metadata.
     pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
-        let active = self.active_workspace().ok();
-        let raw = self.request("j/workspaces")?;
-        let mut list: Vec<WorkspaceInfo> = serde_json::from_str(&raw).map_err(|e| {
+        let mut parts = self.batch(&["j/activeworkspace", "j/workspaces"])?;
+        let (active, raw_list) = if parts.len() == 2 && parts[1].starts_with('[') {
+            let list_json = parts.pop().unwrap_or_default();
+            let active_json = parts.pop().unwrap_or_default();
+            let active = serde_json::from_str::<WorkspaceInfo>(&active_json).ok();
+            (active, list_json)
+        } else {
+            let active = parts
+                .first()
+                .and_then(|p| serde_json::from_str::<WorkspaceInfo>(p).ok())
+                .or_else(|| self.active_workspace().ok());
+            let raw = self.request("j/workspaces")?;
+            (active, raw)
+        };
+        let mut list: Vec<WorkspaceInfo> = serde_json::from_str(&raw_list).map_err(|e| {
             WaywiError::IpcError(format!("failed to parse Hyprland workspaces JSON: {e}"))
         })?;
         sort_workspaces(&mut list);
@@ -278,7 +293,7 @@ impl HyprlandClient {
     }
 
     /// Moves `workspace` (e.g. `"2"`, `"name:code"`, `"special:magic"`) to `monitor` (e.g.
-    /// `"DP-1"`, `"l"`, `"r"`).
+    /// `"DP-1"`, `"+1"`, `"-1"`, `"l"`, `"r"`).
     pub fn move_workspace_to_monitor(&self, workspace: &str, monitor: &str) -> Result<()> {
         validate_arg(workspace)?;
         let ws = workspace.trim();
@@ -287,7 +302,7 @@ impl HyprlandClient {
                 "Hyprland workspace selector must not be empty".to_owned(),
             ));
         }
-        validate_token("monitor", monitor)?;
+        validate_monitor_selector(monitor)?;
         let legacy_arg = format!("{ws} {monitor}");
         let lua_ws = if let Ok(id) = ws.parse::<i32>() {
             id.to_string()
@@ -300,21 +315,28 @@ impl HyprlandClient {
         self.dispatch_with_lua_fallback("moveworkspacetomonitor", &legacy_arg, &lua_cmd)
     }
 
-    /// Renames workspace `id` to `new_name`.
+    /// Renames workspace `id` to `new_name`. Pass an empty string (`""`) to reset the workspace
+    /// back to its default numeric name.
     pub fn rename_workspace(&self, id: WorkspaceId, new_name: &str) -> Result<()> {
         validate_arg(new_name)?;
         let trimmed = new_name.trim();
-        if trimmed.is_empty() {
-            return Err(WaywiError::IpcError(
-                "Hyprland workspace name must not be empty".to_owned(),
-            ));
-        }
-        let legacy_arg = format!("{} {trimmed}", id.0);
-        let escaped = escape_lua_string(trimmed);
-        let lua_cmd = format!(
-            "dispatch hl.dsp.workspace.rename({{ id = {}, name = \"{escaped}\" }})",
-            id.0
-        );
+        let legacy_arg = if trimmed.is_empty() {
+            id.0.to_string()
+        } else {
+            format!("{} {trimmed}", id.0)
+        };
+        let lua_cmd = if trimmed.is_empty() {
+            format!(
+                "dispatch hl.dsp.workspace.rename({{ workspace = {} }})",
+                id.0
+            )
+        } else {
+            let escaped = escape_lua_string(trimmed);
+            format!(
+                "dispatch hl.dsp.workspace.rename({{ workspace = {}, name = \"{escaped}\" }})",
+                id.0
+            )
+        };
         self.dispatch_with_lua_fallback("renameworkspace", &legacy_arg, &lua_cmd)
     }
 
@@ -616,6 +638,19 @@ fn validate_token(field: &str, value: &str) -> Result<()> {
     {
         return Err(WaywiError::IpcError(format!(
             "invalid Hyprland {field} token `{value}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_monitor_selector(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.' | b':'))
+    {
+        return Err(WaywiError::IpcError(format!(
+            "invalid Hyprland monitor selector `{value}`"
         )));
     }
     Ok(())
@@ -1238,22 +1273,17 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for _ in 0..11 {
+            for _ in 0..12 {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut req = [0u8; 512];
                 let n = conn.read(&mut req).unwrap();
                 let cmd = std::str::from_utf8(&req[..n]).unwrap().to_owned();
                 let resp: &str = match cmd.as_str() {
-                    "j/activeworkspace" => {
-                        r#"{"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"}"#
-                    }
-                    "j/workspaces" => {
-                        r#"[
-                            {"address":"special:magic","type":"special","name":"special:magic","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"dwindle"},
-                            {"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"},
-                            {"address":"1","id":1,"type":"normal","name":"1","monitor":"DP-1","monitorID":0,"windows":2,"tiledLayout":"dwindle"}
-                        ]"#
-                    }
+                    "[[BATCH]]j/activeworkspace;j/workspaces" => concat!(
+                        r#"{"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"}"#,
+                        "\n\n\n",
+                        r#"[{"address":"special:magic","type":"special","name":"special:magic","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"dwindle"},{"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"},{"address":"1","id":1,"type":"normal","name":"1","monitor":"DP-1","monitorID":0,"windows":2,"tiledLayout":"dwindle"}]"#
+                    ),
                     "j/workspacerules" => {
                         r#"[{"workspaceString":"5","enabled":true,"persistent":true,"layout":"master"}]"#
                     }
@@ -1268,7 +1298,9 @@ mod tests {
                     "dispatch hl.dsp.workspace.move({ workspace = 5, monitor = \"HDMI-A-1\" })" => {
                         "ok"
                     }
-                    "dispatch hl.dsp.workspace.rename({ id = 5, name = \"code\" })" => "ok",
+                    "dispatch hl.dsp.workspace.move({ workspace = 5, monitor = \"+1\" })" => "ok",
+                    "dispatch hl.dsp.workspace.rename({ workspace = 5, name = \"code\" })" => "ok",
+                    "dispatch hl.dsp.workspace.rename({ workspace = 5 })" => "ok",
                     other => panic!("unexpected workspace command: {other}"),
                 };
                 seen.push(cmd);
@@ -1308,10 +1340,12 @@ mod tests {
         client.switch_workspace_relative(1, true).unwrap();
         client.switch_workspace_previous().unwrap();
         client.move_workspace_to_monitor("5", "HDMI-A-1").unwrap();
+        client.move_workspace_to_monitor("5", "+1").unwrap();
         client.rename_workspace(WorkspaceId(5), "code").unwrap();
+        client.rename_workspace(WorkspaceId(5), "").unwrap();
 
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
 
         // Multiple Hyprland v0.57+ special workspaces share WorkspaceId(0) without colliding.
         assert!(apply_workspace_event(

@@ -220,11 +220,16 @@ impl WorkspaceInfo {
     /// `"special:magic"`, or `"name:code"`).
     #[must_use]
     pub fn target_spec(&self) -> String {
+        if self.id.0 > 0 {
+            return self.id.0.to_string();
+        }
         if !self.address.is_empty() {
-            self.address.clone()
-        } else if self.id.0 > 0 {
-            self.id.0.to_string()
-        } else if self.name.starts_with("special:") || self.name.starts_with("name:") {
+            if self.is_named() && !self.address.starts_with("name:") {
+                return format!("name:{}", self.address);
+            }
+            return self.address.clone();
+        }
+        if self.name.starts_with("special:") || self.name.starts_with("name:") {
             self.name.clone()
         } else if !self.name.is_empty() {
             format!("name:{}", self.name)
@@ -297,6 +302,13 @@ impl From<WorkspaceInfoJson> for WorkspaceInfo {
             WorkspaceType::from_hyprland(raw.workspace_type.as_deref(), raw.id, &raw.name);
         let address = if !raw.address.is_empty() {
             raw.address
+        } else if raw.id > 0 {
+            raw.id.to_string()
+        } else if workspace_type == WorkspaceType::Named
+            && !raw.name.is_empty()
+            && !raw.name.starts_with("name:")
+        {
+            format!("name:{}", raw.name)
         } else if !raw.name.is_empty() {
             raw.name.clone()
         } else if raw.id != 0 {
@@ -1363,5 +1375,18 @@ mod tests {
             serde_json::from_str(r#"{"address":"","type":"","name":""}"#).unwrap();
         assert!(empty_ref.is_empty());
         assert!(!empty_ref.is_special());
+
+        // Legacy (<0.57) renamed numbered workspace and named workspace without `address`.
+        let legacy_renamed: WorkspaceInfo =
+            serde_json::from_str(r#"{"id":2,"name":"dev","monitor":"DP-1","windows":1}"#).unwrap();
+        assert_eq!(legacy_renamed.address, "2");
+        assert_eq!(legacy_renamed.target_spec(), "2");
+
+        let named_ws: WorkspaceInfo =
+            serde_json::from_str(r#"{"type":"named","name":"code","monitor":"DP-1","windows":1}"#)
+                .unwrap();
+        assert!(named_ws.is_named());
+        assert_eq!(named_ws.address, "name:code");
+        assert_eq!(named_ws.target_spec(), "name:code");
     }
 }
