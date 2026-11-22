@@ -30,9 +30,8 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         },
         "workspacev2" => {
             let (id_str, ws_name) = data.split_once(',')?;
-            let id = id_str.parse::<i32>().ok()?;
             HyprlandEvent::WorkspaceV2 {
-                id: WorkspaceId(id),
+                id: parse_workspace_id_or_address(id_str),
                 name: ws_name.to_owned(),
             }
         }
@@ -45,10 +44,9 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         }
         "focusedmonv2" => {
             let (mon, id_str) = data.split_once(',')?;
-            let id = id_str.parse::<i32>().ok()?;
             HyprlandEvent::FocusedMonitorV2 {
                 monitor: mon.to_owned(),
-                workspace_id: WorkspaceId(id),
+                workspace_id: parse_workspace_id_or_address(id_str),
             }
         }
         "createworkspace" => HyprlandEvent::CreateWorkspace {
@@ -56,9 +54,8 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         },
         "createworkspacev2" => {
             let (id_str, ws_name) = data.split_once(',')?;
-            let id = id_str.parse::<i32>().ok()?;
             HyprlandEvent::CreateWorkspaceV2 {
-                id: WorkspaceId(id),
+                id: parse_workspace_id_or_address(id_str),
                 name: ws_name.to_owned(),
             }
         }
@@ -67,28 +64,26 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         },
         "destroyworkspacev2" => {
             let (id_str, ws_name) = data.split_once(',')?;
-            let id = id_str.parse::<i32>().ok()?;
             HyprlandEvent::DestroyWorkspaceV2 {
-                id: WorkspaceId(id),
+                id: parse_workspace_id_or_address(id_str),
                 name: ws_name.to_owned(),
             }
         }
         "moveworkspacev2" => {
             let mut parts = data.splitn(3, ',');
-            let id = parts.next()?.parse::<i32>().ok()?;
+            let id = parse_workspace_id_or_address(parts.next()?);
             let ws_name = parts.next()?.to_owned();
             let monitor = parts.next()?.to_owned();
             HyprlandEvent::MoveWorkspaceV2 {
-                id: WorkspaceId(id),
+                id,
                 name: ws_name,
                 monitor,
             }
         }
         "renameworkspace" => {
             let (id_str, ws_name) = data.split_once(',')?;
-            let id = id_str.parse::<i32>().ok()?;
             HyprlandEvent::RenameWorkspace {
-                id: WorkspaceId(id),
+                id: parse_workspace_id_or_address(id_str),
                 name: ws_name.to_owned(),
             }
         }
@@ -100,14 +95,12 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
             }
         }
         "activespecialv2" => {
-            // Format: `WORKSPACEID,WORKSPACENAME,MONNAME` (empty ID/name when closed: `,,DP-1`).
+            // Format: `WORKSPACEID_OR_ADDR,WORKSPACENAME,MONNAME` (empty when closed: `,,DP-1`).
+            // On Hyprland v0.57+, special workspaces pass string addresses (`special:magic`) in the
+            // first field rather than negative numeric IDs.
             let (id_str, rest) = data.split_once(',')?;
             let (ws_name, monitor) = rest.rsplit_once(',')?;
-            let workspace_id = if id_str.is_empty() {
-                None
-            } else {
-                Some(WorkspaceId(id_str.parse::<i32>().ok()?))
-            };
+            let workspace_id = id_str.trim().parse::<i32>().ok().map(WorkspaceId);
             HyprlandEvent::ActiveSpecialV2 {
                 workspace_id,
                 workspace_name: ws_name.to_owned(),
@@ -153,7 +146,7 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         "movewindowv2" => {
             let mut parts = data.splitn(3, ',');
             let address = parts.next()?.to_owned();
-            let workspace_id = WorkspaceId(parts.next()?.parse::<i32>().ok()?);
+            let workspace_id = parse_workspace_id_or_address(parts.next()?);
             let workspace_name = parts.next()?.to_owned();
             HyprlandEvent::MoveWindowV2 {
                 address,
@@ -239,6 +232,17 @@ pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
         },
     };
     Some(event)
+}
+
+/// Parses a Hyprland `socket2` workspace ID field: numeric on Hyprland `<0.57` and for regular
+/// numbered workspaces, or a string address (e.g. `"special:magic"`) on Hyprland `v0.57+` (mapped
+/// to `WorkspaceId(0)` so the accompanying workspace name/address stays intact).
+#[inline]
+fn parse_workspace_id_or_address(raw: &str) -> WorkspaceId {
+    raw.trim()
+        .parse::<i32>()
+        .map(WorkspaceId)
+        .unwrap_or(WorkspaceId(0))
 }
 
 /// Zero-polling `socket2` listener bridge feeding Hyprland events into `calloop::channel`.
@@ -674,6 +678,37 @@ mod tests {
         assert_eq!(
             parse_event_line("configreloaded>>"),
             Some(HyprlandEvent::ConfigReloaded)
+        );
+        // Hyprland v0.57+ string-addressed special/named workspace events.
+        assert_eq!(
+            parse_event_line("createworkspacev2>>special:magic,special:magic"),
+            Some(HyprlandEvent::CreateWorkspaceV2 {
+                id: WorkspaceId(0),
+                name: "special:magic".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_event_line("destroyworkspacev2>>special:magic,special:magic"),
+            Some(HyprlandEvent::DestroyWorkspaceV2 {
+                id: WorkspaceId(0),
+                name: "special:magic".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_event_line("activespecialv2>>special:magic,special:magic,DP-1"),
+            Some(HyprlandEvent::ActiveSpecialV2 {
+                workspace_id: None,
+                workspace_name: "special:magic".to_owned(),
+                monitor: "DP-1".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_event_line("movewindowv2>>0xabc,special:magic,special:magic"),
+            Some(HyprlandEvent::MoveWindowV2 {
+                address: "0xabc".to_owned(),
+                workspace_id: WorkspaceId(0),
+                workspace_name: "special:magic".to_owned(),
+            })
         );
     }
 

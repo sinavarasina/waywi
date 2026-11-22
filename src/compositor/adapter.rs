@@ -2,12 +2,17 @@ use crate::capabilities::Capability;
 use crate::error::{Result, WaywiError};
 
 /// Common neutral workspace descriptor exposed when using [`CompositorClient`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompositorWorkspace {
     pub id: i32,
     pub name: String,
     pub monitor: String,
     pub focused: bool,
+    /// `true` when this workspace is a scratchpad/special workspace (e.g. Hyprland `special:*`).
+    pub is_special: bool,
+    /// Active workspace layout string if reported by the compositor (e.g. `"dwindle"`,
+    /// `"master"`, `"monocle"`, `"scrolling"`, `"splith"`, `"tabbed"`).
+    pub layout: Option<String>,
 }
 
 /// Target workspace identifier for [`CompositorClient::switch_workspace`].
@@ -49,11 +54,17 @@ impl<'a> CompositorClient<'a> {
             return Ok(h
                 .workspaces()?
                 .into_iter()
-                .map(|w| CompositorWorkspace {
-                    id: w.id.0,
-                    name: w.name,
-                    monitor: w.monitor,
-                    focused: w.focused,
+                .map(|w| {
+                    let is_special = w.is_special();
+                    let layout = w.layout.is_known().then(|| w.layout.as_str().to_owned());
+                    CompositorWorkspace {
+                        id: w.id.0,
+                        name: w.name,
+                        monitor: w.monitor,
+                        focused: w.focused,
+                        is_special,
+                        layout,
+                    }
                 })
                 .collect());
         }
@@ -67,6 +78,8 @@ impl<'a> CompositorClient<'a> {
                     name: w.name,
                     monitor: w.output,
                     focused: w.focused,
+                    is_special: false,
+                    layout: (!w.layout.is_empty()).then_some(w.layout),
                 })
                 .collect());
         }

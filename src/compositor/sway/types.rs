@@ -11,7 +11,7 @@ pub enum WorkspaceRef<'a> {
 }
 
 /// Sway workspace snapshot (`GET_WORKSPACES` or `workspace` event payload).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct SwayWorkspace {
     pub id: i64,
     pub num: i32,
@@ -24,6 +24,8 @@ pub struct SwayWorkspace {
     pub urgent: bool,
     #[serde(default)]
     pub output: String,
+    #[serde(default)]
+    pub layout: String,
 }
 
 /// Sway output metadata (`GET_OUTPUTS`).

@@ -40,6 +40,7 @@ fn hyprland_ipc_parsing_and_mock_socket_roundtrip() {
             monitor: "eDP-1".into(),
             windows: 1,
             focused: true,
+            ..WorkspaceInfo::default()
         },
         WorkspaceInfo {
             id: WorkspaceId(2),
@@ -47,6 +48,7 @@ fn hyprland_ipc_parsing_and_mock_socket_roundtrip() {
             monitor: "eDP-1".into(),
             windows: 0,
             focused: false,
+            ..WorkspaceInfo::default()
         },
     ];
     assert!(apply_workspace_event(

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -7,7 +8,11 @@ use crate::error::{Result, WaywiError};
 use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
 
 /// Typed Hyprland workspace identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+///
+/// On Hyprland v0.57+, special and named workspaces omit numeric `"id"` in IPC JSON and default
+/// to `WorkspaceId(0)` while exposing their stable string identifier via
+/// [`WorkspaceInfo::address`] and [`WorkspaceInfo::name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize)]
 #[serde(transparent)]
 pub struct WorkspaceId(pub i32);
 
@@ -32,17 +37,392 @@ impl From<i32> for WorkspaceId {
     }
 }
 
-/// Workspace metadata returned by Hyprland IPC or maintained incrementally from events.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Classification of a Hyprland workspace (`type` field on Hyprland v0.57+, inferred from `id`
+/// and `name` on older Hyprland releases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WorkspaceType {
+    /// Standard numbered workspace (e.g. `"1"`, `"2"`).
+    #[default]
+    Normal,
+    /// Scratchpad / special workspace (e.g. `"special:magic"`).
+    Special,
+    /// Named non-special workspace (e.g. `"name:code"`).
+    Named,
+}
+
+impl WorkspaceType {
+    /// Classifies a workspace from Hyprland's optional `"type"` string, falling back to numeric
+    /// `id` and `name` heuristics on Hyprland <0.57.
+    #[must_use]
+    pub fn from_hyprland(raw_type: Option<&str>, id: i32, name: &str) -> Self {
+        if let Some(raw) = raw_type.map(str::trim).filter(|s| !s.is_empty()) {
+            if raw.eq_ignore_ascii_case("special") {
+                return Self::Special;
+            }
+            if raw.eq_ignore_ascii_case("named") {
+                return Self::Named;
+            }
+            if raw.eq_ignore_ascii_case("normal") {
+                return Self::Normal;
+            }
+        }
+        if id < 0 || name.starts_with("special:") {
+            Self::Special
+        } else if name.starts_with("name:") || (id == 0 && !name.is_empty()) {
+            Self::Named
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+/// Tiling layout engine active on a Hyprland workspace (`tiledLayout` on Hyprland v0.57+, or
+/// `general:layout` globally).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum HyprlandLayout {
+    /// Recursive binary-split layout (`"dwindle"`).
+    Dwindle,
+    /// Master-stack layout (`"master"`).
+    Master,
+    /// Full-area stacked monocle layout (`"monocle"`).
+    Monocle,
+    /// Horizontal/vertical column scrolling layout (`"scrolling"`).
+    Scrolling,
+    /// Another built-in or plugin-provided layout name (e.g. `"hy3"`).
+    Custom(String),
+    /// Layout was not reported (e.g. older Hyprland releases or empty payload).
+    #[default]
+    Unknown,
+}
+
+impl HyprlandLayout {
+    /// Parses a Hyprland layout identifier string (`"dwindle"`, `"master"`, `"monocle"`,
+    /// `"scrolling"`, or a plugin layout name).
+    #[must_use]
+    pub fn from_hyprland_str(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            Self::Unknown
+        } else if trimmed.eq_ignore_ascii_case("dwindle") {
+            Self::Dwindle
+        } else if trimmed.eq_ignore_ascii_case("master") {
+            Self::Master
+        } else if trimmed.eq_ignore_ascii_case("monocle") {
+            Self::Monocle
+        } else if trimmed.eq_ignore_ascii_case("scrolling") {
+            Self::Scrolling
+        } else {
+            Self::Custom(trimmed.to_owned())
+        }
+    }
+
+    /// Returns the Hyprland wire/config string for this layout (`""` when [`Self::Unknown`]).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Dwindle => "dwindle",
+            Self::Master => "master",
+            Self::Monocle => "monocle",
+            Self::Scrolling => "scrolling",
+            Self::Custom(name) => name.as_str(),
+            Self::Unknown => "",
+        }
+    }
+
+    /// Returns `true` when this layout is a concrete layout name (not [`Self::Unknown`]).
+    #[inline]
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
+impl fmt::Display for HyprlandLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Workspace metadata returned by Hyprland IPC (`j/workspaces`, `j/activeworkspace`) or
+/// maintained incrementally from `socket2` events.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "WorkspaceInfoJson")]
 pub struct WorkspaceInfo {
+    /// Typed numeric workspace ID (`WorkspaceId(0)` for Hyprland v0.57+ special/named workspaces
+    /// that omit `"id"`).
     pub id: WorkspaceId,
+    /// Stable string workspace address (`"address"` on Hyprland v0.57+, e.g. `"3"`,
+    /// `"special:magic"`; falls back to `name` or `id` on older Hyprland).
+    pub address: String,
+    /// Workspace classification (`Normal`, `Special`, or `Named`).
+    pub workspace_type: WorkspaceType,
+    /// Display name of the workspace (e.g. `"1"`, `"special:magic"`).
     pub name: String,
-    #[serde(default)]
+    /// Monitor connector name owning this workspace (e.g. `"DP-1"`).
     pub monitor: String,
-    #[serde(default)]
+    /// Numeric monitor ID owning this workspace (`monitorID`), or `None` when unassigned.
+    pub monitor_id: Option<i64>,
+    /// Number of windows currently on this workspace.
     pub windows: u32,
-    #[serde(skip_deserializing, default)]
+    /// `true` when any window on this workspace is fullscreen (`hasfullscreen`).
+    pub has_fullscreen: bool,
+    /// Hex address of the most recently focused window on this workspace (`lastwindow`).
+    pub last_window: String,
+    /// Title of the most recently focused window on this workspace (`lastwindowtitle`).
+    pub last_window_title: String,
+    /// `true` when the workspace is configured as persistent (`ispersistent`).
+    pub is_persistent: bool,
+    /// Active tiling layout on this workspace (`tiledLayout` on Hyprland v0.57+).
+    pub layout: HyprlandLayout,
+    /// `true` when this workspace is the currently focused/active workspace.
     pub focused: bool,
+}
+
+impl WorkspaceInfo {
+    /// Returns `true` if this workspace is a special/scratchpad workspace.
+    #[inline]
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.workspace_type == WorkspaceType::Special
+            || self.id.0 < 0
+            || self.name.starts_with("special:")
+            || self.address.starts_with("special:")
+    }
+
+    /// Returns `true` if this workspace is a named (non-special) workspace.
+    #[inline]
+    #[must_use]
+    pub fn is_named(&self) -> bool {
+        self.workspace_type == WorkspaceType::Named && !self.is_special()
+    }
+
+    /// Returns `true` if this workspace is a regular numbered workspace.
+    #[inline]
+    #[must_use]
+    pub fn is_normal(&self) -> bool {
+        !self.is_special() && !self.is_named()
+    }
+
+    /// Returns the special workspace short name without the `"special:"` prefix (e.g. `"magic"`
+    /// for `"special:magic"`), or `None` if this is not a special workspace.
+    #[must_use]
+    pub fn special_name(&self) -> Option<&str> {
+        if !self.is_special() {
+            return None;
+        }
+        self.name
+            .strip_prefix("special:")
+            .or_else(|| self.address.strip_prefix("special:"))
+            .or(Some(""))
+    }
+
+    /// Returns a Hyprland workspace selector string suitable for dispatchers (e.g. `"3"`,
+    /// `"special:magic"`, or `"name:code"`).
+    #[must_use]
+    pub fn target_spec(&self) -> String {
+        if !self.address.is_empty() {
+            self.address.clone()
+        } else if self.id.0 > 0 {
+            self.id.0.to_string()
+        } else if self.name.starts_with("special:") || self.name.starts_with("name:") {
+            self.name.clone()
+        } else if !self.name.is_empty() {
+            format!("name:{}", self.name)
+        } else {
+            self.id.0.to_string()
+        }
+    }
+
+    /// Returns `true` when `self` and `other` identify the same workspace across both Hyprland
+    /// `<0.57` (numeric IDs) and `v0.57+` (string addresses for special/named workspaces).
+    #[must_use]
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        if !self.address.is_empty() && !other.address.is_empty() {
+            return self.address == other.address;
+        }
+        if self.id.0 != 0 && other.id.0 != 0 {
+            return self.id == other.id;
+        }
+        !self.name.is_empty() && self.name == other.name
+    }
+
+    /// Returns `true` when `self` matches a `socket2` `(id, name)` pair (handling `WorkspaceId(0)`
+    /// for Hyprland v0.57+ special/named workspace events without colliding across specials).
+    #[must_use]
+    pub fn matches_ref(&self, id: WorkspaceId, name: &str) -> bool {
+        if id.0 != 0 && self.id.0 != 0 {
+            return self.id == id;
+        }
+        if !name.is_empty() {
+            return self.name == name
+                || (!self.address.is_empty() && self.address == name)
+                || self.name.strip_prefix("name:") == Some(name)
+                || name.strip_prefix("name:") == Some(self.name.as_str());
+        }
+        id.0 != 0 && self.id == id
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceInfoJson {
+    #[serde(default)]
+    id: i32,
+    #[serde(default)]
+    address: String,
+    #[serde(rename = "type", default)]
+    workspace_type: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    monitor: String,
+    #[serde(rename = "monitorID", default)]
+    monitor_id: Option<i64>,
+    #[serde(default)]
+    windows: u32,
+    #[serde(rename = "hasfullscreen", default)]
+    has_fullscreen: bool,
+    #[serde(rename = "lastwindow", default)]
+    last_window: String,
+    #[serde(rename = "lastwindowtitle", default)]
+    last_window_title: String,
+    #[serde(rename = "ispersistent", default)]
+    is_persistent: bool,
+    #[serde(rename = "tiledLayout", alias = "tiled_layout", default)]
+    tiled_layout: String,
+}
+
+impl From<WorkspaceInfoJson> for WorkspaceInfo {
+    fn from(raw: WorkspaceInfoJson) -> Self {
+        let workspace_type =
+            WorkspaceType::from_hyprland(raw.workspace_type.as_deref(), raw.id, &raw.name);
+        let address = if !raw.address.is_empty() {
+            raw.address
+        } else if !raw.name.is_empty() {
+            raw.name.clone()
+        } else if raw.id != 0 {
+            raw.id.to_string()
+        } else {
+            String::new()
+        };
+        Self {
+            id: WorkspaceId(raw.id),
+            address,
+            workspace_type,
+            name: raw.name,
+            monitor: raw.monitor,
+            monitor_id: raw.monitor_id.filter(|&m| m >= 0),
+            windows: raw.windows,
+            has_fullscreen: raw.has_fullscreen,
+            last_window: raw.last_window,
+            last_window_title: raw.last_window_title,
+            is_persistent: raw.is_persistent,
+            layout: HyprlandLayout::from_hyprland_str(&raw.tiled_layout),
+            focused: false,
+        }
+    }
+}
+
+/// Workspace rule definition returned by `j/workspacerules`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "WorkspaceRuleJson")]
+pub struct WorkspaceRuleInfo {
+    /// Raw workspace rule selector (`workspaceString`, e.g. `"5"`, `"s[true] m[DP-1]"`).
+    pub workspace_string: String,
+    /// Whether the rule is currently enabled (`enabled`; defaults to `true`).
+    pub enabled: bool,
+    /// Optional monitor binding (`monitor`).
+    pub monitor: Option<String>,
+    /// Optional default-workspace flag (`default`).
+    pub default: Option<bool>,
+    /// Optional persistent-workspace flag (`persistent`).
+    pub persistent: Option<bool>,
+    /// Optional inner gaps override `[top, right, bottom, left]` (`gapsIn`).
+    pub gaps_in: Option<[i64; 4]>,
+    /// Optional outer gaps override `[top, right, bottom, left]` (`gapsOut`).
+    pub gaps_out: Option<[i64; 4]>,
+    /// Optional border size override (`borderSize`).
+    pub border_size: Option<i64>,
+    /// Optional border visibility override (`border`).
+    pub border: Option<bool>,
+    /// Optional rounding override (`rounding`).
+    pub rounding: Option<bool>,
+    /// Optional window decoration override (`decorate`).
+    pub decorate: Option<bool>,
+    /// Optional window shadow override (`shadow`).
+    pub shadow: Option<bool>,
+    /// Optional layout override configured on this rule (`layout` / `layoutName`).
+    pub layout: Option<HyprlandLayout>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawGaps {
+    Edges([i64; 4]),
+    Uniform(i64),
+}
+
+impl RawGaps {
+    fn into_edges(self) -> [i64; 4] {
+        match self {
+            Self::Edges(e) => e,
+            Self::Uniform(v) => [v, v, v, v],
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceRuleJson {
+    #[serde(rename = "workspaceString", default)]
+    workspace_string: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    monitor: Option<String>,
+    #[serde(default)]
+    default: Option<bool>,
+    #[serde(default)]
+    persistent: Option<bool>,
+    #[serde(rename = "gapsIn", default)]
+    gaps_in: Option<RawGaps>,
+    #[serde(rename = "gapsOut", default)]
+    gaps_out: Option<RawGaps>,
+    #[serde(rename = "borderSize", default)]
+    border_size: Option<i64>,
+    #[serde(default)]
+    border: Option<bool>,
+    #[serde(default)]
+    rounding: Option<bool>,
+    #[serde(default)]
+    decorate: Option<bool>,
+    #[serde(default)]
+    shadow: Option<bool>,
+    #[serde(default, alias = "layoutName")]
+    layout: Option<String>,
+}
+
+impl From<WorkspaceRuleJson> for WorkspaceRuleInfo {
+    fn from(raw: WorkspaceRuleJson) -> Self {
+        let layout = raw
+            .layout
+            .as_deref()
+            .map(HyprlandLayout::from_hyprland_str)
+            .filter(HyprlandLayout::is_known);
+        Self {
+            workspace_string: raw.workspace_string,
+            enabled: raw.enabled,
+            monitor: raw.monitor.filter(|s| !s.is_empty()),
+            default: raw.default,
+            persistent: raw.persistent,
+            gaps_in: raw.gaps_in.map(RawGaps::into_edges),
+            gaps_out: raw.gaps_out.map(RawGaps::into_edges),
+            border_size: raw.border_size,
+            border: raw.border,
+            rounding: raw.rounding,
+            decorate: raw.decorate,
+            shadow: raw.shadow,
+            layout,
+        }
+    }
 }
 
 /// Active/open client window metadata from Hyprland IPC (`j/activewindow`, `j/clients`).
@@ -217,12 +597,50 @@ fn normalize_content_type(raw: &str) -> Option<String> {
     }
 }
 
+/// Lightweight workspace reference embedded in [`ClientInfo::workspace`] and
+/// [`MonitorInfo::active_workspace`] / [`MonitorInfo::special_workspace`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct WorkspaceRefJson {
     #[serde(default)]
     pub id: i32,
     #[serde(default)]
+    pub address: String,
+    #[serde(rename = "type", default)]
+    pub workspace_type: String,
+    #[serde(default)]
     pub name: String,
+}
+
+impl WorkspaceRefJson {
+    /// Returns `true` when this reference is unset/empty (e.g., an inactive `specialWorkspace`
+    /// on `j/monitors`).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.id == 0 && self.name.is_empty() && self.address.is_empty()
+    }
+
+    /// Returns `true` when this reference targets a special/scratchpad workspace.
+    #[inline]
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.workspace_type.eq_ignore_ascii_case("special")
+            || self.id < 0
+            || self.name.starts_with("special:")
+            || self.address.starts_with("special:")
+    }
+
+    /// Returns the special workspace short name without the `"special:"` prefix, if special.
+    #[must_use]
+    pub fn special_name(&self) -> Option<&str> {
+        if !self.is_special() {
+            return None;
+        }
+        self.name
+            .strip_prefix("special:")
+            .or_else(|| self.address.strip_prefix("special:"))
+            .or(Some(""))
+    }
 }
 
 /// Monitor metadata from Hyprland IPC (`j/monitors`).
@@ -468,16 +886,6 @@ impl From<HyprlandOptionJson> for HyprlandOption {
             set: raw.set,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct ActiveWorkspaceJson {
-    pub id: i32,
-    pub name: String,
-    #[serde(default)]
-    pub monitor: String,
-    #[serde(default)]
-    pub windows: u32,
 }
 
 /// Incremental event emitted by Hyprland's `socket2` event stream.
@@ -834,5 +1242,126 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("\"static\""))
         );
+    }
+
+    #[test]
+    fn deserializes_hyprland_0_57_workspaces_without_special_id_layouts_and_rules() {
+        let workspaces_json = r#"[
+            {
+                "address": "1",
+                "id": 1,
+                "type": "normal",
+                "name": "1",
+                "monitor": "DP-1",
+                "monitorID": 0,
+                "windows": 2,
+                "hasfullscreen": true,
+                "lastwindow": "0x55d4ad9018d0",
+                "lastwindowtitle": "Firefox",
+                "ispersistent": true,
+                "tiledLayout": "dwindle"
+            },
+            {
+                "address": "5",
+                "id": 5,
+                "type": "normal",
+                "name": "5",
+                "monitor": "DP-1",
+                "monitorID": 0,
+                "windows": 1,
+                "hasfullscreen": false,
+                "lastwindow": "0x55d4abc9bed0",
+                "lastwindowtitle": "foot",
+                "ispersistent": false,
+                "tiledLayout": "master"
+            },
+            {
+                "address": "6",
+                "id": 6,
+                "type": "normal",
+                "name": "6",
+                "monitor": "DP-1",
+                "monitorID": 0,
+                "windows": 1,
+                "tiledLayout": "monocle"
+            },
+            {
+                "address": "7",
+                "id": 7,
+                "type": "normal",
+                "name": "7",
+                "monitor": "DP-1",
+                "monitorID": 0,
+                "windows": 1,
+                "tiledLayout": "scrolling"
+            },
+            {
+                "address": "special:magic",
+                "type": "special",
+                "name": "special:magic",
+                "monitor": "DP-1",
+                "monitorID": 0,
+                "windows": 1,
+                "hasfullscreen": false,
+                "lastwindow": "0x55d4abc452c0",
+                "lastwindowtitle": "foot",
+                "ispersistent": false,
+                "tiledLayout": "hy3"
+            }
+        ]"#;
+
+        let list: Vec<WorkspaceInfo> = serde_json::from_str(workspaces_json).unwrap();
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[0].id, WorkspaceId(1));
+        assert_eq!(list[0].address, "1");
+        assert_eq!(list[0].workspace_type, WorkspaceType::Normal);
+        assert_eq!(list[0].monitor_id, Some(0));
+        assert!(list[0].has_fullscreen);
+        assert!(list[0].is_persistent);
+        assert_eq!(list[0].last_window, "0x55d4ad9018d0");
+        assert_eq!(list[0].last_window_title, "Firefox");
+        assert_eq!(list[0].layout, HyprlandLayout::Dwindle);
+        assert!(list[0].is_normal());
+        assert_eq!(list[0].special_name(), None);
+
+        assert_eq!(list[1].layout, HyprlandLayout::Master);
+        assert_eq!(list[2].layout, HyprlandLayout::Monocle);
+        assert_eq!(list[3].layout, HyprlandLayout::Scrolling);
+
+        let special = &list[4];
+        assert_eq!(special.id, WorkspaceId(0));
+        assert_eq!(special.address, "special:magic");
+        assert_eq!(special.workspace_type, WorkspaceType::Special);
+        assert!(special.is_special());
+        assert!(!special.is_normal());
+        assert_eq!(special.special_name(), Some("magic"));
+        assert_eq!(special.target_spec(), "special:magic");
+        assert_eq!(special.layout, HyprlandLayout::Custom("hy3".to_owned()));
+
+        let rules_json = r#"[
+            {"workspaceString":"5","enabled":true,"persistent":true,"layout":"master","gapsOut":[10,20,10,20]},
+            {"workspaceString":"s[true] m[DP-1]","enabled":true,"gapsIn":4,"gapsOut":[106,192,106,192]}
+        ]"#;
+        let rules: Vec<WorkspaceRuleInfo> = serde_json::from_str(rules_json).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].workspace_string, "5");
+        assert_eq!(rules[0].persistent, Some(true));
+        assert_eq!(rules[0].layout, Some(HyprlandLayout::Master));
+        assert_eq!(rules[0].gaps_out, Some([10, 20, 10, 20]));
+        assert_eq!(rules[1].gaps_in, Some([4, 4, 4, 4]));
+        assert_eq!(rules[1].gaps_out, Some([106, 192, 106, 192]));
+
+        let special_ref: WorkspaceRefJson = serde_json::from_str(
+            r#"{"address":"special:magic","type":"special","name":"special:magic"}"#,
+        )
+        .unwrap();
+        assert!(!special_ref.is_empty());
+        assert!(special_ref.is_special());
+        assert_eq!(special_ref.special_name(), Some("magic"));
+
+        let empty_ref: WorkspaceRefJson =
+            serde_json::from_str(r#"{"address":"","type":"","name":""}"#).unwrap();
+        assert!(empty_ref.is_empty());
+        assert!(!empty_ref.is_special());
     }
 }

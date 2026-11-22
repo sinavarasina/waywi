@@ -66,8 +66,8 @@ pub use crate::control::{Control, ControlRequest, Signal};
 #[cfg(feature = "hyprland-ipc")]
 pub use crate::hyprland::{
     ClientInfo, CursorPos, Hyprland, HyprlandClient, HyprlandDevices, HyprlandEvent,
-    HyprlandKeyboard, HyprlandMouse, HyprlandOption, HyprlandOptionValue, HyprlandVersion,
-    MonitorInfo, WorkspaceId, WorkspaceInfo,
+    HyprlandKeyboard, HyprlandLayout, HyprlandMouse, HyprlandOption, HyprlandOptionValue,
+    HyprlandVersion, MonitorInfo, WorkspaceId, WorkspaceInfo, WorkspaceRuleInfo, WorkspaceType,
 };
 
 #[cfg(feature = "sway-ipc")]

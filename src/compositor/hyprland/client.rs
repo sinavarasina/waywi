@@ -7,8 +7,9 @@ use std::time::Duration;
 use crate::error::{Result, WaywiError};
 
 use super::types::{
-    ActiveWorkspaceJson, ClientInfo, CursorPos, HyprlandDevices, HyprlandEvent, HyprlandOption,
-    HyprlandSockets, HyprlandVersion, MonitorInfo, WorkspaceId, WorkspaceInfo,
+    ClientInfo, CursorPos, HyprlandDevices, HyprlandEvent, HyprlandLayout, HyprlandOption,
+    HyprlandSockets, HyprlandVersion, MonitorInfo, WorkspaceId, WorkspaceInfo, WorkspaceRuleInfo,
+    WorkspaceType,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -65,36 +66,87 @@ impl HyprlandClient {
     }
 
     /// Queries all workspaces (`j/workspaces`), marking the active workspace as `focused`.
+    ///
+    /// Supports both legacy numeric workspace IDs and Hyprland v0.57+ string-addressed special
+    /// and named workspaces (which omit `"id"`), exposing per-workspace `tiledLayout` (`layout`),
+    /// `workspace_type`, `address`, `has_fullscreen`, `is_persistent`, and last-window metadata.
     pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
-        let active_id = self.active_workspace().ok().map(|w| w.id);
+        let active = self.active_workspace().ok();
         let raw = self.request("j/workspaces")?;
         let mut list: Vec<WorkspaceInfo> = serde_json::from_str(&raw).map_err(|e| {
             WaywiError::IpcError(format!("failed to parse Hyprland workspaces JSON: {e}"))
         })?;
-        list.sort_by_key(|w| w.id);
-        if let Some(aid) = active_id {
+        sort_workspaces(&mut list);
+        if let Some(ref active_ws) = active {
             for w in &mut list {
-                w.focused = w.id == aid;
+                w.focused = active_ws.matches_identity(w);
             }
         }
         Ok(list)
     }
 
-    /// Queries the currently active workspace (`j/activeworkspace`).
+    /// Queries the currently active workspace (`j/activeworkspace`), including its active tiling
+    /// layout (`tiledLayout`) and full metadata.
     pub fn active_workspace(&self) -> Result<WorkspaceInfo> {
         let raw = self.request("j/activeworkspace")?;
-        let parsed: ActiveWorkspaceJson = serde_json::from_str(&raw).map_err(|e| {
+        let mut parsed: WorkspaceInfo = serde_json::from_str(&raw).map_err(|e| {
             WaywiError::IpcError(format!(
                 "failed to parse Hyprland activeworkspace JSON: {e}"
             ))
         })?;
-        Ok(WorkspaceInfo {
-            id: WorkspaceId(parsed.id),
-            name: parsed.name,
-            monitor: parsed.monitor,
-            windows: parsed.windows,
-            focused: true,
+        parsed.focused = true;
+        Ok(parsed)
+    }
+
+    /// Queries all configured workspace rules (`j/workspacerules`).
+    pub fn workspace_rules(&self) -> Result<Vec<WorkspaceRuleInfo>> {
+        let raw = self.request("j/workspacerules")?;
+        serde_json::from_str(&raw).map_err(|e| {
+            WaywiError::IpcError(format!("failed to parse Hyprland workspacerules JSON: {e}"))
         })
+    }
+
+    /// Queries the global default tiling layout configured under `general:layout` (`dwindle`,
+    /// `master`, `monocle`, `scrolling`, or a custom layout plugin).
+    pub fn default_layout(&self) -> Result<HyprlandLayout> {
+        let opt = self.get_option("general:layout")?;
+        Ok(opt
+            .value
+            .as_str()
+            .map(HyprlandLayout::from_hyprland_str)
+            .unwrap_or(HyprlandLayout::Unknown))
+    }
+
+    /// Updates the global default tiling layout (`general:layout`) at runtime, supporting both
+    /// legacy `keyword` and Hyprland v0.55+/v0.57+ `eval hl.config(...)`.
+    pub fn set_default_layout(&self, layout: &HyprlandLayout) -> Result<()> {
+        let raw = layout.as_str();
+        if !layout.is_known() || raw.is_empty() {
+            return Err(WaywiError::IpcError(
+                "Hyprland layout must not be empty or Unknown".to_owned(),
+            ));
+        }
+        validate_token("layout", raw)?;
+        self.keyword("general:layout", raw)
+    }
+
+    /// Sends a layout-specific message (`layoutmsg <message>` on Hyprlang, `hl.dsp.layout(...)`
+    /// on HyprLua v0.55+/v0.57+), such as `"togglesplit"`, `"swapsplit"`, `"swapwithmaster"`,
+    /// `"orientationnext"`, `"cyclenext"`, or `"swapcol l"`.
+    pub fn layout_message(&self, message: &str) -> Result<()> {
+        validate_arg(message)?;
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return Err(WaywiError::IpcError(
+                "Hyprland layout message must not be empty".to_owned(),
+            ));
+        }
+        let escaped = escape_lua_string(trimmed);
+        self.dispatch_with_lua_fallback(
+            "layoutmsg",
+            trimmed,
+            &format!("dispatch hl.dsp.layout(\"{escaped}\")"),
+        )
     }
 
     /// Queries the active client window (`j/activewindow`).
@@ -195,6 +247,75 @@ impl HyprlandClient {
             &target,
             &format!("dispatch hl.dsp.focus({{ workspace = \"{escaped}\" }})"),
         )
+    }
+
+    /// Switches workspace relative to the current one (e.g. `delta = 1, existing_only = true`
+    /// dispatches `"e+1"`; `delta = -1, existing_only = false` dispatches `"-1"`).
+    pub fn switch_workspace_relative(&self, delta: i32, existing_only: bool) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let prefix = if existing_only { "e" } else { "" };
+        let spec = if delta > 0 {
+            format!("{prefix}+{delta}")
+        } else {
+            format!("{prefix}{delta}")
+        };
+        self.dispatch_with_lua_fallback(
+            "workspace",
+            &spec,
+            &format!("dispatch hl.dsp.focus({{ workspace = \"{spec}\" }})"),
+        )
+    }
+
+    /// Switches back to the previously active workspace (`"previous"`).
+    pub fn switch_workspace_previous(&self) -> Result<()> {
+        self.dispatch_with_lua_fallback(
+            "workspace",
+            "previous",
+            "dispatch hl.dsp.focus({ workspace = \"previous\" })",
+        )
+    }
+
+    /// Moves `workspace` (e.g. `"2"`, `"name:code"`, `"special:magic"`) to `monitor` (e.g.
+    /// `"DP-1"`, `"l"`, `"r"`).
+    pub fn move_workspace_to_monitor(&self, workspace: &str, monitor: &str) -> Result<()> {
+        validate_arg(workspace)?;
+        let ws = workspace.trim();
+        if ws.is_empty() {
+            return Err(WaywiError::IpcError(
+                "Hyprland workspace selector must not be empty".to_owned(),
+            ));
+        }
+        validate_token("monitor", monitor)?;
+        let legacy_arg = format!("{ws} {monitor}");
+        let lua_ws = if let Ok(id) = ws.parse::<i32>() {
+            id.to_string()
+        } else {
+            format!("\"{}\"", escape_lua_string(ws))
+        };
+        let lua_cmd = format!(
+            "dispatch hl.dsp.workspace.move({{ workspace = {lua_ws}, monitor = \"{monitor}\" }})"
+        );
+        self.dispatch_with_lua_fallback("moveworkspacetomonitor", &legacy_arg, &lua_cmd)
+    }
+
+    /// Renames workspace `id` to `new_name`.
+    pub fn rename_workspace(&self, id: WorkspaceId, new_name: &str) -> Result<()> {
+        validate_arg(new_name)?;
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err(WaywiError::IpcError(
+                "Hyprland workspace name must not be empty".to_owned(),
+            ));
+        }
+        let legacy_arg = format!("{} {trimmed}", id.0);
+        let escaped = escape_lua_string(trimmed);
+        let lua_cmd = format!(
+            "dispatch hl.dsp.workspace.rename({{ id = {}, name = \"{escaped}\" }})",
+            id.0
+        );
+        self.dispatch_with_lua_fallback("renameworkspace", &legacy_arg, &lua_cmd)
     }
 
     /// Focuses a window matching `selector` (e.g. `"0x55a8f1234560"`, `"address:0x55a8f1234560"`,
@@ -642,27 +763,94 @@ fn format_lua_literal(value: &str) -> String {
     format!("\"{}\"", escape_lua_string(trimmed))
 }
 
+fn sort_workspaces(list: &mut [WorkspaceInfo]) {
+    list.sort_by(|a, b| {
+        a.is_special()
+            .cmp(&b.is_special())
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+}
+
+fn new_workspace_from_event(id: WorkspaceId, name: &str, focused: bool) -> WorkspaceInfo {
+    let address = if !name.is_empty() {
+        name.to_owned()
+    } else if id.0 != 0 {
+        id.0.to_string()
+    } else {
+        String::new()
+    };
+    WorkspaceInfo {
+        id,
+        address,
+        workspace_type: WorkspaceType::from_hyprland(None, id.0, name),
+        name: name.to_owned(),
+        focused,
+        ..WorkspaceInfo::default()
+    }
+}
+
 /// Updates a `Vec<WorkspaceInfo>` incrementally from a `HyprlandEvent` with zero extra socket
 /// roundtrips. Returns `true` if the list changed.
 pub fn apply_workspace_event(workspaces: &mut Vec<WorkspaceInfo>, event: &HyprlandEvent) -> bool {
     match event {
-        HyprlandEvent::WorkspaceV2 { id, name } => {
+        HyprlandEvent::Workspace { name } => {
+            let id = name
+                .parse::<i32>()
+                .map(WorkspaceId)
+                .unwrap_or(WorkspaceId(0));
+            let mut found = false;
             for ws in workspaces.iter_mut() {
-                ws.focused = ws.id == *id;
+                let matched = ws.matches_ref(id, name);
+                ws.focused = matched;
+                if matched {
+                    found = true;
+                }
             }
-            if !workspaces.iter().any(|w| w.id == *id) {
-                workspaces.push(WorkspaceInfo {
-                    id: *id,
-                    name: name.clone(),
-                    monitor: String::new(),
-                    windows: 0,
-                    focused: true,
-                });
-                workspaces.sort_by_key(|w| w.id);
+            if !found && !name.is_empty() {
+                workspaces.push(new_workspace_from_event(id, name, true));
+                sort_workspaces(workspaces);
             }
             true
         }
+        HyprlandEvent::WorkspaceV2 { id, name } => {
+            let mut found = false;
+            for ws in workspaces.iter_mut() {
+                let matched = ws.matches_ref(*id, name);
+                ws.focused = matched;
+                if matched {
+                    found = true;
+                }
+            }
+            if !found {
+                workspaces.push(new_workspace_from_event(*id, name, true));
+                sort_workspaces(workspaces);
+            }
+            true
+        }
+        HyprlandEvent::FocusedMonitor { workspace_name, .. } => {
+            if workspace_name.is_empty() {
+                return false;
+            }
+            let id = workspace_name
+                .parse::<i32>()
+                .map(WorkspaceId)
+                .unwrap_or(WorkspaceId(0));
+            let mut changed = false;
+            for ws in workspaces.iter_mut() {
+                let next = ws.matches_ref(id, workspace_name);
+                if ws.focused != next {
+                    ws.focused = next;
+                    changed = true;
+                }
+            }
+            changed
+        }
         HyprlandEvent::FocusedMonitorV2 { workspace_id, .. } => {
+            if workspace_id.0 == 0 {
+                return false;
+            }
             let mut changed = false;
             for ws in workspaces.iter_mut() {
                 let next = ws.id == *workspace_id;
@@ -673,27 +861,45 @@ pub fn apply_workspace_event(workspaces: &mut Vec<WorkspaceInfo>, event: &Hyprla
             }
             changed
         }
-        HyprlandEvent::CreateWorkspaceV2 { id, name } => {
-            if workspaces.iter().any(|w| w.id == *id) {
+        HyprlandEvent::CreateWorkspace { name } => {
+            if name.is_empty() {
                 return false;
             }
-            workspaces.push(WorkspaceInfo {
-                id: *id,
-                name: name.clone(),
-                monitor: String::new(),
-                windows: 0,
-                focused: false,
-            });
-            workspaces.sort_by_key(|w| w.id);
+            let id = name
+                .parse::<i32>()
+                .map(WorkspaceId)
+                .unwrap_or(WorkspaceId(0));
+            if workspaces.iter().any(|w| w.matches_ref(id, name)) {
+                return false;
+            }
+            workspaces.push(new_workspace_from_event(id, name, false));
+            sort_workspaces(workspaces);
             true
         }
-        HyprlandEvent::DestroyWorkspaceV2 { id, .. } => {
+        HyprlandEvent::CreateWorkspaceV2 { id, name } => {
+            if workspaces.iter().any(|w| w.matches_ref(*id, name)) {
+                return false;
+            }
+            workspaces.push(new_workspace_from_event(*id, name, false));
+            sort_workspaces(workspaces);
+            true
+        }
+        HyprlandEvent::DestroyWorkspace { name } => {
+            let id = name
+                .parse::<i32>()
+                .map(WorkspaceId)
+                .unwrap_or(WorkspaceId(0));
             let before = workspaces.len();
-            workspaces.retain(|w| w.id != *id);
+            workspaces.retain(|w| !w.matches_ref(id, name));
+            workspaces.len() != before
+        }
+        HyprlandEvent::DestroyWorkspaceV2 { id, name } => {
+            let before = workspaces.len();
+            workspaces.retain(|w| !w.matches_ref(*id, name));
             workspaces.len() != before
         }
         HyprlandEvent::MoveWorkspaceV2 { id, name, monitor } => {
-            if let Some(ws) = workspaces.iter_mut().find(|w| w.id == *id) {
+            if let Some(ws) = workspaces.iter_mut().find(|w| w.matches_ref(*id, name)) {
                 ws.name = name.clone();
                 ws.monitor = monitor.clone();
                 true
@@ -702,7 +908,8 @@ pub fn apply_workspace_event(workspaces: &mut Vec<WorkspaceInfo>, event: &Hyprla
             }
         }
         HyprlandEvent::RenameWorkspace { id, name } => {
-            if let Some(ws) = workspaces.iter_mut().find(|w| w.id == *id)
+            if id.0 != 0
+                && let Some(ws) = workspaces.iter_mut().find(|w| w.id == *id)
                 && ws.name != *name
             {
                 ws.name = name.clone();
@@ -870,6 +1077,7 @@ mod tests {
             monitor: "DP-1".to_owned(),
             windows: 1,
             focused: false,
+            ..WorkspaceInfo::default()
         }];
         assert!(apply_workspace_event(
             &mut wss,
@@ -1013,6 +1221,118 @@ mod tests {
                 "dispatch hl.dsp.focus({ window = \"address:0xabc\" })".to_owned(),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hyprland_0_57_workspaces_layouts_rules_and_special_event_tracking() {
+        let dir = std::env::temp_dir().join(format!(
+            "waywi-hypr-ws057-{}-{}",
+            std::process::id(),
+            SOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd_sock = dir.join(".socket.sock");
+        let ev_sock = dir.join(".socket2.sock");
+        let listener = UnixListener::bind(&cmd_sock).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..11 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut req = [0u8; 512];
+                let n = conn.read(&mut req).unwrap();
+                let cmd = std::str::from_utf8(&req[..n]).unwrap().to_owned();
+                let resp: &str = match cmd.as_str() {
+                    "j/activeworkspace" => {
+                        r#"{"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"}"#
+                    }
+                    "j/workspaces" => {
+                        r#"[
+                            {"address":"special:magic","type":"special","name":"special:magic","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"dwindle"},
+                            {"address":"5","id":5,"type":"normal","name":"5","monitor":"DP-1","monitorID":0,"windows":1,"tiledLayout":"master"},
+                            {"address":"1","id":1,"type":"normal","name":"1","monitor":"DP-1","monitorID":0,"windows":2,"tiledLayout":"dwindle"}
+                        ]"#
+                    }
+                    "j/workspacerules" => {
+                        r#"[{"workspaceString":"5","enabled":true,"persistent":true,"layout":"master"}]"#
+                    }
+                    "j/getoption general:layout" => {
+                        r#"{"option":"general:layout","str":"dwindle","set":true}"#
+                    }
+                    "j/systeminfo" => "System Information:\nconfigProvider: lua\n",
+                    "eval hl.config({ general = { layout = \"scrolling\" } })" => "ok",
+                    "dispatch hl.dsp.layout(\"swapwithmaster\")" => "ok",
+                    "dispatch hl.dsp.focus({ workspace = \"e+1\" })" => "ok",
+                    "dispatch hl.dsp.focus({ workspace = \"previous\" })" => "ok",
+                    "dispatch hl.dsp.workspace.move({ workspace = 5, monitor = \"HDMI-A-1\" })" => {
+                        "ok"
+                    }
+                    "dispatch hl.dsp.workspace.rename({ id = 5, name = \"code\" })" => "ok",
+                    other => panic!("unexpected workspace command: {other}"),
+                };
+                seen.push(cmd);
+                conn.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+
+        let client = HyprlandClient::with_sockets(HyprlandSockets {
+            command_socket: cmd_sock,
+            event_socket: ev_sock,
+        });
+
+        let mut wss = client.workspaces().unwrap();
+        assert_eq!(wss.len(), 3);
+        // Normal workspaces sorted by id first, special workspaces after.
+        assert_eq!(wss[0].id, WorkspaceId(1));
+        assert_eq!(wss[0].layout, HyprlandLayout::Dwindle);
+        assert!(!wss[0].focused);
+        assert_eq!(wss[1].id, WorkspaceId(5));
+        assert_eq!(wss[1].layout, HyprlandLayout::Master);
+        assert!(wss[1].focused);
+        assert!(wss[2].is_special());
+        assert_eq!(wss[2].name, "special:magic");
+        assert!(!wss[2].focused);
+
+        let rules = client.workspace_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].layout, Some(HyprlandLayout::Master));
+
+        assert_eq!(client.default_layout().unwrap(), HyprlandLayout::Dwindle);
+        client
+            .set_default_layout(&HyprlandLayout::Scrolling)
+            .unwrap();
+        assert!(client.set_default_layout(&HyprlandLayout::Unknown).is_err());
+        client.layout_message("swapwithmaster").unwrap();
+        client.switch_workspace_relative(1, true).unwrap();
+        client.switch_workspace_previous().unwrap();
+        client.move_workspace_to_monitor("5", "HDMI-A-1").unwrap();
+        client.rename_workspace(WorkspaceId(5), "code").unwrap();
+
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 11);
+
+        // Multiple Hyprland v0.57+ special workspaces share WorkspaceId(0) without colliding.
+        assert!(apply_workspace_event(
+            &mut wss,
+            &HyprlandEvent::CreateWorkspaceV2 {
+                id: WorkspaceId(0),
+                name: "special:term".to_owned(),
+            }
+        ));
+        assert_eq!(wss.len(), 4);
+        assert!(apply_workspace_event(
+            &mut wss,
+            &HyprlandEvent::DestroyWorkspaceV2 {
+                id: WorkspaceId(0),
+                name: "special:magic".to_owned(),
+            }
+        ));
+        assert_eq!(wss.len(), 3);
+        assert!(wss.iter().any(|w| w.name == "special:term"));
+        assert!(!wss.iter().any(|w| w.name == "special:magic"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
