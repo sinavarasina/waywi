@@ -9,7 +9,7 @@ use spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
 use spa::sys as spa_sys;
 use spa::utils::SpaTypes;
 
-use crate::audio::types::AudioPortAvailability;
+use crate::audio::types::{AudioChannelPosition, AudioPortAvailability};
 
 /// Converts PipeWire linear amplitude (`channelVolumes`) to user-perceived linear level (`0.0..=1.5`).
 #[must_use]
@@ -88,13 +88,78 @@ pub(crate) struct PropsExtracted {
     pub(crate) channels: Option<usize>,
     pub(crate) volume: Option<f32>,
     pub(crate) channel_volumes: Option<Vec<f32>>,
+    pub(crate) channel_map: Option<Vec<AudioChannelPosition>>,
     pub(crate) muted: Option<bool>,
+}
+
+pub(crate) fn map_spa_audio_channel(raw_id: u32) -> AudioChannelPosition {
+    match raw_id {
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_MONO => AudioChannelPosition::Mono,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_FL => AudioChannelPosition::FrontLeft,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_FR => AudioChannelPosition::FrontRight,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_FC => AudioChannelPosition::FrontCenter,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_LFE || x == spa_sys::SPA_AUDIO_CHANNEL_LFE2 => {
+            AudioChannelPosition::Lfe
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_SL || x == spa_sys::SPA_AUDIO_CHANNEL_TSL => {
+            AudioChannelPosition::SideLeft
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_SR || x == spa_sys::SPA_AUDIO_CHANNEL_TSR => {
+            AudioChannelPosition::SideRight
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_FLC
+            || x == spa_sys::SPA_AUDIO_CHANNEL_FLW
+            || x == spa_sys::SPA_AUDIO_CHANNEL_FLH
+            || x == spa_sys::SPA_AUDIO_CHANNEL_LLFE
+            || x == spa_sys::SPA_AUDIO_CHANNEL_BLC =>
+        {
+            AudioChannelPosition::FrontLeftCenter
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_FRC
+            || x == spa_sys::SPA_AUDIO_CHANNEL_FRW
+            || x == spa_sys::SPA_AUDIO_CHANNEL_FRH
+            || x == spa_sys::SPA_AUDIO_CHANNEL_RLFE
+            || x == spa_sys::SPA_AUDIO_CHANNEL_BRC =>
+        {
+            AudioChannelPosition::FrontRightCenter
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_RC || x == spa_sys::SPA_AUDIO_CHANNEL_BC => {
+            AudioChannelPosition::RearCenter
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_RL || x == spa_sys::SPA_AUDIO_CHANNEL_RLC => {
+            AudioChannelPosition::RearLeft
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_RR || x == spa_sys::SPA_AUDIO_CHANNEL_RRC => {
+            AudioChannelPosition::RearRight
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TC => AudioChannelPosition::TopCenter,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TFL || x == spa_sys::SPA_AUDIO_CHANNEL_TFLC => {
+            AudioChannelPosition::TopFrontLeft
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TFC || x == spa_sys::SPA_AUDIO_CHANNEL_FCH => {
+            AudioChannelPosition::TopFrontCenter
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TFR || x == spa_sys::SPA_AUDIO_CHANNEL_TFRC => {
+            AudioChannelPosition::TopFrontRight
+        }
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TRL => AudioChannelPosition::TopRearLeft,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TRC => AudioChannelPosition::TopRearCenter,
+        x if x == spa_sys::SPA_AUDIO_CHANNEL_TRR => AudioChannelPosition::TopRearRight,
+        x if (spa_sys::SPA_AUDIO_CHANNEL_START_Aux
+            ..spa_sys::SPA_AUDIO_CHANNEL_START_Aux + 4096)
+            .contains(&x) =>
+        {
+            AudioChannelPosition::Aux((x - spa_sys::SPA_AUDIO_CHANNEL_START_Aux) as u16)
+        }
+        _ => AudioChannelPosition::Unknown,
+    }
 }
 
 fn extract_props_object(obj: &Object) -> PropsExtracted {
     let mut channels = None;
     let mut volume = None;
     let mut channel_volumes = None;
+    let mut channel_map = None;
     let mut scalar_volume = None;
     let mut muted = None;
 
@@ -119,6 +184,13 @@ fn extract_props_object(obj: &Object) -> PropsExtracted {
                     channel_volumes = Some(vols.clone());
                 }
             }
+            spa_sys::SPA_PROP_channelMap => {
+                if let Value::ValueArray(ValueArray::Id(ids)) = &prop.value
+                    && !ids.is_empty()
+                {
+                    channel_map = Some(ids.iter().map(|id| map_spa_audio_channel(id.0)).collect());
+                }
+            }
             spa_sys::SPA_PROP_volume => {
                 if let Value::Float(v) = prop.value {
                     scalar_volume = Some(v);
@@ -129,9 +201,10 @@ fn extract_props_object(obj: &Object) -> PropsExtracted {
     }
 
     PropsExtracted {
-        channels,
+        channels: channels.or_else(|| channel_map.as_ref().map(Vec::len)),
         volume: volume.or(scalar_volume),
         channel_volumes,
+        channel_map,
         muted,
     }
 }
@@ -158,6 +231,7 @@ pub(crate) struct RouteParams {
     pub(crate) channels: Option<usize>,
     pub(crate) volume: Option<f32>,
     pub(crate) channel_volumes: Option<Vec<f32>>,
+    pub(crate) channel_map: Option<Vec<AudioChannelPosition>>,
     pub(crate) muted: Option<bool>,
 }
 
@@ -267,6 +341,7 @@ pub(crate) fn parse_route_pod(bytes: &[u8]) -> Option<RouteParams> {
         channels: props.channels,
         volume: props.volume,
         channel_volumes: props.channel_volumes,
+        channel_map: props.channel_map,
         muted: props.muted,
     })
 }
@@ -715,6 +790,13 @@ mod tests {
         assert_eq!(parsed.profiles, vec![1, 2]);
         assert_eq!(parsed.devices, vec![5]);
         assert_eq!(parsed.channels, Some(2));
+        assert_eq!(
+            parsed.channel_map,
+            Some(vec![
+                AudioChannelPosition::FrontLeft,
+                AudioChannelPosition::FrontRight,
+            ])
+        );
         assert_eq!(parsed.muted, Some(false));
         assert!((raw_to_linear(parsed.volume.unwrap()) - 0.5).abs() < 1e-4);
     }

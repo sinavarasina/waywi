@@ -485,20 +485,20 @@ fn build_sound_theme_chain(primary: &str, dirs: &[PathBuf]) -> Vec<String> {
 }
 
 /// Polyphonic active-voice mixer outputting normalized 48 kHz interleaved stereo frames.
-#[cfg(any(test, not(feature = "audio-playback")))]
+#[cfg(any(test, feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 #[derive(Default)]
 pub(crate) struct PolyphonicMixer {
     voices: Vec<ActiveVoice>,
 }
 
-#[cfg(any(test, not(feature = "audio-playback")))]
+#[cfg(any(test, feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 struct ActiveVoice {
     stereo_48k: Arc<[f32]>,
     cursor: usize,
     gain: f32,
 }
 
-#[cfg(any(test, not(feature = "audio-playback")))]
+#[cfg(any(test, feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 impl PolyphonicMixer {
     pub(crate) fn push(&mut self, stereo_48k: Arc<[f32]>, gain: f32) {
         if stereo_48k.is_empty() || gain <= 0.0 {
@@ -514,10 +514,6 @@ impl PolyphonicMixer {
         });
     }
 
-    #[cfg(all(
-        not(feature = "audio-playback"),
-        any(feature = "pulseaudio", feature = "alsa")
-    ))]
     pub(crate) fn is_empty(&self) -> bool {
         self.voices.is_empty()
     }

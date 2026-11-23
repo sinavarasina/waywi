@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use crate::error::{Result, WaywiError};
 
 use super::backend::{
-    AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, default_backend,
+    AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, candidate_backends,
 };
 use super::types::{AudioEvent, AudioSnapshot, sanitize_linear_channels};
 
@@ -19,7 +19,7 @@ struct RunningWorker {
 struct AudioClientInner {
     shared: Arc<Mutex<SharedAudioState>>,
     stop_flag: Arc<AtomicBool>,
-    backend: Box<dyn AudioBackend>,
+    backends: Vec<Box<dyn AudioBackend>>,
     worker: Mutex<Option<RunningWorker>>,
 }
 
@@ -65,7 +65,7 @@ impl AudioClient {
             inner: Arc::new(AudioClientInner {
                 shared: Arc::new(Mutex::new(SharedAudioState::default())),
                 stop_flag: Arc::new(AtomicBool::new(false)),
-                backend: default_backend(),
+                backends: candidate_backends(),
                 worker: Mutex::new(None),
             }),
         }
@@ -85,18 +85,21 @@ impl AudioClient {
         if guard.is_some() {
             return;
         }
-        let shared = Arc::clone(&self.inner.shared);
-        let stop_flag = Arc::clone(&self.inner.stop_flag);
-        *guard = match self.inner.backend.start(shared, stop_flag) {
-            Some((sender, join)) => Some(RunningWorker {
-                sender: Some(sender),
-                join: Some(join),
-            }),
-            None => Some(RunningWorker {
-                sender: None,
-                join: None,
-            }),
-        };
+        for backend in &self.inner.backends {
+            let shared = Arc::clone(&self.inner.shared);
+            let stop_flag = Arc::clone(&self.inner.stop_flag);
+            if let Some((sender, join)) = backend.start(shared, stop_flag) {
+                *guard = Some(RunningWorker {
+                    sender: Some(sender),
+                    join: Some(join),
+                });
+                return;
+            }
+        }
+        *guard = Some(RunningWorker {
+            sender: None,
+            join: None,
+        });
     }
 
     pub(crate) fn drain_events(&self) -> Vec<AudioEvent> {

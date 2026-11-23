@@ -20,9 +20,9 @@ use spa::sys as spa_sys;
 
 use crate::audio::backend::{AudioCommand, SharedAudioState, StreamMetadata};
 use crate::audio::types::{
-    AudioCapture, AudioCard, AudioDevice, AudioEvent, AudioPort, AudioPortAvailability,
-    AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance, sanitize_linear_channels,
-    scale_linear_channels,
+    AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance_with_map,
+    sanitize_linear_channels, scale_linear_channels,
 };
 
 use super::pod::{
@@ -43,6 +43,7 @@ struct AudioNodeRecord {
     channels: usize,
     raw_volume: f32,
     raw_channels: Vec<f32>,
+    channel_map: Vec<AudioChannelPosition>,
     nonzero_linear_template: Vec<f32>,
     muted: bool,
 }
@@ -66,8 +67,18 @@ impl AudioNodeRecord {
             channels: 2,
             raw_volume: 1.0,
             raw_channels: Vec::new(),
+            channel_map: Vec::new(),
             nonzero_linear_template: Vec::new(),
             muted: false,
+        }
+    }
+
+    fn effective_channel_map(&self) -> Vec<AudioChannelPosition> {
+        let count = self.channels.max(1);
+        if self.channel_map.len() == count {
+            self.channel_map.clone()
+        } else {
+            AudioChannelPosition::default_map_for_count(count)
         }
     }
 
@@ -134,6 +145,13 @@ impl AudioNodeRecord {
                 updated = true;
             }
         }
+        if let Some(ref cmap) = route.channel_map
+            && !cmap.is_empty()
+            && self.channel_map != *cmap
+        {
+            self.channel_map.clone_from(cmap);
+            updated = true;
+        }
         if let Some(m) = route.muted
             && self.muted != m
         {
@@ -176,12 +194,22 @@ struct AudioStreamRecord {
     channels: usize,
     raw_volume: f32,
     raw_channels: Vec<f32>,
+    channel_map: Vec<AudioChannelPosition>,
     nonzero_linear_template: Vec<f32>,
     muted: bool,
     playback: bool,
 }
 
 impl AudioStreamRecord {
+    fn effective_channel_map(&self) -> Vec<AudioChannelPosition> {
+        let count = self.channels.max(1);
+        if self.channel_map.len() == count {
+            self.channel_map.clone()
+        } else {
+            AudioChannelPosition::default_map_for_count(count)
+        }
+    }
+
     fn linear_channels(&self) -> Vec<f32> {
         if self.raw_channels.is_empty() {
             vec![raw_to_linear(self.raw_volume); self.channels.max(1)]
@@ -215,6 +243,11 @@ impl AudioStreamRecord {
                 self.raw_volume = vol;
             }
         }
+        if let Some(ref cmap) = props.channel_map
+            && !cmap.is_empty()
+        {
+            self.channel_map.clone_from(cmap);
+        }
         if let Some(m) = props.muted {
             self.muted = m;
         }
@@ -229,6 +262,7 @@ struct DeviceRouteRecord {
     channels: Option<usize>,
     volume: Option<f32>,
     channel_volumes: Option<Vec<f32>>,
+    channel_map: Option<Vec<AudioChannelPosition>>,
     muted: Option<bool>,
 }
 
@@ -343,9 +377,11 @@ impl WorkerState {
             card_id: rec.device_id,
             active_port,
             ports,
+            channel_map: rec.effective_channel_map(),
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn summarize_nodes(
         &self,
         nodes: &BTreeMap<u32, AudioNodeRecord>,
@@ -355,6 +391,7 @@ impl WorkerState {
         Vec<AudioDevice>,
         f32,
         Vec<f32>,
+        Vec<AudioChannelPosition>,
         Option<f32>,
         bool,
         Option<AudioDevice>,
@@ -366,18 +403,27 @@ impl WorkerState {
 
         let target = select_target_node(nodes, default_name, configured_name);
 
-        let (linear, channels, db, muted, default_dev) = if let Some(node) = target {
+        let (linear, channels, channel_map, db, muted, default_dev) = if let Some(node) = target {
             (
                 raw_to_linear(node.raw_volume),
                 node.linear_channels(),
+                node.effective_channel_map(),
                 raw_to_db(node.raw_volume),
                 node.muted,
                 Some(self.build_audio_device(node)),
             )
         } else {
-            (0.0, Vec::new(), None, false, None)
+            (0.0, Vec::new(), Vec::new(), None, false, None)
         };
-        (devices, linear, channels, db, muted, default_dev)
+        (
+            devices,
+            linear,
+            channels,
+            channel_map,
+            db,
+            muted,
+            default_dev,
+        )
     }
 
     fn card_list(&self) -> Vec<AudioCard> {
@@ -407,6 +453,7 @@ impl WorkerState {
         for rec in self.streams.values() {
             let linear = raw_to_linear(rec.raw_volume);
             let channels = rec.linear_channels();
+            let channel_map = rec.effective_channel_map();
             let db = raw_to_db(rec.raw_volume);
             if rec.playback {
                 streams.push(AudioStream {
@@ -418,6 +465,7 @@ impl WorkerState {
                     sink_id: rec.target_id,
                     linear,
                     channels,
+                    channel_map,
                     db,
                     muted: rec.muted,
                 });
@@ -431,6 +479,7 @@ impl WorkerState {
                     source_id: rec.target_id,
                     linear,
                     channels,
+                    channel_map,
                     db,
                     muted: rec.muted,
                 });
@@ -440,17 +489,25 @@ impl WorkerState {
     }
 
     fn compute_snapshot(&self) -> Option<AudioSnapshot> {
-        let (devices, linear, channels, db, muted, default_sink) = self.summarize_nodes(
-            &self.sinks,
-            self.default_sink_name.as_deref(),
-            self.configured_sink_name.as_deref(),
-        );
-        let (sources, source_linear, source_channels, source_db, source_muted, default_source) =
-            self.summarize_nodes(
-                &self.sources,
-                self.default_source_name.as_deref(),
-                self.configured_source_name.as_deref(),
+        let (devices, linear, channels, channel_map, db, muted, default_sink) = self
+            .summarize_nodes(
+                &self.sinks,
+                self.default_sink_name.as_deref(),
+                self.configured_sink_name.as_deref(),
             );
+        let (
+            sources,
+            source_linear,
+            source_channels,
+            source_channel_map,
+            source_db,
+            source_muted,
+            default_source,
+        ) = self.summarize_nodes(
+            &self.sources,
+            self.default_source_name.as_deref(),
+            self.configured_source_name.as_deref(),
+        );
 
         let cards = self.card_list();
         let (streams, captures) = self.stream_lists();
@@ -458,12 +515,14 @@ impl WorkerState {
         Some(AudioSnapshot {
             linear,
             channels,
+            channel_map,
             db,
             muted,
             default_sink,
             devices,
             source_linear,
             source_channels,
+            source_channel_map,
             source_db,
             source_muted,
             default_source,
@@ -757,7 +816,7 @@ impl WorkerState {
     }
 
     fn apply_node_props(&mut self, is_source: bool, id: u32, props: PropsExtracted) -> bool {
-        let (has_route_ch, has_route_vol, has_route_mute) = {
+        let (has_route_ch, has_route_vol, has_route_map, has_route_mute) = {
             let map = if is_source {
                 &self.sources
             } else {
@@ -769,10 +828,11 @@ impl WorkerState {
                 (
                     r.channels.is_some() || r.channel_volumes.is_some(),
                     r.volume.is_some() || r.channel_volumes.is_some(),
+                    r.channel_map.as_ref().is_some_and(|m| !m.is_empty()),
                     r.muted.is_some(),
                 )
             } else {
-                (false, false, false)
+                (false, false, false, false)
             }
         };
         let map = if is_source {
@@ -801,6 +861,14 @@ impl WorkerState {
                 rec.raw_volume = vol;
                 updated = true;
             }
+        }
+        if !has_route_map
+            && let Some(cmap) = props.channel_map
+            && !cmap.is_empty()
+            && rec.channel_map != cmap
+        {
+            rec.channel_map = cmap;
+            updated = true;
         }
         if !has_route_mute
             && let Some(m) = props.muted
@@ -855,8 +923,17 @@ impl WorkerState {
         } else {
             Vec::new()
         };
-        apply_linear_balance(
+        let cmap: &[AudioChannelPosition] = if let Some(r) = route
+            && let Some(ref r_map) = r.channel_map
+            && !r_map.is_empty()
+        {
+            r_map
+        } else {
+            &rec.channel_map
+        };
+        apply_linear_balance_with_map(
             &current_linear,
+            cmap,
             count,
             raw_to_linear(rec.raw_volume),
             balance,
@@ -1053,7 +1130,13 @@ impl WorkerState {
         } else {
             rec.linear_channels()
         };
-        let vols = apply_linear_balance(&cur, rec.channels, raw_to_linear(rec.raw_volume), balance);
+        let vols = apply_linear_balance_with_map(
+            &cur,
+            &rec.channel_map,
+            rec.channels,
+            raw_to_linear(rec.raw_volume),
+            balance,
+        );
         if let Some(bytes) = build_volume_pod_channels(&vols)
             && let Some(pod) = Pod::from_bytes(&bytes)
             && let Some(node) = self.nodes.get(&id)
@@ -1106,6 +1189,7 @@ impl WorkerState {
                 channels: 2,
                 raw_volume: 1.0,
                 raw_channels: Vec::new(),
+                channel_map: Vec::new(),
                 nonzero_linear_template: Vec::new(),
                 muted: false,
                 playback,
@@ -1477,6 +1561,7 @@ fn run_single_pw_session(
                                 channels: route.channels,
                                 volume: route.volume,
                                 channel_volumes: route.channel_volumes,
+                                channel_map: route.channel_map,
                                 muted: route.muted,
                             };
                             if !st.record_device_route(id, seq, direction, route_rec.clone()) {
@@ -1669,7 +1754,8 @@ fn run_single_pw_session(
                 }
                 ObjectType::Node
                     if classify_media_class(props.get("media.class").unwrap_or_default())
-                        .is_some() =>
+                        .is_some()
+                        && props.get("node.name") != Some("waywi-audio") =>
                 {
                     let playback =
                         classify_media_class(props.get("media.class").unwrap_or_default())
@@ -1882,6 +1968,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.02),
                 channel_volumes: Some(vec![0.02, 0.02]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -1896,6 +1983,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.04),
                 channel_volumes: Some(vec![0.04, 0.04]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -1927,6 +2015,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.04),
                 channel_volumes: Some(vec![0.04, 0.04]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -1941,6 +2030,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.125),
                 channel_volumes: Some(vec![0.125, 0.125]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -1961,6 +2051,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.125),
                 channel_volumes: Some(vec![0.125, 0.125]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -2032,6 +2123,7 @@ mod tests {
                 channels: None,
                 volume: None,
                 channel_volumes: None,
+                channel_map: None,
                 muted: None,
             },
         ));
@@ -2051,6 +2143,7 @@ mod tests {
                 channels: None,
                 volume: None,
                 channel_volumes: None,
+                channel_map: None,
                 muted: None,
             },
         ));
@@ -2069,6 +2162,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(raw_80),
                 channel_volumes: Some(vec![raw_80, raw_40]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -2085,6 +2179,7 @@ mod tests {
                 channels: Some(1),
                 volume: Some(0.5),
                 channel_volumes: Some(vec![0.5]),
+                channel_map: None,
                 muted: Some(false),
             },
         ));
@@ -2145,6 +2240,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(1.0),
                 channel_volumes: Some(vec![1.0, 1.0]),
+                channel_map: None,
                 muted: Some(true),
             },
         ));
@@ -2158,6 +2254,7 @@ mod tests {
                 channels: Some(2),
                 volume: Some(0.25),
                 channel_volumes: Some(vec![0.25, 0.25]),
+                channel_map: None,
                 muted: Some(true),
             },
         ));

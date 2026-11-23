@@ -1,5 +1,204 @@
 use crate::subscription::{Subscription, SubscriptionKey, SubscriptionSpec};
 
+/// Spatial speaker / channel position reported by the audio server (`SPA_PROP_channelMap` on
+/// PipeWire, `pa_channel_map` on PulseAudio, `SelemChannelId` on ALSA).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AudioChannelPosition {
+    #[default]
+    Unknown,
+    Mono,
+    FrontLeft,
+    FrontRight,
+    FrontCenter,
+    Lfe,
+    RearLeft,
+    RearRight,
+    RearCenter,
+    SideLeft,
+    SideRight,
+    FrontLeftCenter,
+    FrontRightCenter,
+    TopCenter,
+    TopFrontLeft,
+    TopFrontCenter,
+    TopFrontRight,
+    TopRearLeft,
+    TopRearCenter,
+    TopRearRight,
+    Aux(u16),
+}
+
+impl AudioChannelPosition {
+    /// Returns `true` if this speaker position belongs to the left stereo/surround hemisphere.
+    #[must_use]
+    pub const fn is_left(self) -> bool {
+        matches!(
+            self,
+            Self::FrontLeft
+                | Self::RearLeft
+                | Self::SideLeft
+                | Self::FrontLeftCenter
+                | Self::TopFrontLeft
+                | Self::TopRearLeft
+        )
+    }
+
+    /// Returns `true` if this speaker position belongs to the right stereo/surround hemisphere.
+    #[must_use]
+    pub const fn is_right(self) -> bool {
+        matches!(
+            self,
+            Self::FrontRight
+                | Self::RearRight
+                | Self::SideRight
+                | Self::FrontRightCenter
+                | Self::TopFrontRight
+                | Self::TopRearRight
+        )
+    }
+
+    /// Returns `true` if this speaker position lies on the center plane or is an LFE/subwoofer
+    /// channel (unaffected by left/right balance panning).
+    #[must_use]
+    pub const fn is_center_or_lfe(self) -> bool {
+        matches!(
+            self,
+            Self::Mono
+                | Self::FrontCenter
+                | Self::Lfe
+                | Self::RearCenter
+                | Self::TopCenter
+                | Self::TopFrontCenter
+                | Self::TopRearCenter
+        )
+    }
+
+    /// Returns `true` if this speaker position belongs to the front soundstage.
+    #[must_use]
+    pub const fn is_front(self) -> bool {
+        matches!(
+            self,
+            Self::FrontLeft
+                | Self::FrontRight
+                | Self::FrontCenter
+                | Self::FrontLeftCenter
+                | Self::FrontRightCenter
+                | Self::TopFrontLeft
+                | Self::TopFrontCenter
+                | Self::TopFrontRight
+        )
+    }
+
+    /// Returns `true` if this speaker position belongs to the rear soundstage.
+    #[must_use]
+    pub const fn is_rear(self) -> bool {
+        matches!(
+            self,
+            Self::RearLeft
+                | Self::RearRight
+                | Self::RearCenter
+                | Self::TopRearLeft
+                | Self::TopRearCenter
+                | Self::TopRearRight
+        )
+    }
+
+    /// Short standard label for UI display (`"FL"`, `"FR"`, `"FC"`, `"LFE"`, `"RL"`, `"RR"`, etc.).
+    #[must_use]
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNK",
+            Self::Mono => "MONO",
+            Self::FrontLeft => "FL",
+            Self::FrontRight => "FR",
+            Self::FrontCenter => "FC",
+            Self::Lfe => "LFE",
+            Self::RearLeft => "RL",
+            Self::RearRight => "RR",
+            Self::RearCenter => "RC",
+            Self::SideLeft => "SL",
+            Self::SideRight => "SR",
+            Self::FrontLeftCenter => "FLC",
+            Self::FrontRightCenter => "FRC",
+            Self::TopCenter => "TC",
+            Self::TopFrontLeft => "TFL",
+            Self::TopFrontCenter => "TFC",
+            Self::TopFrontRight => "TFR",
+            Self::TopRearLeft => "TRL",
+            Self::TopRearCenter => "TRC",
+            Self::TopRearRight => "TRR",
+            Self::Aux(_) => "AUX",
+        }
+    }
+
+    /// Synthesizes the standard ITU/ALSA/PipeWire channel map for `count` channels (`1` = Mono,
+    /// `2` = Stereo, `4` = Quad, `6` = 5.1 Surround, `8` = 7.1 Surround).
+    #[must_use]
+    pub fn default_map_for_count(count: usize) -> Vec<Self> {
+        (0..count)
+            .map(|idx| Self::default_for_index(idx, count))
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) const fn default_for_index(idx: usize, count: usize) -> Self {
+        match count {
+            0 | 1 => Self::Mono,
+            2 => match idx {
+                0 => Self::FrontLeft,
+                _ => Self::FrontRight,
+            },
+            3 => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                _ => Self::Lfe,
+            },
+            4 => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                2 => Self::RearLeft,
+                _ => Self::RearRight,
+            },
+            5 => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                2 => Self::FrontCenter,
+                3 => Self::RearLeft,
+                _ => Self::RearRight,
+            },
+            6 => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                2 => Self::FrontCenter,
+                3 => Self::Lfe,
+                4 => Self::RearLeft,
+                _ => Self::RearRight,
+            },
+            7 => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                2 => Self::FrontCenter,
+                3 => Self::Lfe,
+                4 => Self::RearCenter,
+                5 => Self::SideLeft,
+                _ => Self::SideRight,
+            },
+            _ => match idx {
+                0 => Self::FrontLeft,
+                1 => Self::FrontRight,
+                2 => Self::FrontCenter,
+                3 => Self::Lfe,
+                4 => Self::RearLeft,
+                5 => Self::RearRight,
+                6 => Self::SideLeft,
+                7 => Self::SideRight,
+                other => Self::Aux((other - 8) as u16),
+            },
+        }
+    }
+}
+
 /// Jack / port plug availability reported by the audio server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioPortAvailability {
@@ -76,6 +275,8 @@ pub struct AudioDevice {
     pub active_port: Option<String>,
     /// Switchable ports/routes available on this device under the active card profile.
     pub ports: Vec<AudioPort>,
+    /// Spatial speaker/channel layout reported for this device (`[FrontLeft, FrontRight, ...]`).
+    pub channel_map: Vec<AudioChannelPosition>,
 }
 
 /// Per-application playback stream routed into a sink (PulseAudio sink input, PipeWire
@@ -95,15 +296,17 @@ pub struct AudioStream {
     pub linear: f32,
     /// Per-channel linear volumes (`[left, right, ...]`).
     pub channels: Vec<f32>,
+    /// Spatial channel positions corresponding to [`Self::channels`].
+    pub channel_map: Vec<AudioChannelPosition>,
     pub db: Option<f32>,
     pub muted: bool,
 }
 
 impl AudioStream {
-    /// Stereo L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
+    /// Stereo/surround L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
     #[must_use]
     pub fn balance(&self) -> f32 {
-        compute_stereo_balance(&self.channels)
+        compute_balance_with_map(&self.channels, &self.channel_map)
     }
 }
 
@@ -124,15 +327,17 @@ pub struct AudioCapture {
     pub linear: f32,
     /// Per-channel linear volumes (`[left, right, ...]`).
     pub channels: Vec<f32>,
+    /// Spatial channel positions corresponding to [`Self::channels`].
+    pub channel_map: Vec<AudioChannelPosition>,
     pub db: Option<f32>,
     pub muted: bool,
 }
 
 impl AudioCapture {
-    /// Stereo L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
+    /// Stereo/surround L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
     #[must_use]
     pub fn balance(&self) -> f32 {
-        compute_stereo_balance(&self.channels)
+        compute_balance_with_map(&self.channels, &self.channel_map)
     }
 }
 
@@ -143,6 +348,8 @@ pub struct AudioSnapshot {
     pub linear: f32,
     /// Per-channel linear volumes of the active default sink (`[left, right, ...]`).
     pub channels: Vec<f32>,
+    /// Spatial speaker positions corresponding to [`Self::channels`].
+    pub channel_map: Vec<AudioChannelPosition>,
     pub db: Option<f32>,
     pub muted: bool,
     pub default_sink: Option<AudioDevice>,
@@ -150,6 +357,8 @@ pub struct AudioSnapshot {
     pub source_linear: f32,
     /// Per-channel linear volumes of the active default source (`[left, right, ...]`).
     pub source_channels: Vec<f32>,
+    /// Spatial channel positions corresponding to [`Self::source_channels`].
+    pub source_channel_map: Vec<AudioChannelPosition>,
     pub source_db: Option<f32>,
     pub source_muted: bool,
     pub default_source: Option<AudioDevice>,
@@ -173,16 +382,16 @@ impl AudioSnapshot {
         (self.source_linear * 100.0).clamp(0.0, 150.0)
     }
 
-    /// Stereo L/R balance of the active default sink in `-1.0..=1.0` (`0.0` when centered or mono).
+    /// Stereo/surround L/R balance of the active default sink in `-1.0..=1.0` (`0.0` when centered or mono).
     #[must_use]
     pub fn balance(&self) -> f32 {
-        compute_stereo_balance(&self.channels)
+        compute_balance_with_map(&self.channels, &self.channel_map)
     }
 
-    /// Stereo L/R balance of the active default source in `-1.0..=1.0` (`0.0` when centered or mono).
+    /// Stereo/surround L/R balance of the active default source in `-1.0..=1.0` (`0.0` when centered or mono).
     #[must_use]
     pub fn source_balance(&self) -> f32 {
-        compute_stereo_balance(&self.source_channels)
+        compute_balance_with_map(&self.source_channels, &self.source_channel_map)
     }
 
     /// Ports available on the active default output sink.
@@ -262,24 +471,59 @@ impl AudioSnapshot {
     }
 }
 
-/// Computes stereo L/R balance in `-1.0..=1.0` from per-channel linear volumes (`[left, right, ..]`).
+#[inline]
+fn resolve_channel_position(
+    channel_map: &[AudioChannelPosition],
+    idx: usize,
+    count: usize,
+) -> AudioChannelPosition {
+    match channel_map.get(idx).copied() {
+        Some(pos) if pos != AudioChannelPosition::Unknown => pos,
+        _ => AudioChannelPosition::default_for_index(idx, count),
+    }
+}
+
+/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes using the standard ITU/ALSA
+/// speaker map for `channels.len()` (`2` = Stereo, `4` = Quad, `6` = 5.1 Surround, `8` = 7.1 Surround).
 ///
-/// Returns `0.0` when fewer than 2 channels are present or both channels are silent.
+/// Center and LFE channels are excluded from L/R balance calculation (`pa_cvolume_get_balance`
+/// semantics). Returns `0.0` when fewer than 2 directional channels are present or silent.
 #[must_use]
 pub fn compute_stereo_balance(channels: &[f32]) -> f32 {
-    if channels.len() < 2 {
+    compute_balance_with_map(channels, &[])
+}
+
+/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes and an explicit
+/// [`AudioChannelPosition`] map (falling back to the standard layout for `channels.len()` when
+/// `channel_map` is empty or contains [`AudioChannelPosition::Unknown`]).
+#[must_use]
+pub fn compute_balance_with_map(channels: &[f32], channel_map: &[AudioChannelPosition]) -> f32 {
+    let count = channels.len();
+    if count < 2 {
         return 0.0;
     }
-    let l = if channels[0].is_finite() {
-        channels[0].max(0.0)
-    } else {
-        0.0
-    };
-    let r = if channels[1].is_finite() {
-        channels[1].max(0.0)
-    } else {
-        0.0
-    };
+    let mut left_sum = 0.0_f32;
+    let mut left_n = 0_u32;
+    let mut right_sum = 0.0_f32;
+    let mut right_n = 0_u32;
+
+    for (idx, &raw) in channels.iter().enumerate() {
+        let v = if raw.is_finite() { raw.max(0.0) } else { 0.0 };
+        let pos = resolve_channel_position(channel_map, idx, count);
+        if pos.is_left() {
+            left_sum += v;
+            left_n += 1;
+        } else if pos.is_right() {
+            right_sum += v;
+            right_n += 1;
+        }
+    }
+
+    if left_n == 0 || right_n == 0 {
+        return 0.0;
+    }
+    let l = left_sum / (left_n as f32);
+    let r = right_sum / (right_n as f32);
     let max = l.max(r);
     if max <= 1e-6 {
         0.0
@@ -343,11 +587,30 @@ pub(crate) fn scale_linear_channels(
     vec![target; count]
 }
 
-/// Applies a stereo L/R balance (`-1.0..=1.0`) to `current` per-channel linear volumes while
-/// preserving their peak master level (`fallback_linear` when all channels are silent).
+/// Applies a stereo/surround L/R balance (`-1.0..=1.0`) to `current` per-channel linear volumes
+/// using the standard channel layout for `current.len()` (or `fallback_count`).
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn apply_linear_balance(
     current: &[f32],
+    fallback_count: usize,
+    fallback_linear: f32,
+    balance: f32,
+) -> Vec<f32> {
+    apply_linear_balance_with_map(current, &[], fallback_count, fallback_linear, balance)
+}
+
+/// Applies a stereo/surround L/R balance (`-1.0..=1.0`) to `current` per-channel linear volumes
+/// with [`AudioChannelPosition`] awareness (`pa_cvolume_set_balance` semantics):
+///
+/// - Left channels (`FL`, `RL`, `SL`, ...) and right channels (`FR`, `RR`, `SR`, ...) are scaled
+///   proportionally to their hemisphere average so front-to-rear fade ratios are preserved.
+/// - Center, LFE/subwoofer, and auxiliary channels (`FC`, `LFE`, `RC`, ...) remain untouched at
+///   their existing levels instead of being treated as left/right channels.
+#[must_use]
+pub(crate) fn apply_linear_balance_with_map(
+    current: &[f32],
+    channel_map: &[AudioChannelPosition],
     fallback_count: usize,
     fallback_linear: f32,
     balance: f32,
@@ -377,12 +640,78 @@ pub(crate) fn apply_linear_balance(
     if count == 1 {
         return vec![master];
     }
-    let left_gain = if b > 0.0 { 1.0 - b } else { 1.0 };
-    let right_gain = if b < 0.0 { 1.0 + b } else { 1.0 };
+
+    let mut left_sum = 0.0_f32;
+    let mut left_n = 0_u32;
+    let mut right_sum = 0.0_f32;
+    let mut right_n = 0_u32;
+    for idx in 0..count {
+        let v = current
+            .get(idx)
+            .copied()
+            .filter(|v| v.is_finite())
+            .map_or(master, |v| v.max(0.0));
+        let pos = resolve_channel_position(channel_map, idx, count);
+        if pos.is_left() {
+            left_sum += v;
+            left_n += 1;
+        } else if pos.is_right() {
+            right_sum += v;
+            right_n += 1;
+        }
+    }
+
+    if left_n == 0 || right_n == 0 {
+        return if current.is_empty() {
+            vec![master; count]
+        } else {
+            current
+                .iter()
+                .map(|&v| {
+                    if v.is_finite() {
+                        v.clamp(0.0, 1.5)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+    }
+
+    let left_avg = left_sum / (left_n as f32);
+    let right_avg = right_sum / (right_n as f32);
+    let lr_ref = {
+        let m = left_avg.max(right_avg);
+        if m > 1e-6 { m } else { master }
+    };
+    let target_left = if b > 0.0 { lr_ref * (1.0 - b) } else { lr_ref };
+    let target_right = if b < 0.0 { lr_ref * (1.0 + b) } else { lr_ref };
+
     (0..count)
         .map(|idx| {
-            let gain = if idx % 2 == 0 { left_gain } else { right_gain };
-            (master * gain).clamp(0.0, 1.5)
+            let cur_v = current
+                .get(idx)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map_or(master, |v| v.max(0.0));
+            let pos = resolve_channel_position(channel_map, idx, count);
+            if pos.is_left() {
+                let next = if left_avg > 1e-6 {
+                    cur_v * (target_left / left_avg)
+                } else {
+                    target_left
+                };
+                next.clamp(0.0, 1.5)
+            } else if pos.is_right() {
+                let next = if right_avg > 1e-6 {
+                    cur_v * (target_right / right_avg)
+                } else {
+                    target_right
+                };
+                next.clamp(0.0, 1.5)
+            } else {
+                cur_v.clamp(0.0, 1.5)
+            }
         })
         .collect()
 }
@@ -454,8 +783,9 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioCapture, AudioCard, AudioDevice, AudioPort, AudioPortAvailability, AudioProfile,
-        AudioSnapshot, AudioStream, apply_linear_balance, compute_stereo_balance,
+        AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioPort,
+        AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance,
+        apply_linear_balance_with_map, compute_balance_with_map, compute_stereo_balance,
         sanitize_linear_channels, scale_linear_channels,
     };
 
@@ -472,6 +802,7 @@ mod tests {
                 sink_id: None,
                 linear: 0.5,
                 channels: vec![0.5, 0.5],
+                channel_map: Vec::new(),
                 db: None,
                 muted: false,
             }],
@@ -484,6 +815,7 @@ mod tests {
                 source_id: None,
                 linear: 0.75,
                 channels: vec![0.75],
+                channel_map: Vec::new(),
                 db: None,
                 muted: true,
             }],
@@ -535,6 +867,53 @@ mod tests {
     }
 
     #[test]
+    fn surround_5_1_and_7_1_balance_preserves_center_lfe_and_front_rear_fade() {
+        // 5.1 layout: [FL, FR, FC, LFE, RL, RR] with custom center (0.7), subwoofer (0.5),
+        // and front (0.8) vs rear (0.6) fade.
+        let map_5_1 = AudioChannelPosition::default_map_for_count(6);
+        assert_eq!(
+            map_5_1,
+            vec![
+                AudioChannelPosition::FrontLeft,
+                AudioChannelPosition::FrontRight,
+                AudioChannelPosition::FrontCenter,
+                AudioChannelPosition::Lfe,
+                AudioChannelPosition::RearLeft,
+                AudioChannelPosition::RearRight,
+            ]
+        );
+        let ch_5_1 = [0.8, 0.8, 0.7, 0.5, 0.6, 0.6];
+        assert!((compute_balance_with_map(&ch_5_1, &map_5_1) - 0.0).abs() < 1e-5);
+
+        // Pan 50% left (-0.5):
+        // - FL (0.8) and RL (0.6) stay at 0.8 and 0.6 (front/rear fade ratio preserved)
+        // - FR (0.8 -> 0.4) and RR (0.6 -> 0.3) scale down by 0.5 (front/rear fade preserved)
+        // - FC (0.7) and LFE (0.5) are completely untouched!
+        let panned = apply_linear_balance_with_map(&ch_5_1, &map_5_1, 6, 0.8, -0.5);
+        assert!((panned[0] - 0.8).abs() < 1e-5); // FL
+        assert!((panned[1] - 0.4).abs() < 1e-5); // FR
+        assert!((panned[2] - 0.7).abs() < 1e-5); // FC untouched
+        assert!((panned[3] - 0.5).abs() < 1e-5); // LFE untouched
+        assert!((panned[4] - 0.6).abs() < 1e-5); // RL
+        assert!((panned[5] - 0.3).abs() < 1e-5); // RR
+        assert!((compute_balance_with_map(&panned, &map_5_1) - (-0.5)).abs() < 1e-5);
+
+        // 7.1 layout: [FL, FR, FC, LFE, RL, RR, SL, SR]
+        let map_7_1 = AudioChannelPosition::default_map_for_count(8);
+        let ch_7_1 = [0.8, 0.8, 0.75, 0.4, 0.8, 0.8, 0.8, 0.8];
+        let panned_7_1 = apply_linear_balance_with_map(&ch_7_1, &map_7_1, 8, 0.8, 0.5);
+        assert!((panned_7_1[0] - 0.4).abs() < 1e-5); // FL
+        assert!((panned_7_1[1] - 0.8).abs() < 1e-5); // FR
+        assert!((panned_7_1[2] - 0.75).abs() < 1e-5); // FC untouched
+        assert!((panned_7_1[3] - 0.4).abs() < 1e-5); // LFE untouched
+        assert!((panned_7_1[4] - 0.4).abs() < 1e-5); // RL
+        assert!((panned_7_1[5] - 0.8).abs() < 1e-5); // RR
+        assert!((panned_7_1[6] - 0.4).abs() < 1e-5); // SL
+        assert!((panned_7_1[7] - 0.8).abs() < 1e-5); // SR
+        assert!((compute_balance_with_map(&panned_7_1, &map_7_1) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
     fn snapshot_exposes_active_ports_and_cards() {
         let hp_port = AudioPort {
             index: 4,
@@ -557,6 +936,10 @@ mod tests {
             card_id: Some(45),
             active_port: Some("analog-output-headphones".into()),
             ports: vec![hp_port.clone(), lo_port],
+            channel_map: vec![
+                AudioChannelPosition::FrontLeft,
+                AudioChannelPosition::FrontRight,
+            ],
         };
         let card = AudioCard {
             id: 45,

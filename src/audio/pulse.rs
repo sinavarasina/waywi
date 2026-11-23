@@ -18,9 +18,9 @@ use super::backend::{
     AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, update_snapshot,
 };
 use super::types::{
-    AudioCapture, AudioCard, AudioDevice, AudioEvent, AudioPort, AudioPortAvailability,
-    AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance, sanitize_linear_channels,
-    scale_linear_channels,
+    AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance_with_map,
+    sanitize_linear_channels, scale_linear_channels,
 };
 
 /// Device record shared by output sinks and input sources (mics).
@@ -32,6 +32,7 @@ struct PulseDeviceRecord {
     channels: u8,
     volume_linear: f32,
     channel_volumes: Vec<f32>,
+    channel_map: Vec<AudioChannelPosition>,
     nonzero_template: Vec<f32>,
     db: Option<f32>,
     muted: bool,
@@ -53,6 +54,7 @@ struct PulseStreamRecord {
     channels: u8,
     volume_linear: f32,
     channel_volumes: Vec<f32>,
+    channel_map: Vec<AudioChannelPosition>,
     nonzero_template: Vec<f32>,
     db: Option<f32>,
     muted: bool,
@@ -92,6 +94,7 @@ impl PulseRecordState {
                 sink_id: Some(rec.target_id),
                 linear: rec.volume_linear,
                 channels: rec.channel_volumes.clone(),
+                channel_map: rec.channel_map.clone(),
                 db: rec.db,
                 muted: rec.muted,
             })
@@ -108,6 +111,7 @@ impl PulseRecordState {
                 source_id: Some(rec.target_id),
                 linear: rec.volume_linear,
                 channels: rec.channel_volumes.clone(),
+                channel_map: rec.channel_map.clone(),
                 db: rec.db,
                 muted: rec.muted,
             })
@@ -121,6 +125,9 @@ impl PulseRecordState {
             channels: sink_target
                 .as_ref()
                 .map_or_else(Vec::new, |s| s.channel_volumes.clone()),
+            channel_map: sink_target
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.channel_map.clone()),
             db: sink_target.as_ref().and_then(|s| s.db),
             muted: sink_target.as_ref().is_some_and(|s| s.muted),
             default_sink: sink_target.as_ref().map(|s| rec_device(s)),
@@ -129,6 +136,9 @@ impl PulseRecordState {
             source_channels: source_target
                 .as_ref()
                 .map_or_else(Vec::new, |s| s.channel_volumes.clone()),
+            source_channel_map: source_target
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.channel_map.clone()),
             source_db: source_target.as_ref().and_then(|s| s.db),
             source_muted: source_target.as_ref().is_some_and(|s| s.muted),
             default_source: source_target.as_ref().map(|s| rec_device(s)),
@@ -404,6 +414,7 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     sink.name.as_deref(),
                     sink.description.as_deref(),
                     &sink.volume,
+                    &sink.channel_map,
                     sink.mute,
                     sink.card,
                     sink.active_port
@@ -459,6 +470,7 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     source.name.as_deref(),
                     source.description.as_deref(),
                     &source.volume,
+                    &source.channel_map,
                     source.mute,
                     source.card,
                     source
@@ -506,6 +518,9 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
     let tx_inputs = tx.clone();
     let _input_op = introspect.get_sink_input_info_list(move |res| match res {
         ListResult::Item(info) => {
+            if info.name.as_deref() == Some("waywi-audio") {
+                return;
+            }
             if let Ok(mut list) = collected_inputs_cb.lock() {
                 list.push(pulse_stream_record(
                     info.index,
@@ -513,6 +528,7 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     info.name.as_deref(),
                     info.sink,
                     &info.volume,
+                    &info.channel_map,
                     info.mute,
                 ));
             }
@@ -538,6 +554,7 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     info.name.as_deref(),
                     info.source,
                     &info.volume,
+                    &info.channel_map,
                     info.mute,
                 ));
             }
@@ -589,8 +606,9 @@ fn apply_pulse_command(
             if let Some(id) = target_id
                 && let Some(sink) = records.sinks.get_mut(&id)
             {
-                let balanced = apply_linear_balance(
+                let balanced = apply_linear_balance_with_map(
                     &sink.channel_volumes,
+                    &sink.channel_map,
                     sink.channels as usize,
                     sink.volume_linear,
                     balance,
@@ -675,8 +693,9 @@ fn apply_pulse_command(
             if let Some(id) = source_target_id
                 && let Some(source) = records.sources.get_mut(&id)
             {
-                let balanced = apply_linear_balance(
+                let balanced = apply_linear_balance_with_map(
                     &source.channel_volumes,
+                    &source.channel_map,
                     source.channels as usize,
                     source.volume_linear,
                     balance,
@@ -763,8 +782,9 @@ fn apply_pulse_command(
         }
         AudioCommand::SetStreamBalance(id, balance) => {
             if let Some(rec) = records.sink_inputs.get_mut(&id) {
-                let balanced = apply_linear_balance(
+                let balanced = apply_linear_balance_with_map(
                     &rec.channel_volumes,
+                    &rec.channel_map,
                     rec.channels as usize,
                     rec.volume_linear,
                     balance,
@@ -822,8 +842,9 @@ fn apply_pulse_command(
         }
         AudioCommand::SetCaptureBalance(id, balance) => {
             if let Some(rec) = records.source_outputs.get_mut(&id) {
-                let balanced = apply_linear_balance(
+                let balanced = apply_linear_balance_with_map(
                     &rec.channel_volumes,
+                    &rec.channel_map,
                     rec.channels as usize,
                     rec.volume_linear,
                     balance,
@@ -944,7 +965,76 @@ fn rec_device(rec: &PulseDeviceRecord) -> AudioDevice {
         card_id: rec.card_id,
         active_port: rec.active_port.clone(),
         ports: rec.ports.clone(),
+        channel_map: rec.channel_map.clone(),
     }
+}
+
+fn pulse_channel_map(
+    map: &pa::channelmap::Map,
+    fallback_count: usize,
+) -> Vec<AudioChannelPosition> {
+    use pa::channelmap::Position as P;
+    let slice = map.get();
+    if slice.is_empty() {
+        return AudioChannelPosition::default_map_for_count(fallback_count.max(1));
+    }
+    slice
+        .iter()
+        .map(|&pos| match pos {
+            P::Mono => AudioChannelPosition::Mono,
+            P::FrontLeft => AudioChannelPosition::FrontLeft,
+            P::FrontRight => AudioChannelPosition::FrontRight,
+            P::FrontCenter => AudioChannelPosition::FrontCenter,
+            P::RearCenter => AudioChannelPosition::RearCenter,
+            P::RearLeft => AudioChannelPosition::RearLeft,
+            P::RearRight => AudioChannelPosition::RearRight,
+            P::Lfe => AudioChannelPosition::Lfe,
+            P::FrontLeftOfCenter => AudioChannelPosition::FrontLeftCenter,
+            P::FrontRightOfCenter => AudioChannelPosition::FrontRightCenter,
+            P::SideLeft => AudioChannelPosition::SideLeft,
+            P::SideRight => AudioChannelPosition::SideRight,
+            P::TopCenter => AudioChannelPosition::TopCenter,
+            P::TopFrontLeft => AudioChannelPosition::TopFrontLeft,
+            P::TopFrontRight => AudioChannelPosition::TopFrontRight,
+            P::TopFrontCenter => AudioChannelPosition::TopFrontCenter,
+            P::TopRearLeft => AudioChannelPosition::TopRearLeft,
+            P::TopRearRight => AudioChannelPosition::TopRearRight,
+            P::TopRearCenter => AudioChannelPosition::TopRearCenter,
+            P::Aux0 => AudioChannelPosition::Aux(0),
+            P::Aux1 => AudioChannelPosition::Aux(1),
+            P::Aux2 => AudioChannelPosition::Aux(2),
+            P::Aux3 => AudioChannelPosition::Aux(3),
+            P::Aux4 => AudioChannelPosition::Aux(4),
+            P::Aux5 => AudioChannelPosition::Aux(5),
+            P::Aux6 => AudioChannelPosition::Aux(6),
+            P::Aux7 => AudioChannelPosition::Aux(7),
+            P::Aux8 => AudioChannelPosition::Aux(8),
+            P::Aux9 => AudioChannelPosition::Aux(9),
+            P::Aux10 => AudioChannelPosition::Aux(10),
+            P::Aux11 => AudioChannelPosition::Aux(11),
+            P::Aux12 => AudioChannelPosition::Aux(12),
+            P::Aux13 => AudioChannelPosition::Aux(13),
+            P::Aux14 => AudioChannelPosition::Aux(14),
+            P::Aux15 => AudioChannelPosition::Aux(15),
+            P::Aux16 => AudioChannelPosition::Aux(16),
+            P::Aux17 => AudioChannelPosition::Aux(17),
+            P::Aux18 => AudioChannelPosition::Aux(18),
+            P::Aux19 => AudioChannelPosition::Aux(19),
+            P::Aux20 => AudioChannelPosition::Aux(20),
+            P::Aux21 => AudioChannelPosition::Aux(21),
+            P::Aux22 => AudioChannelPosition::Aux(22),
+            P::Aux23 => AudioChannelPosition::Aux(23),
+            P::Aux24 => AudioChannelPosition::Aux(24),
+            P::Aux25 => AudioChannelPosition::Aux(25),
+            P::Aux26 => AudioChannelPosition::Aux(26),
+            P::Aux27 => AudioChannelPosition::Aux(27),
+            P::Aux28 => AudioChannelPosition::Aux(28),
+            P::Aux29 => AudioChannelPosition::Aux(29),
+            P::Aux30 => AudioChannelPosition::Aux(30),
+            P::Aux31 => AudioChannelPosition::Aux(31),
+            P::Invalid => AudioChannelPosition::Unknown,
+        })
+        .collect()
 }
 
 fn pulse_volume_parts(volume: &ChannelVolumes) -> (f32, Vec<f32>, Option<f32>) {
@@ -979,6 +1069,7 @@ fn pulse_device_record(
     name: Option<&str>,
     description: Option<&str>,
     volume: &ChannelVolumes,
+    raw_channel_map: &pa::channelmap::Map,
     muted: bool,
     card_id: Option<u32>,
     active_port: Option<&str>,
@@ -990,6 +1081,7 @@ fn pulse_device_record(
         .unwrap_or(name)
         .to_owned();
     let (volume_linear, channel_volumes, db) = pulse_volume_parts(volume);
+    let channel_map = pulse_channel_map(raw_channel_map, channel_volumes.len());
     ports.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
@@ -1007,6 +1099,7 @@ fn pulse_device_record(
         channels: volume.len().max(1),
         volume_linear,
         channel_volumes,
+        channel_map,
         nonzero_template,
         db,
         muted,
@@ -1069,10 +1162,12 @@ fn pulse_stream_record(
     stream_name: Option<&str>,
     target_id: u32,
     volume: &ChannelVolumes,
+    raw_channel_map: &pa::channelmap::Map,
     muted: bool,
 ) -> PulseStreamRecord {
     let meta = super::backend::StreamMetadata::extract(stream_name, |k| proplist.get_str(k));
     let (volume_linear, channel_volumes, db) = pulse_volume_parts(volume);
+    let channel_map = pulse_channel_map(raw_channel_map, channel_volumes.len());
     let nonzero_template = if channel_volumes.iter().any(|&v| v > 1e-6) {
         channel_volumes.clone()
     } else {
@@ -1088,6 +1183,7 @@ fn pulse_stream_record(
         channels: volume.len().max(1),
         volume_linear,
         channel_volumes,
+        channel_map,
         nonzero_template,
         db,
         muted,

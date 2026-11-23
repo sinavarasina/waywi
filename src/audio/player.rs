@@ -14,7 +14,7 @@ use super::sound::{
     resolve_sound_theme_path,
 };
 
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use super::sound::PolyphonicMixer;
 
 #[cfg(feature = "audio-playback")]
@@ -212,17 +212,13 @@ impl AudioPlayer {
 }
 
 fn start_playback_driver() -> Option<Box<dyn PlaybackDriver>> {
-    #[cfg(feature = "audio-playback")]
-    {
-        if let Some(drv) = RodioDriver::spawn() {
-            return Some(Box::new(drv));
-        }
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    if let Some(drv) = NativeDriver::spawn() {
+        return Some(Box::new(drv));
     }
-    #[cfg(not(feature = "audio-playback"))]
-    {
-        if let Some(drv) = NativeDriver::spawn() {
-            return Some(Box::new(drv));
-        }
+    #[cfg(feature = "audio-playback")]
+    if let Some(drv) = RodioDriver::spawn() {
+        return Some(Box::new(drv));
     }
     None
 }
@@ -237,12 +233,15 @@ struct RodioDriver {
 impl RodioDriver {
     fn spawn() -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<PlayerCommand>();
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
         let join = thread::Builder::new()
             .name("waywi-audio-rodio".to_owned())
             .spawn(move || {
                 let Ok(sink) = rodio::DeviceSinkBuilder::open_default_sink() else {
+                    let _ = init_tx.send(false);
                     return;
                 };
+                let _ = init_tx.send(true);
                 let channels = std::num::NonZero::new(2).unwrap();
                 let rate = std::num::NonZero::new(MIXER_SAMPLE_RATE).unwrap();
                 let mut active_players: Vec<rodio::Player> = Vec::new();
@@ -270,6 +269,10 @@ impl RodioDriver {
                 }
             })
             .ok()?;
+        if !init_rx.recv().unwrap_or(false) {
+            let _ = join.join();
+            return None;
+        }
         Some(Self {
             tx,
             join: Some(join),
@@ -295,96 +298,179 @@ impl PlaybackDriver for RodioDriver {
     }
 }
 
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use std::sync::Condvar;
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(feature = "pipewire")]
+use std::sync::atomic::AtomicUsize;
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Silent frames (~250 ms at 48 kHz) drained after the last voice finishes before corking the
+/// PipeWire stream so short tactile clicks never clip at the tail while idle sinks can suspend.
+#[cfg(feature = "pipewire")]
+const IDLE_CORK_FRAMES: usize = (MIXER_SAMPLE_RATE / 4) as usize;
+
+#[cfg(feature = "pipewire")]
+enum PwPlaySignal {
+    EnsureActive,
+    CheckIdleCork,
+    StopAll,
+    Shutdown,
+}
+
 /// Mixer state shared between the player driver and the native output threads.
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 type SharedMixer = Arc<(Mutex<PolyphonicMixer>, Condvar)>;
 
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 struct NativeDriver {
     mixer: SharedMixer,
     stop: Arc<AtomicBool>,
+    #[cfg(feature = "pipewire")]
+    pw_wake: Option<pipewire::channel::Sender<PwPlaySignal>>,
+    #[cfg(feature = "pipewire")]
+    idle_frames: Arc<AtomicUsize>,
     join: Option<JoinHandle<()>>,
 }
 
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 impl NativeDriver {
     fn spawn() -> Option<Self> {
-        let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-
-        let try_spawn = |name: &'static str, f: fn(SharedMixer, Arc<AtomicBool>)| -> Option<Self> {
-            let m = Arc::clone(&mixer);
-            let s = Arc::clone(&stop);
-            thread::Builder::new()
-                .name(name.to_owned())
-                .spawn(move || f(m, s))
-                .ok()
-                .map(|j| Self {
-                    mixer: Arc::clone(&mixer),
-                    stop: Arc::clone(&stop),
-                    join: Some(j),
-                })
-        };
+        #[cfg(feature = "pipewire")]
+        let pw_avail = super::backend::pipewire_runtime_available();
+        #[cfg(feature = "pulseaudio")]
+        let pulse_avail = super::backend::pulseaudio_runtime_available();
+        #[cfg(feature = "alsa")]
+        let alsa_avail = super::backend::alsa_runtime_available();
 
         #[cfg(feature = "pipewire")]
-        if super::backend::pipewire_runtime_available()
-            && let Some(drv) = try_spawn("waywi-audio-pw", run_pipewire_playback)
-        {
+        if pw_avail && let Some(drv) = Self::try_spawn_pipewire() {
             return Some(drv);
         }
 
         #[cfg(feature = "pulseaudio")]
-        if super::backend::pulseaudio_runtime_available()
-            && let Some(drv) = try_spawn("waywi-audio-pulse", run_pulse_playback)
+        if pulse_avail
+            && let Some(drv) = Self::try_spawn_worker("waywi-audio-pulse", run_pulse_playback)
         {
             return Some(drv);
         }
 
         #[cfg(feature = "alsa")]
-        if super::backend::alsa_runtime_available()
-            && let Some(drv) = try_spawn("waywi-audio-alsa", run_alsa_playback)
+        if alsa_avail
+            && let Some(drv) = Self::try_spawn_worker("waywi-audio-alsa", run_alsa_playback)
         {
             return Some(drv);
         }
 
+        // Runtime fallback pass for non-standard socket environments where the fast path skipped
+        // a compiled-in backend.
         #[cfg(feature = "pipewire")]
-        if let Some(drv) = try_spawn("waywi-audio-pw", run_pipewire_playback) {
+        if !pw_avail && let Some(drv) = Self::try_spawn_pipewire() {
             return Some(drv);
         }
-        #[cfg(all(not(feature = "pipewire"), feature = "pulseaudio"))]
-        if let Some(drv) = try_spawn("waywi-audio-pulse", run_pulse_playback) {
+
+        #[cfg(feature = "pulseaudio")]
+        if !pulse_avail
+            && let Some(drv) = Self::try_spawn_worker("waywi-audio-pulse", run_pulse_playback)
+        {
             return Some(drv);
         }
-        #[cfg(all(
-            not(feature = "pipewire"),
-            not(feature = "pulseaudio"),
-            feature = "alsa"
-        ))]
-        if let Some(drv) = try_spawn("waywi-audio-alsa", run_alsa_playback) {
+
+        #[cfg(feature = "alsa")]
+        if !alsa_avail
+            && let Some(drv) = Self::try_spawn_worker("waywi-audio-alsa", run_alsa_playback)
+        {
             return Some(drv);
         }
 
         None
     }
+
+    #[cfg(feature = "pipewire")]
+    fn try_spawn_pipewire() -> Option<Self> {
+        let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let idle_frames = Arc::new(AtomicUsize::new(0));
+        let (pw_tx, pw_rx) = pipewire::channel::channel::<PwPlaySignal>();
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+
+        let m = Arc::clone(&mixer);
+        let s = Arc::clone(&stop);
+        let idle = Arc::clone(&idle_frames);
+        let tx_proc = pw_tx.clone();
+        let join = thread::Builder::new()
+            .name("waywi-audio-pw".to_owned())
+            .spawn(move || run_pipewire_playback(m, s, idle, tx_proc, pw_rx, init_tx))
+            .ok()?;
+
+        if !init_rx.recv().unwrap_or(false) {
+            let _ = join.join();
+            return None;
+        }
+
+        Some(Self {
+            mixer,
+            stop,
+            pw_wake: Some(pw_tx),
+            idle_frames,
+            join: Some(join),
+        })
+    }
+
+    #[cfg(any(feature = "pulseaudio", feature = "alsa"))]
+    fn try_spawn_worker(
+        name: &'static str,
+        f: fn(SharedMixer, Arc<AtomicBool>, std::sync::mpsc::SyncSender<bool>),
+    ) -> Option<Self> {
+        let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let m = Arc::clone(&mixer);
+        let s = Arc::clone(&stop);
+        let join = thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || f(m, s, init_tx))
+            .ok()?;
+
+        if !init_rx.recv().unwrap_or(false) {
+            let _ = join.join();
+            return None;
+        }
+
+        Some(Self {
+            mixer,
+            stop,
+            #[cfg(feature = "pipewire")]
+            pw_wake: None,
+            #[cfg(feature = "pipewire")]
+            idle_frames: Arc::new(AtomicUsize::new(0)),
+            join: Some(join),
+        })
+    }
 }
 
-#[cfg(not(feature = "audio-playback"))]
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 impl PlaybackDriver for NativeDriver {
     fn send_play(&mut self, stereo_48k: Arc<[f32]>, volume: f32) {
+        #[cfg(feature = "pipewire")]
+        self.idle_frames.store(0, Ordering::Release);
         if let Ok(mut g) = self.mixer.0.lock() {
             g.push(stereo_48k, volume);
             self.mixer.1.notify_one();
+        }
+        #[cfg(feature = "pipewire")]
+        if let Some(ref tx) = self.pw_wake {
+            let _ = tx.send(PwPlaySignal::EnsureActive);
         }
     }
 
     fn send_stop(&mut self) {
         if let Ok(mut g) = self.mixer.0.lock() {
             g.clear();
+        }
+        #[cfg(feature = "pipewire")]
+        if let Some(ref tx) = self.pw_wake {
+            let _ = tx.send(PwPlaySignal::StopAll);
         }
     }
 
@@ -393,16 +479,17 @@ impl PlaybackDriver for NativeDriver {
         self.stop.store(true, Ordering::Release);
         self.mixer.1.notify_all();
         drop(guard);
+        #[cfg(feature = "pipewire")]
+        if let Some(ref tx) = self.pw_wake {
+            let _ = tx.send(PwPlaySignal::Shutdown);
+        }
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
     }
 }
 
-#[cfg(all(
-    not(feature = "audio-playback"),
-    any(feature = "pulseaudio", feature = "alsa")
-))]
+#[cfg(any(feature = "pulseaudio", feature = "alsa"))]
 fn mix_next_chunk(mixer: &SharedMixer, stop: &AtomicBool, out: &mut [f32]) -> bool {
     let mut g = mixer.0.lock().unwrap_or_else(|e| e.into_inner());
     g = mixer
@@ -415,8 +502,18 @@ fn mix_next_chunk(mixer: &SharedMixer, stop: &AtomicBool, out: &mut [f32]) -> bo
     g.mix_f32(out)
 }
 
-#[cfg(all(not(feature = "audio-playback"), feature = "pipewire"))]
-fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
+#[cfg(feature = "pipewire")]
+fn run_pipewire_playback(
+    mixer: SharedMixer,
+    stop: Arc<AtomicBool>,
+    idle_frames: Arc<AtomicUsize>,
+    pw_tx: pipewire::channel::Sender<PwPlaySignal>,
+    pw_rx: pipewire::channel::Receiver<PwPlaySignal>,
+    init_tx: std::sync::mpsc::SyncSender<bool>,
+) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use pipewire as pw;
     use pw::spa;
     use spa::param::ParamType;
@@ -426,26 +523,33 @@ fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     use spa::utils::{Direction, SpaTypes};
 
     super::pipewire::ensure_pw_init();
-    let Ok(mainloop) = pw::main_loop::MainLoopBox::new(None) else {
+    let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else {
+        let _ = init_tx.send(false);
         return;
     };
-    let Ok(ctx) = pw::context::ContextBox::new(mainloop.loop_(), None) else {
+    let Ok(ctx) = pw::context::ContextRc::new(&mainloop, None) else {
+        let _ = init_tx.send(false);
         return;
     };
-    let Ok(core) = ctx.connect(None) else {
+    let Ok(core) = ctx.connect_rc(None) else {
+        let _ = init_tx.send(false);
         return;
     };
 
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE => "Event",
+        *pw::keys::APP_NAME => "waywi",
         *pw::keys::NODE_NAME => "waywi-audio",
     };
-    let Ok(stream) = pw::stream::StreamBox::new(&core, "waywi-audio", props) else {
+    let Ok(stream) = pw::stream::StreamRc::new(core, "waywi-audio", props) else {
+        let _ = init_tx.send(false);
         return;
     };
 
     let m_proc = Arc::clone(&mixer);
+    let idle_proc = Arc::clone(&idle_frames);
     let _listener = stream
         .add_local_listener_with_user_data([0.0f32; 2048])
         .process(move |stream, fbuf| {
@@ -463,9 +567,12 @@ fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
             let frame_count = (slice.len() / stride).min(1024);
             let float_count = frame_count * 2;
             let out_slice = &mut fbuf[..float_count];
-            if let Ok(mut g) = m_proc.0.lock() {
-                g.mix_f32(out_slice);
-            }
+            let has_audio = if let Ok(mut g) = m_proc.0.lock() {
+                g.mix_f32(out_slice)
+            } else {
+                out_slice.fill(0.0);
+                false
+            };
             for (dst, &sample) in slice.as_chunks_mut::<4>().0.iter_mut().zip(&*out_slice) {
                 *dst = sample.to_le_bytes();
             }
@@ -473,6 +580,15 @@ fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = stride as i32;
             *chunk.size_mut() = (float_count * std::mem::size_of::<f32>()) as u32;
+
+            if has_audio {
+                idle_proc.store(0, Ordering::Release);
+            } else {
+                let prev = idle_proc.fetch_add(frame_count, Ordering::AcqRel);
+                if prev < IDLE_CORK_FRAMES && prev + frame_count >= IDLE_CORK_FRAMES {
+                    let _ = pw_tx.send(PwPlaySignal::CheckIdleCork);
+                }
+            }
         })
         .register();
 
@@ -487,41 +603,92 @@ fn run_pipewire_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     });
     let Ok((pod_bytes, _)) = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &pod_obj)
     else {
+        let _ = init_tx.send(false);
         return;
     };
     let Some(pod) = spa::pod::Pod::from_bytes(pod_bytes.get_ref()) else {
+        let _ = init_tx.send(false);
         return;
     };
     let mut params = [pod];
     let flags = pw::stream::StreamFlags::AUTOCONNECT
         | pw::stream::StreamFlags::MAP_BUFFERS
-        | pw::stream::StreamFlags::RT_PROCESS;
+        | pw::stream::StreamFlags::RT_PROCESS
+        | pw::stream::StreamFlags::INACTIVE;
     if stream
         .connect(Direction::Output, None, flags, &mut params)
         .is_err()
     {
+        let _ = init_tx.send(false);
         return;
     }
 
-    let loop_ref = mainloop.loop_();
-    while !stop.load(Ordering::Acquire) {
-        let _ = loop_ref.iterate(pw::loop_::Timeout::Finite(
-            std::time::Duration::from_millis(50),
-        ));
-    }
+    let is_active = Rc::new(Cell::new(false));
+    let stream_ctl = stream.clone();
+    let active_ctl = Rc::clone(&is_active);
+    let mixer_ctl = Arc::clone(&mixer);
+    let idle_ctl = Arc::clone(&idle_frames);
+    let stop_ctl = Arc::clone(&stop);
+    let mainloop_quit = mainloop.clone();
+    let _attached_rx = pw_rx.attach(mainloop.loop_(), move |sig| {
+        if stop_ctl.load(Ordering::Acquire) {
+            let _ = stream_ctl.disconnect();
+            mainloop_quit.quit();
+            return;
+        }
+        match sig {
+            PwPlaySignal::EnsureActive => {
+                if !active_ctl.get() && stream_ctl.set_active(true).is_ok() {
+                    active_ctl.set(true);
+                }
+            }
+            PwPlaySignal::CheckIdleCork => {
+                let empty = mixer_ctl.0.lock().map(|g| g.is_empty()).unwrap_or(true);
+                if empty
+                    && idle_ctl.load(Ordering::Acquire) >= IDLE_CORK_FRAMES
+                    && active_ctl.get()
+                    && stream_ctl.set_active(false).is_ok()
+                {
+                    active_ctl.set(false);
+                }
+            }
+            PwPlaySignal::StopAll => {
+                if active_ctl.get() {
+                    let _ = stream_ctl.flush(false);
+                    if stream_ctl.set_active(false).is_ok() {
+                        active_ctl.set(false);
+                    }
+                }
+            }
+            PwPlaySignal::Shutdown => {
+                let _ = stream_ctl.disconnect();
+                mainloop_quit.quit();
+            }
+        }
+    });
+
+    let _ = init_tx.send(true);
+    mainloop.run();
 }
 
-#[cfg(all(not(feature = "audio-playback"), feature = "pulseaudio"))]
-fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
+#[cfg(feature = "pulseaudio")]
+fn run_pulse_playback(
+    mixer: SharedMixer,
+    stop: Arc<AtomicBool>,
+    init_tx: std::sync::mpsc::SyncSender<bool>,
+) {
     use libpulse_binding as pa;
     use pa::mainloop::threaded::Mainloop;
+    use pa::proplist::Proplist;
     use pa::sample::{Format, Spec};
     use pa::stream::{FlagSet as StreamFlags, SeekMode, Stream};
 
     let Some(mut ml) = Mainloop::new() else {
+        let _ = init_tx.send(false);
         return;
     };
     let Some(mut ctx) = pa::context::Context::new(&ml, "waywi-audio") else {
+        let _ = init_tx.send(false);
         return;
     };
     if ctx
@@ -529,6 +696,7 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
         .is_err()
         || ml.start().is_err()
     {
+        let _ = init_tx.send(false);
         return;
     }
 
@@ -539,6 +707,7 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
             pa::context::State::Failed | pa::context::State::Terminated => {
                 ml.unlock();
                 ml.stop();
+                let _ = init_tx.send(false);
                 return;
             }
             _ => ml.wait(),
@@ -547,6 +716,7 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     if stop.load(Ordering::Acquire) {
         ml.unlock();
         ml.stop();
+        let _ = init_tx.send(false);
         return;
     }
 
@@ -555,9 +725,20 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
         channels: 2,
         rate: MIXER_SAMPLE_RATE,
     };
-    let Some(mut stream) = Stream::new(&mut ctx, "waywi-audio", &spec, None) else {
+    let Some(mut proplist) = Proplist::new() else {
         ml.unlock();
         ml.stop();
+        let _ = init_tx.send(false);
+        return;
+    };
+    let _ = proplist.set_str(pa::proplist::properties::MEDIA_ROLE, "event");
+    let _ = proplist.set_str(pa::proplist::properties::APPLICATION_NAME, "waywi");
+    let Some(mut stream) =
+        Stream::new_with_proplist(&mut ctx, "waywi-audio", &spec, None, &mut proplist)
+    else {
+        ml.unlock();
+        ml.stop();
+        let _ = init_tx.send(false);
         return;
     };
     if stream
@@ -566,14 +747,23 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
     {
         ml.unlock();
         ml.stop();
+        let _ = init_tx.send(false);
         return;
     }
-    let _ = stream.uncork(None);
     ml.unlock();
+    let _ = init_tx.send(true);
 
+    let mut is_corked = true;
     let mut fbuf = [0.0f32; 512];
     let mut bbuf = [0u8; 512 * 4];
     while !stop.load(Ordering::Acquire) {
+        let empty = mixer.0.lock().map(|g| g.is_empty()).unwrap_or(true);
+        if empty && !is_corked {
+            ml.lock();
+            let _ = stream.cork(None);
+            ml.unlock();
+            is_corked = true;
+        }
         if !mix_next_chunk(&mixer, &stop, &mut fbuf) {
             continue;
         }
@@ -581,22 +771,32 @@ fn run_pulse_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
             *dst = s.to_le_bytes();
         }
         ml.lock();
+        if is_corked {
+            let _ = stream.uncork(None);
+            is_corked = false;
+        }
         let _ = stream.write_copy(&bbuf, 0, SeekMode::Relative);
         ml.unlock();
     }
     ml.stop();
 }
 
-#[cfg(all(not(feature = "audio-playback"), feature = "alsa"))]
-fn run_alsa_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
+#[cfg(feature = "alsa")]
+fn run_alsa_playback(
+    mixer: SharedMixer,
+    stop: Arc<AtomicBool>,
+    init_tx: std::sync::mpsc::SyncSender<bool>,
+) {
     use alsa::pcm::{Access, Format, HwParams, PCM};
     use alsa::{Direction, ValueOr};
 
     let Ok(pcm) = PCM::new("default", Direction::Playback, false) else {
+        let _ = init_tx.send(false);
         return;
     };
     {
         let Ok(hwp) = HwParams::any(&pcm) else {
+            let _ = init_tx.send(false);
             return;
         };
         if hwp.set_access(Access::RWInterleaved).is_err()
@@ -605,12 +805,15 @@ fn run_alsa_playback(mixer: SharedMixer, stop: Arc<AtomicBool>) {
             || hwp.set_rate(MIXER_SAMPLE_RATE, ValueOr::Nearest).is_err()
             || pcm.hw_params(&hwp).is_err()
         {
+            let _ = init_tx.send(false);
             return;
         }
     }
     let Ok(io) = pcm.io_i16() else {
+        let _ = init_tx.send(false);
         return;
     };
+    let _ = init_tx.send(true);
     let mut fbuf = [0.0f32; 512];
     let mut ibuf = [0i16; 512];
     while !stop.load(Ordering::Acquire) {

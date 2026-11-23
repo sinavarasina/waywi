@@ -16,8 +16,8 @@ use super::backend::{
     AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, update_snapshot,
 };
 use super::types::{
-    AudioDevice, AudioEvent, AudioSnapshot, apply_linear_balance, sanitize_linear_channels,
-    scale_linear_channels,
+    AudioChannelPosition, AudioDevice, AudioEvent, AudioSnapshot, apply_linear_balance_with_map,
+    sanitize_linear_channels, scale_linear_channels,
 };
 
 const PREFERRED_SELEM_NAMES: &[&str] = &["Master", "PCM", "Speaker", "Headphone", "DAC"];
@@ -258,10 +258,15 @@ fn list_playback_selems(mixer: &Mixer, card_name: &str) -> Vec<AudioDevice> {
         let Ok(name) = id.get_name() else {
             continue;
         };
+        let channel_map = playback_channels(&selem)
+            .into_iter()
+            .map(|(_, pos)| pos)
+            .collect();
         out.push(AudioDevice {
             id: idx as u32 + 1,
             name: name.to_owned(),
             description: format!("{name} ({card_name})"),
+            channel_map,
             ..AudioDevice::default()
         });
     }
@@ -281,15 +286,35 @@ fn list_capture_selems(mixer: &Mixer, card_name: &str) -> Vec<AudioDevice> {
         let Ok(name) = id.get_name() else {
             continue;
         };
+        let channel_map = capture_channels(&selem)
+            .into_iter()
+            .map(|(_, pos)| pos)
+            .collect();
         out.push(AudioDevice {
             id: idx as u32 + 1,
             name: name.to_owned(),
             description: format!("{name} ({card_name})"),
+            channel_map,
             ..AudioDevice::default()
         });
     }
     out
 }
+
+const ORDERED_ALSA_CHANNELS: &[(SelemChannelId, AudioChannelPosition)] = &[
+    (SelemChannelId::FrontLeft, AudioChannelPosition::FrontLeft),
+    (SelemChannelId::FrontRight, AudioChannelPosition::FrontRight),
+    (
+        SelemChannelId::FrontCenter,
+        AudioChannelPosition::FrontCenter,
+    ),
+    (SelemChannelId::Woofer, AudioChannelPosition::Lfe),
+    (SelemChannelId::RearLeft, AudioChannelPosition::RearLeft),
+    (SelemChannelId::RearRight, AudioChannelPosition::RearRight),
+    (SelemChannelId::RearCenter, AudioChannelPosition::RearCenter),
+    (SelemChannelId::SideLeft, AudioChannelPosition::SideLeft),
+    (SelemChannelId::SideRight, AudioChannelPosition::SideRight),
+];
 
 fn primary_playback_channel(selem: &Selem<'_>) -> SelemChannelId {
     if selem.has_playback_channel(SelemChannelId::FrontLeft) {
@@ -311,24 +336,40 @@ fn primary_capture_channel(selem: &Selem<'_>) -> SelemChannelId {
     }
 }
 
-fn playback_channels(selem: &Selem<'_>) -> Vec<SelemChannelId> {
-    if selem.has_playback_channel(SelemChannelId::FrontLeft)
-        && selem.has_playback_channel(SelemChannelId::FrontRight)
-    {
-        vec![SelemChannelId::FrontLeft, SelemChannelId::FrontRight]
-    } else {
-        vec![primary_playback_channel(selem)]
+fn playback_channels(selem: &Selem<'_>) -> Vec<(SelemChannelId, AudioChannelPosition)> {
+    if selem.is_playback_mono() {
+        return vec![(primary_playback_channel(selem), AudioChannelPosition::Mono)];
     }
+    let mut out = Vec::new();
+    for &(ch, pos) in ORDERED_ALSA_CHANNELS {
+        if selem.has_playback_channel(ch) {
+            out.push((ch, pos));
+        }
+    }
+    if out.is_empty() {
+        out.push((primary_playback_channel(selem), AudioChannelPosition::Mono));
+    } else if out.len() == 1 {
+        out[0].1 = AudioChannelPosition::Mono;
+    }
+    out
 }
 
-fn capture_channels(selem: &Selem<'_>) -> Vec<SelemChannelId> {
-    if selem.has_capture_channel(SelemChannelId::FrontLeft)
-        && selem.has_capture_channel(SelemChannelId::FrontRight)
-    {
-        vec![SelemChannelId::FrontLeft, SelemChannelId::FrontRight]
-    } else {
-        vec![primary_capture_channel(selem)]
+fn capture_channels(selem: &Selem<'_>) -> Vec<(SelemChannelId, AudioChannelPosition)> {
+    if selem.is_capture_mono() {
+        return vec![(primary_capture_channel(selem), AudioChannelPosition::Mono)];
     }
+    let mut out = Vec::new();
+    for &(ch, pos) in ORDERED_ALSA_CHANNELS {
+        if selem.has_capture_channel(ch) {
+            out.push((ch, pos));
+        }
+    }
+    if out.is_empty() {
+        out.push((primary_capture_channel(selem), AudioChannelPosition::Mono));
+    } else if out.len() == 1 {
+        out[0].1 = AudioChannelPosition::Mono;
+    }
+    out
 }
 
 fn read_alsa_snapshot(
@@ -346,32 +387,34 @@ fn read_alsa_snapshot(
         .and_then(|n| sources.iter().find(|d| d.name == n).cloned())
         .or_else(|| sources.first().cloned());
 
-    let (linear, channels, db, muted) = if let Some(ref dev) = default_sink
+    let (linear, channels, channel_map, db, muted) = if let Some(ref dev) = default_sink
         && let Some(selem) = mixer.find_selem(&SelemId::new(&dev.name, 0))
     {
         read_playback_levels(&selem)
     } else {
-        (0.0, Vec::new(), None, false)
+        (0.0, Vec::new(), Vec::new(), None, false)
     };
 
-    let (source_linear, source_channels, source_db, source_muted) = if let Some(ref dev) =
-        default_source
-        && let Some(selem) = mixer.find_selem(&SelemId::new(&dev.name, 0))
-    {
-        read_capture_levels(&selem)
-    } else {
-        (0.0, Vec::new(), None, false)
-    };
+    let (source_linear, source_channels, source_channel_map, source_db, source_muted) =
+        if let Some(ref dev) = default_source
+            && let Some(selem) = mixer.find_selem(&SelemId::new(&dev.name, 0))
+        {
+            read_capture_levels(&selem)
+        } else {
+            (0.0, Vec::new(), Vec::new(), None, false)
+        };
 
     AudioSnapshot {
         linear,
         channels,
+        channel_map,
         db,
         muted,
         default_sink,
         devices,
         source_linear,
         source_channels,
+        source_channel_map,
         source_db,
         source_muted,
         default_source,
@@ -380,16 +423,20 @@ fn read_alsa_snapshot(
     }
 }
 
-fn read_playback_levels(selem: &Selem<'_>) -> (f32, Vec<f32>, Option<f32>, bool) {
+fn read_playback_levels(
+    selem: &Selem<'_>,
+) -> (f32, Vec<f32>, Vec<AudioChannelPosition>, Option<f32>, bool) {
     let (min, max) = selem.get_playback_volume_range();
     let span = (max - min).max(1) as f32;
-    let ch_ids = playback_channels(selem);
-    let mut channels = Vec::with_capacity(ch_ids.len());
+    let ch_pairs = playback_channels(selem);
+    let mut channels = Vec::with_capacity(ch_pairs.len());
+    let mut channel_map = Vec::with_capacity(ch_pairs.len());
     let mut peak_raw = min;
-    for &ch in &ch_ids {
+    for &(ch, pos) in &ch_pairs {
         let raw = selem.get_playback_volume(ch).unwrap_or(min);
         peak_raw = peak_raw.max(raw);
         channels.push(((raw - min) as f32 / span).clamp(0.0, 1.0));
+        channel_map.push(pos);
     }
     let linear = channels.iter().copied().fold(0.0_f32, f32::max);
     let db = selem
@@ -405,19 +452,23 @@ fn read_playback_levels(selem: &Selem<'_>) -> (f32, Vec<f32>, Option<f32>, bool)
     } else {
         false
     };
-    (linear, channels, db, muted)
+    (linear, channels, channel_map, db, muted)
 }
 
-fn read_capture_levels(selem: &Selem<'_>) -> (f32, Vec<f32>, Option<f32>, bool) {
+fn read_capture_levels(
+    selem: &Selem<'_>,
+) -> (f32, Vec<f32>, Vec<AudioChannelPosition>, Option<f32>, bool) {
     let (min, max) = selem.get_capture_volume_range();
     let span = (max - min).max(1) as f32;
-    let ch_ids = capture_channels(selem);
-    let mut channels = Vec::with_capacity(ch_ids.len());
+    let ch_pairs = capture_channels(selem);
+    let mut channels = Vec::with_capacity(ch_pairs.len());
+    let mut channel_map = Vec::with_capacity(ch_pairs.len());
     let mut peak_raw = min;
-    for &ch in &ch_ids {
+    for &(ch, pos) in &ch_pairs {
         let raw = selem.get_capture_volume(ch).unwrap_or(min);
         peak_raw = peak_raw.max(raw);
         channels.push(((raw - min) as f32 / span).clamp(0.0, 1.0));
+        channel_map.push(pos);
     }
     let linear = channels.iter().copied().fold(0.0_f32, f32::max);
     let db = selem.ask_capture_vol_db(peak_raw).ok().map(|mb| mb.to_db());
@@ -430,19 +481,19 @@ fn read_capture_levels(selem: &Selem<'_>) -> (f32, Vec<f32>, Option<f32>, bool) 
     } else {
         false
     };
-    (linear, channels, db, muted)
+    (linear, channels, channel_map, db, muted)
 }
 
 fn write_playback_channels(selem: &Selem<'_>, values: &[f32], nonzero_template: &mut Vec<f32>) {
     let (min, max) = selem.get_playback_volume_range();
     let span = (max - min) as f32;
-    let ch_ids = playback_channels(selem);
-    if ch_ids.len() <= 1 || values.len() <= 1 {
+    let ch_pairs = playback_channels(selem);
+    if ch_pairs.len() <= 1 || values.len() <= 1 {
         let clamped = values.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let target = min + (span * clamped).round() as i64;
         let _ = selem.set_playback_volume_all(target);
     } else {
-        for (idx, &ch) in ch_ids.iter().enumerate() {
+        for (idx, &(ch, _)) in ch_pairs.iter().enumerate() {
             let clamped = values
                 .get(idx)
                 .or_else(|| values.last())
@@ -462,13 +513,13 @@ fn write_playback_channels(selem: &Selem<'_>, values: &[f32], nonzero_template: 
 fn write_capture_channels(selem: &Selem<'_>, values: &[f32], nonzero_template: &mut Vec<f32>) {
     let (min, max) = selem.get_capture_volume_range();
     let span = (max - min) as f32;
-    let ch_ids = capture_channels(selem);
-    if ch_ids.len() <= 1 || values.len() <= 1 {
+    let ch_pairs = capture_channels(selem);
+    if ch_pairs.len() <= 1 || values.len() <= 1 {
         let clamped = values.first().copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let target = min + (span * clamped).round() as i64;
         let _ = selem.set_capture_volume_all(target);
     } else {
-        for (idx, &ch) in ch_ids.iter().enumerate() {
+        for (idx, &(ch, _)) in ch_pairs.iter().enumerate() {
             let clamped = values
                 .get(idx)
                 .or_else(|| values.last())
@@ -489,7 +540,7 @@ fn apply_alsa_command(selem: &Selem<'_>, cmd: AudioCommand, nonzero_template: &m
     match cmd {
         AudioCommand::SetVolumeLinear(linear) => {
             if selem.has_playback_volume() {
-                let (_, cur_channels, _, _) = read_playback_levels(selem);
+                let (_, cur_channels, _, _, _) = read_playback_levels(selem);
                 let scaled = scale_linear_channels(
                     &cur_channels,
                     nonzero_template,
@@ -501,9 +552,14 @@ fn apply_alsa_command(selem: &Selem<'_>, cmd: AudioCommand, nonzero_template: &m
         }
         AudioCommand::SetBalance(balance) => {
             if selem.has_playback_volume() {
-                let (peak, cur_channels, _, _) = read_playback_levels(selem);
-                let balanced =
-                    apply_linear_balance(&cur_channels, cur_channels.len().max(1), peak, balance);
+                let (peak, cur_channels, cur_map, _, _) = read_playback_levels(selem);
+                let balanced = apply_linear_balance_with_map(
+                    &cur_channels,
+                    &cur_map,
+                    cur_channels.len().max(1),
+                    peak,
+                    balance,
+                );
                 write_playback_channels(selem, &balanced, nonzero_template);
             }
         }
@@ -558,7 +614,7 @@ fn apply_alsa_source_command(
     match cmd {
         AudioCommand::SetSourceVolumeLinear(linear) => {
             if selem.has_capture_volume() {
-                let (_, cur_channels, _, _) = read_capture_levels(selem);
+                let (_, cur_channels, _, _, _) = read_capture_levels(selem);
                 let scaled = scale_linear_channels(
                     &cur_channels,
                     nonzero_template,
@@ -570,9 +626,14 @@ fn apply_alsa_source_command(
         }
         AudioCommand::SetSourceBalance(balance) => {
             if selem.has_capture_volume() {
-                let (peak, cur_channels, _, _) = read_capture_levels(selem);
-                let balanced =
-                    apply_linear_balance(&cur_channels, cur_channels.len().max(1), peak, balance);
+                let (peak, cur_channels, cur_map, _, _) = read_capture_levels(selem);
+                let balanced = apply_linear_balance_with_map(
+                    &cur_channels,
+                    &cur_map,
+                    cur_channels.len().max(1),
+                    peak,
+                    balance,
+                );
                 write_capture_channels(selem, &balanced, nonzero_template);
             }
         }

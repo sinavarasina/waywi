@@ -301,40 +301,51 @@ pub(crate) fn stream_display_name(
     first_non_empty_prop([app_name, binary, stream_name]).unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// Selects the highest-priority audio backend enabled by Cargo features and live session sockets.
+/// Returns compiled-in audio backends ordered by runtime session availability (`PipeWire ->
+/// PulseAudio -> ALSA`), followed by any remaining compiled-in fallback backends so enabling
+/// multiple audio features never hides a fallback at compile time.
 #[must_use]
-pub(crate) fn default_backend() -> Box<dyn AudioBackend> {
+pub(crate) fn candidate_backends() -> Vec<Box<dyn AudioBackend>> {
+    let mut list: Vec<Box<dyn AudioBackend>> = Vec::with_capacity(3);
+
     #[cfg(feature = "pipewire")]
-    if pipewire_runtime_available() {
-        return Box::new(super::pipewire::PipewireBackend);
+    let pw_avail = pipewire_runtime_available();
+    #[cfg(feature = "pulseaudio")]
+    let pulse_avail = pulseaudio_runtime_available();
+    #[cfg(feature = "alsa")]
+    let alsa_avail = alsa_runtime_available();
+
+    #[cfg(feature = "pipewire")]
+    if pw_avail {
+        list.push(Box::new(super::pipewire::PipewireBackend));
     }
 
     #[cfg(feature = "pulseaudio")]
-    if pulseaudio_runtime_available() {
-        return Box::new(super::pulse::PulseBackend);
+    if pulse_avail {
+        list.push(Box::new(super::pulse::PulseBackend));
     }
 
     #[cfg(feature = "alsa")]
-    if alsa_runtime_available() {
-        return Box::new(super::alsa::AlsaBackend);
+    if alsa_avail {
+        list.push(Box::new(super::alsa::AlsaBackend));
     }
 
     #[cfg(feature = "pipewire")]
-    {
-        Box::new(super::pipewire::PipewireBackend)
+    if !pw_avail {
+        list.push(Box::new(super::pipewire::PipewireBackend));
     }
-    #[cfg(all(not(feature = "pipewire"), feature = "pulseaudio"))]
-    {
-        Box::new(super::pulse::PulseBackend)
+
+    #[cfg(feature = "pulseaudio")]
+    if !pulse_avail {
+        list.push(Box::new(super::pulse::PulseBackend));
     }
-    #[cfg(all(
-        not(feature = "pipewire"),
-        not(feature = "pulseaudio"),
-        feature = "alsa"
-    ))]
-    {
-        Box::new(super::alsa::AlsaBackend)
+
+    #[cfg(feature = "alsa")]
+    if !alsa_avail {
+        list.push(Box::new(super::alsa::AlsaBackend));
     }
+
+    list
 }
 
 #[cfg(test)]
@@ -458,6 +469,7 @@ mod snapshot_tests {
                 channels: vec![linear, linear],
                 db: None,
                 muted: false,
+                ..AudioStream::default()
             }],
             ..AudioSnapshot::default()
         }

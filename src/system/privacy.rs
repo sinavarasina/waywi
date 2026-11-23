@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "pipewire")]
 use std::sync::Mutex;
-#[cfg(any(feature = "pipewire", feature = "dbus"))]
+#[cfg(feature = "dbus")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "pipewire", feature = "dbus"))]
 use std::thread::JoinHandle;
