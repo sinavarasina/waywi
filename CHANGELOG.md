@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Per-channel volumes & stereo L/R balance preservation (`audio`)**: `AudioClient::set_volume_linear`, `set_source_volume_linear`, `set_stream_volume_linear`, and `set_capture_volume_linear` now scale existing per-channel linear volumes proportionally (`pa_cvolume_scale` semantics, preserving stereo L/R balance even across `0.0` via a cached non-zero channel template) across PipeWire, PulseAudio, and ALSA. Added `channels: Vec<f32>` to `AudioSnapshot` (`channels`, `source_channels`), `AudioStream`, and `AudioCapture`, balance getters (`AudioSnapshot::{balance, source_balance}`, `AudioStream::balance`, `AudioCapture::balance`, `compute_stereo_balance`), and explicit balance and per-channel setters on `AudioClient` (`set_balance`, `set_channel_volumes`, `set_source_balance`, `set_source_channel_volumes`, `set_stream_balance`, `set_stream_channel_volumes`, `set_capture_balance`, `set_capture_channel_volumes`).
+- **Manual audio port (route) & sound card profile selection (`audio`)**: Added `AudioPortAvailability` (`Unknown`, `Available`, `Unavailable`; `is_available`), `AudioPort`, `AudioProfile`, and `AudioCard` (re-exported in `waywi::audio` and `waywi::prelude`). Extended `AudioDevice` with `card_id`, `active_port`, and `ports`, extended `AudioSnapshot` with `cards` and helpers (`ports`, `active_port`, `source_ports`, `active_source_port`, `card`, `default_sink_card`, `default_source_card`), and added `AudioClient::{select_port, select_device_port, select_source_port, select_source_device_port, select_card_profile}` backed by PipeWire `ParamType::{EnumRoute, Route, EnumProfile, Profile}` and PulseAudio port/card introspection.
+
+### Changed
+- **`AudioDevice`, `AudioStream`, `AudioCapture`, and `AudioSnapshot` fields (`audio`)**: All four types now implement `Default` and include the new port, card, and per-channel volume fields; struct literals constructing them directly should include `..Default::default()`.
+
+### Fixed
+- **PipeWire hardware route sync on port/profile switches (`pipewire`)**: Added a `Device::info` listener watching `DeviceChangeMask::PARAMS` to invalidate stale routes immediately when `ParamType::Route` flags change (including `SPA_PARAM_INFO_SERIAL` toggles or unreadable profiles) and re-enumerate `ParamType::{Route, EnumRoute, Profile, EnumProfile}` whenever readable (pruning superseded batches by async `seq`). Prevents stale `route.index` writes from switching shared-sink multi-port cards (such as front-panel headphones vs. rear line-out) back to an inactive port on volume or mute updates.
+- **PipeWire `SPA_PARAM_ROUTE_props` inner object ID (`pipewire`)**: Encoded the inner `Props` object inside `device.set_param(ParamType::Route, ...)` with `id = ParamType::Route` (`13`) instead of `ParamType::Props` (`2`) to match PipeWire and WirePlumber wire conventions.
+- **PipeWire route matching, mono channel count, route-vs-props precedence & default metadata (`pipewire`)**: Stopped `resolve_route_for_node` from falling back across different `card.profile.device` sub-devices on the same card; used the active route's channel count instead of `max(route.channels, node.channels)` so mono routes (e.g., USB microphones) are not written as stereo; seeded nodes from already-enumerated `Device` routes and prevented `Node::Props` from overwriting active hardware `Route` volume/mute/channels; and tracked `default.audio.{sink,source}` separately from `default.configured.audio.{sink,source}` so an offline configured sink/source cannot clobber the active default.
+
 ## [0.1.10] - 2026-11-23
 
 ### Added

@@ -53,7 +53,10 @@ pub use crate::text::{
 pub use crate::timer::Timer;
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-pub use crate::audio::{Audio, AudioClient, AudioDevice, AudioEvent, AudioSnapshot};
+pub use crate::audio::{
+    Audio, AudioCapture, AudioCard, AudioClient, AudioDevice, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream,
+};
 #[cfg(any(
     feature = "pipewire",
     feature = "pulseaudio",

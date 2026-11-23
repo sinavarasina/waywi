@@ -9,6 +9,8 @@ use spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
 use spa::sys as spa_sys;
 use spa::utils::SpaTypes;
 
+use crate::audio::types::AudioPortAvailability;
+
 /// Converts PipeWire linear amplitude (`channelVolumes`) to user-perceived linear level (`0.0..=1.5`).
 #[must_use]
 pub(crate) fn raw_to_linear(raw: f32) -> f32 {
@@ -81,9 +83,18 @@ pub(crate) fn escape_json(s: &str) -> String {
     out
 }
 
-fn extract_props_object(obj: &Object) -> (Option<usize>, Option<f32>, Option<bool>) {
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct PropsExtracted {
+    pub(crate) channels: Option<usize>,
+    pub(crate) volume: Option<f32>,
+    pub(crate) channel_volumes: Option<Vec<f32>>,
+    pub(crate) muted: Option<bool>,
+}
+
+fn extract_props_object(obj: &Object) -> PropsExtracted {
     let mut channels = None;
     let mut volume = None;
+    let mut channel_volumes = None;
     let mut scalar_volume = None;
     let mut muted = None;
 
@@ -99,8 +110,13 @@ fn extract_props_object(obj: &Object) -> (Option<usize>, Option<f32>, Option<boo
                     && !vols.is_empty()
                 {
                     channels = Some(vols.len());
-                    let sum: f32 = vols.iter().copied().sum();
-                    volume = Some(sum / vols.len() as f32);
+                    let peak = vols
+                        .iter()
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .fold(0.0_f32, f32::max);
+                    volume = Some(peak);
+                    channel_volumes = Some(vols.clone());
                 }
             }
             spa_sys::SPA_PROP_volume => {
@@ -112,20 +128,49 @@ fn extract_props_object(obj: &Object) -> (Option<usize>, Option<f32>, Option<boo
         }
     }
 
-    (channels, volume.or(scalar_volume), muted)
+    PropsExtracted {
+        channels,
+        volume: volume.or(scalar_volume),
+        channel_volumes,
+        muted,
+    }
+}
+
+fn map_spa_availability(raw_id: u32) -> AudioPortAvailability {
+    match raw_id {
+        x if x == spa_sys::SPA_PARAM_AVAILABILITY_yes => AudioPortAvailability::Available,
+        x if x == spa_sys::SPA_PARAM_AVAILABILITY_no => AudioPortAvailability::Unavailable,
+        _ => AudioPortAvailability::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RouteParams {
     pub(crate) index: i32,
     pub(crate) direction: Option<u32>,
-    pub(crate) device: i32,
+    pub(crate) device: Option<i32>,
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) priority: u32,
+    pub(crate) availability: AudioPortAvailability,
+    pub(crate) profiles: Vec<i32>,
+    pub(crate) devices: Vec<i32>,
     pub(crate) channels: Option<usize>,
     pub(crate) volume: Option<f32>,
+    pub(crate) channel_volumes: Option<Vec<f32>>,
     pub(crate) muted: Option<bool>,
 }
 
-pub(crate) fn parse_props_pod(bytes: &[u8]) -> Option<(Option<usize>, Option<f32>, Option<bool>)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileParams {
+    pub(crate) index: i32,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) priority: u32,
+    pub(crate) available: bool,
+}
+
+pub(crate) fn parse_props_pod(bytes: &[u8]) -> Option<PropsExtracted> {
     let (_, value) = PodDeserializer::deserialize_any_from(bytes).ok()?;
     let Value::Object(obj) = value else {
         return None;
@@ -141,7 +186,13 @@ pub(crate) fn parse_route_pod(bytes: &[u8]) -> Option<RouteParams> {
     let mut index = None;
     let mut direction = None;
     let mut device = None;
-    let mut props = (None, None, None);
+    let mut name = None;
+    let mut description = None;
+    let mut priority = 0_u32;
+    let mut availability = AudioPortAvailability::Unknown;
+    let mut profiles = Vec::new();
+    let mut devices = Vec::new();
+    let mut props = PropsExtracted::default();
 
     for prop in &obj.properties {
         match prop.key {
@@ -160,6 +211,40 @@ pub(crate) fn parse_route_pod(bytes: &[u8]) -> Option<RouteParams> {
                     device = Some(d);
                 }
             }
+            spa_sys::SPA_PARAM_ROUTE_name => {
+                if let Value::String(s) = &prop.value
+                    && !s.is_empty()
+                {
+                    name = Some(s.clone());
+                }
+            }
+            spa_sys::SPA_PARAM_ROUTE_description => {
+                if let Value::String(s) = &prop.value
+                    && !s.is_empty()
+                {
+                    description = Some(s.clone());
+                }
+            }
+            spa_sys::SPA_PARAM_ROUTE_priority => {
+                if let Value::Int(p) = prop.value {
+                    priority = u32::try_from(p).unwrap_or(0);
+                }
+            }
+            spa_sys::SPA_PARAM_ROUTE_available => {
+                if let Value::Id(id) = prop.value {
+                    availability = map_spa_availability(id.0);
+                }
+            }
+            spa_sys::SPA_PARAM_ROUTE_profiles => {
+                if let Value::ValueArray(ValueArray::Int(v)) = &prop.value {
+                    profiles.clone_from(v);
+                }
+            }
+            spa_sys::SPA_PARAM_ROUTE_devices => {
+                if let Value::ValueArray(ValueArray::Int(v)) = &prop.value {
+                    devices.clone_from(v);
+                }
+            }
             spa_sys::SPA_PARAM_ROUTE_props => {
                 if let Value::Object(props_obj) = &prop.value {
                     props = extract_props_object(props_obj);
@@ -172,19 +257,86 @@ pub(crate) fn parse_route_pod(bytes: &[u8]) -> Option<RouteParams> {
     Some(RouteParams {
         index: index?,
         direction,
-        device: device?,
-        channels: props.0,
-        volume: props.1,
-        muted: props.2,
+        device,
+        name,
+        description,
+        priority,
+        availability,
+        profiles,
+        devices,
+        channels: props.channels,
+        volume: props.volume,
+        channel_volumes: props.channel_volumes,
+        muted: props.muted,
     })
 }
 
-fn props_volume_object(linear: f32, channels: usize) -> Object {
-    let raw = linear_to_raw(linear);
-    let vols = vec![raw; channels.max(1)];
+pub(crate) fn parse_profile_pod(bytes: &[u8]) -> Option<ProfileParams> {
+    let (_, value) = PodDeserializer::deserialize_any_from(bytes).ok()?;
+    let Value::Object(obj) = value else {
+        return None;
+    };
+    let mut index = None;
+    let mut name = None;
+    let mut description = None;
+    let mut priority = 0_u32;
+    let mut available = true;
+
+    for prop in &obj.properties {
+        match prop.key {
+            spa_sys::SPA_PARAM_PROFILE_index => {
+                if let Value::Int(i) = prop.value {
+                    index = Some(i);
+                }
+            }
+            spa_sys::SPA_PARAM_PROFILE_name => {
+                if let Value::String(s) = &prop.value
+                    && !s.is_empty()
+                {
+                    name = Some(s.clone());
+                }
+            }
+            spa_sys::SPA_PARAM_PROFILE_description => {
+                if let Value::String(s) = &prop.value
+                    && !s.is_empty()
+                {
+                    description = Some(s.clone());
+                }
+            }
+            spa_sys::SPA_PARAM_PROFILE_priority => {
+                if let Value::Int(p) = prop.value {
+                    priority = u32::try_from(p).unwrap_or(0);
+                }
+            }
+            spa_sys::SPA_PARAM_PROFILE_available => {
+                if let Value::Id(id) = prop.value {
+                    available = id.0 != spa_sys::SPA_PARAM_AVAILABILITY_no;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let name = name?;
+    let description = description.unwrap_or_else(|| name.clone());
+    Some(ProfileParams {
+        index: index?,
+        name,
+        description,
+        priority,
+        available,
+    })
+}
+
+fn props_channel_volumes_object(object_id: ParamType, linear_channels: &[f32]) -> Object {
+    let vols: Vec<f32> = if linear_channels.is_empty() {
+        vec![0.0]
+    } else {
+        linear_channels.iter().copied().map(linear_to_raw).collect()
+    };
     Object {
         type_: SpaTypes::ObjectParamProps.as_raw(),
-        id: ParamType::Props.as_raw(),
+        id: object_id.as_raw(),
         properties: vec![Property {
             key: spa_sys::SPA_PROP_channelVolumes,
             flags: PropertyFlags::empty(),
@@ -193,10 +345,24 @@ fn props_volume_object(linear: f32, channels: usize) -> Object {
     }
 }
 
-fn props_mute_object(muted: bool) -> Object {
+fn props_volume_object(object_id: ParamType, linear: f32, channels: usize) -> Object {
+    let raw = linear_to_raw(linear);
+    let vols = vec![raw; channels.max(1)];
     Object {
         type_: SpaTypes::ObjectParamProps.as_raw(),
-        id: ParamType::Props.as_raw(),
+        id: object_id.as_raw(),
+        properties: vec![Property {
+            key: spa_sys::SPA_PROP_channelVolumes,
+            flags: PropertyFlags::empty(),
+            value: Value::ValueArray(ValueArray::Float(vols)),
+        }],
+    }
+}
+
+fn props_mute_object(object_id: ParamType, muted: bool) -> Object {
+    Object {
+        type_: SpaTypes::ObjectParamProps.as_raw(),
+        id: object_id.as_raw(),
         properties: vec![Property {
             key: spa_sys::SPA_PROP_mute,
             flags: PropertyFlags::empty(),
@@ -205,15 +371,23 @@ fn props_mute_object(muted: bool) -> Object {
     }
 }
 
+pub(crate) fn build_volume_pod_channels(linear_channels: &[f32]) -> Option<Vec<u8>> {
+    let obj = props_channel_volumes_object(ParamType::Props, linear_channels);
+    let (cursor, _) =
+        PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj)).ok()?;
+    Some(cursor.into_inner())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_volume_pod(linear: f32, channels: usize) -> Option<Vec<u8>> {
-    let obj = props_volume_object(linear, channels);
+    let obj = props_volume_object(ParamType::Props, linear, channels);
     let (cursor, _) =
         PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj)).ok()?;
     Some(cursor.into_inner())
 }
 
 pub(crate) fn build_mute_pod(muted: bool) -> Option<Vec<u8>> {
-    let obj = props_mute_object(muted);
+    let obj = props_mute_object(ParamType::Props, muted);
     let (cursor, _) =
         PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj)).ok()?;
     Some(cursor.into_inner())
@@ -251,17 +425,88 @@ fn serialize_route_pod(index: i32, device: i32, props_obj: Object) -> Option<Vec
     Some(cursor.into_inner())
 }
 
+pub(crate) fn build_route_volume_pod_channels(
+    index: i32,
+    device: i32,
+    linear_channels: &[f32],
+) -> Option<Vec<u8>> {
+    serialize_route_pod(
+        index,
+        device,
+        props_channel_volumes_object(ParamType::Route, linear_channels),
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_route_volume_pod(
     index: i32,
     device: i32,
     linear: f32,
     channels: usize,
 ) -> Option<Vec<u8>> {
-    serialize_route_pod(index, device, props_volume_object(linear, channels))
+    serialize_route_pod(
+        index,
+        device,
+        props_volume_object(ParamType::Route, linear, channels),
+    )
 }
 
 pub(crate) fn build_route_mute_pod(index: i32, device: i32, muted: bool) -> Option<Vec<u8>> {
-    serialize_route_pod(index, device, props_mute_object(muted))
+    serialize_route_pod(index, device, props_mute_object(ParamType::Route, muted))
+}
+
+/// Builds a `ParamType::Route` selection POD switching `device` (`card.profile.device`) to
+/// route `index` with `save = true` so WirePlumber restores stored route props and persists the
+/// user's port choice.
+pub(crate) fn build_route_select_pod(index: i32, device: i32) -> Option<Vec<u8>> {
+    let route_obj = Object {
+        type_: SpaTypes::ObjectParamRoute.as_raw(),
+        id: ParamType::Route.as_raw(),
+        properties: vec![
+            Property {
+                key: spa_sys::SPA_PARAM_ROUTE_index,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(index),
+            },
+            Property {
+                key: spa_sys::SPA_PARAM_ROUTE_device,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(device),
+            },
+            Property {
+                key: spa_sys::SPA_PARAM_ROUTE_save,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(true),
+            },
+        ],
+    };
+    let (cursor, _) =
+        PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(route_obj)).ok()?;
+    Some(cursor.into_inner())
+}
+
+/// Builds a `ParamType::Profile` selection POD switching a card to profile `index` with
+/// `save = true`.
+pub(crate) fn build_profile_pod(index: i32) -> Option<Vec<u8>> {
+    let profile_obj = Object {
+        type_: SpaTypes::ObjectParamProfile.as_raw(),
+        id: ParamType::Profile.as_raw(),
+        properties: vec![
+            Property {
+                key: spa_sys::SPA_PARAM_PROFILE_index,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(index),
+            },
+            Property {
+                key: spa_sys::SPA_PARAM_PROFILE_save,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(true),
+            },
+        ],
+    };
+    let (cursor, _) =
+        PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(profile_obj)).ok()?;
+    Some(cursor.into_inner())
 }
 
 #[cfg(test)]
@@ -271,32 +516,259 @@ mod tests {
     #[test]
     fn volume_mute_pod_roundtrip() {
         let vol_bytes = build_volume_pod(0.5, 2).expect("volume pod serialized");
-        let (ch, vol, muted) = parse_props_pod(&vol_bytes).expect("volume pod parsed");
-        assert_eq!(ch, Some(2));
-        assert!(muted.is_none());
-        let linear = raw_to_linear(vol.unwrap());
+        let extracted = parse_props_pod(&vol_bytes).expect("volume pod parsed");
+        assert_eq!(extracted.channels, Some(2));
+        assert!(extracted.muted.is_none());
+        let linear = raw_to_linear(extracted.volume.unwrap());
         assert!((linear - 0.5).abs() < 1e-4, "got {linear}");
 
+        let ch_bytes =
+            build_volume_pod_channels(&[0.8, 0.4]).expect("per-channel volume pod serialized");
+        let ch_ext = parse_props_pod(&ch_bytes).expect("per-channel volume pod parsed");
+        let ch_vols = ch_ext.channel_volumes.expect("channel_volumes present");
+        assert_eq!(ch_vols.len(), 2);
+        assert!((raw_to_linear(ch_vols[0]) - 0.8).abs() < 1e-4);
+        assert!((raw_to_linear(ch_vols[1]) - 0.4).abs() < 1e-4);
+        assert!((raw_to_linear(ch_ext.volume.unwrap()) - 0.8).abs() < 1e-4);
+
         let mute_bytes = build_mute_pod(true).expect("mute pod serialized");
-        let (_, _, parsed_mute) = parse_props_pod(&mute_bytes).expect("mute pod parsed");
-        assert_eq!(parsed_mute, Some(true));
+        let mute_ext = parse_props_pod(&mute_bytes).expect("mute pod parsed");
+        assert_eq!(mute_ext.muted, Some(true));
     }
 
     #[test]
     fn route_volume_mute_pod_roundtrip() {
         let r_vol = build_route_volume_pod(3, 5, 0.72, 2).expect("route vol pod serialized");
+        let (_, Value::Object(vol_outer)) =
+            PodDeserializer::deserialize_any_from(&r_vol).expect("route vol outer")
+        else {
+            panic!("expected outer Object");
+        };
+        assert_eq!(vol_outer.id, ParamType::Route.as_raw());
+        let inner_vol_id = vol_outer.properties.iter().find_map(|p| {
+            if p.key == spa_sys::SPA_PARAM_ROUTE_props
+                && let Value::Object(o) = &p.value
+            {
+                Some(o.id)
+            } else {
+                None
+            }
+        });
+        assert_eq!(inner_vol_id, Some(ParamType::Route.as_raw()));
+
         let parsed = parse_route_pod(&r_vol).expect("route vol pod parsed");
         assert_eq!(parsed.index, 3);
-        assert_eq!(parsed.device, 5);
+        assert_eq!(parsed.device, Some(5));
         assert_eq!(parsed.channels, Some(2));
         let linear = raw_to_linear(parsed.volume.unwrap());
         assert!((linear - 0.72).abs() < 1e-4, "got {linear}");
 
-        let r_mute = build_route_mute_pod(3, 5, true).expect("route mute pod serialized");
+        let r_ch = build_route_volume_pod_channels(4, 5, &[0.9, 0.45])
+            .expect("route channel vol pod serialized");
+        let parsed_ch = parse_route_pod(&r_ch).expect("route channel vol pod parsed");
+        assert_eq!(parsed_ch.index, 4);
+        assert_eq!(parsed_ch.device, Some(5));
+        let r_vols = parsed_ch.channel_volumes.expect("route channel volumes");
+        assert!((raw_to_linear(r_vols[0]) - 0.9).abs() < 1e-4);
+        assert!((raw_to_linear(r_vols[1]) - 0.45).abs() < 1e-4);
+
+        let r_sel = build_route_select_pod(4, 5).expect("route select pod serialized");
+        let parsed_sel = parse_route_pod(&r_sel).expect("route select pod parsed");
+        assert_eq!(parsed_sel.index, 4);
+        assert_eq!(parsed_sel.device, Some(5));
+
+        let r_mute = build_route_mute_pod(4, 5, true).expect("route mute pod serialized");
+        let (_, Value::Object(mute_outer)) =
+            PodDeserializer::deserialize_any_from(&r_mute).expect("route mute outer")
+        else {
+            panic!("expected outer Object");
+        };
+        let inner_mute_id = mute_outer.properties.iter().find_map(|p| {
+            if p.key == spa_sys::SPA_PARAM_ROUTE_props
+                && let Value::Object(o) = &p.value
+            {
+                Some(o.id)
+            } else {
+                None
+            }
+        });
+        assert_eq!(inner_mute_id, Some(ParamType::Route.as_raw()));
+
         let parsed_m = parse_route_pod(&r_mute).expect("route mute pod parsed");
-        assert_eq!(parsed_m.index, 3);
-        assert_eq!(parsed_m.device, 5);
+        assert_eq!(parsed_m.index, 4);
+        assert_eq!(parsed_m.device, Some(5));
         assert_eq!(parsed_m.muted, Some(true));
+    }
+
+    #[test]
+    fn parse_route_pod_handles_full_pipewire_route_payload() {
+        let props_obj = Object {
+            type_: SpaTypes::ObjectParamProps.as_raw(),
+            id: ParamType::Route.as_raw(),
+            properties: vec![
+                Property {
+                    key: spa_sys::SPA_PROP_mute,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Bool(false),
+                },
+                Property {
+                    key: spa_sys::SPA_PROP_channelVolumes,
+                    flags: PropertyFlags::empty(),
+                    value: Value::ValueArray(ValueArray::Float(vec![0.125, 0.125])),
+                },
+                Property {
+                    key: spa_sys::SPA_PROP_channelMap,
+                    flags: PropertyFlags::empty(),
+                    value: Value::ValueArray(ValueArray::Id(vec![
+                        spa::utils::Id(3),
+                        spa::utils::Id(4),
+                    ])),
+                },
+                Property {
+                    key: spa_sys::SPA_PROP_latencyOffsetNsec,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Long(0),
+                },
+            ],
+        };
+        let full_route = Object {
+            type_: SpaTypes::ObjectParamRoute.as_raw(),
+            id: ParamType::Route.as_raw(),
+            properties: vec![
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_index,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(4),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_direction,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Id(spa::utils::Id(spa_sys::SPA_DIRECTION_OUTPUT)),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_name,
+                    flags: PropertyFlags::empty(),
+                    value: Value::String("analog-output-headphones".to_owned()),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_description,
+                    flags: PropertyFlags::empty(),
+                    value: Value::String("Headphones".to_owned()),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_priority,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(9900),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_available,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Id(spa::utils::Id(spa_sys::SPA_PARAM_AVAILABILITY_yes)),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_info,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Struct(vec![
+                        Value::Int(1),
+                        Value::String("port.type".to_owned()),
+                        Value::String("headphones".to_owned()),
+                    ]),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_profiles,
+                    flags: PropertyFlags::empty(),
+                    value: Value::ValueArray(ValueArray::Int(vec![1, 2])),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_device,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(5),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_props,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Object(props_obj),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_devices,
+                    flags: PropertyFlags::empty(),
+                    value: Value::ValueArray(ValueArray::Int(vec![5])),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_ROUTE_save,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Bool(false),
+                },
+            ],
+        };
+        let (cursor, _) =
+            PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(full_route))
+                .expect("serialize full route");
+        let parsed = parse_route_pod(cursor.get_ref()).expect("parse full route");
+        assert_eq!(parsed.index, 4);
+        assert_eq!(parsed.direction, Some(spa_sys::SPA_DIRECTION_OUTPUT));
+        assert_eq!(parsed.device, Some(5));
+        assert_eq!(parsed.name.as_deref(), Some("analog-output-headphones"));
+        assert_eq!(parsed.description.as_deref(), Some("Headphones"));
+        assert_eq!(parsed.priority, 9900);
+        assert_eq!(parsed.availability, AudioPortAvailability::Available);
+        assert_eq!(parsed.profiles, vec![1, 2]);
+        assert_eq!(parsed.devices, vec![5]);
+        assert_eq!(parsed.channels, Some(2));
+        assert_eq!(parsed.muted, Some(false));
+        assert!((raw_to_linear(parsed.volume.unwrap()) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn profile_pod_parse_and_build() {
+        let prof_obj = Object {
+            type_: SpaTypes::ObjectParamProfile.as_raw(),
+            id: ParamType::EnumProfile.as_raw(),
+            properties: vec![
+                Property {
+                    key: spa_sys::SPA_PARAM_PROFILE_index,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(1),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_PROFILE_name,
+                    flags: PropertyFlags::empty(),
+                    value: Value::String("output:analog-stereo+input:analog-stereo".to_owned()),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_PROFILE_description,
+                    flags: PropertyFlags::empty(),
+                    value: Value::String("Analog Stereo Duplex".to_owned()),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_PROFILE_priority,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Int(6565),
+                },
+                Property {
+                    key: spa_sys::SPA_PARAM_PROFILE_available,
+                    flags: PropertyFlags::empty(),
+                    value: Value::Id(spa::utils::Id(spa_sys::SPA_PARAM_AVAILABILITY_yes)),
+                },
+            ],
+        };
+        let (cursor, _) =
+            PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(prof_obj))
+                .expect("serialize profile");
+        let parsed = parse_profile_pod(cursor.get_ref()).expect("parse profile");
+        assert_eq!(parsed.index, 1);
+        assert_eq!(parsed.name, "output:analog-stereo+input:analog-stereo");
+        assert_eq!(parsed.description, "Analog Stereo Duplex");
+        assert_eq!(parsed.priority, 6565);
+        assert!(parsed.available);
+
+        let set_pod = build_profile_pod(1).expect("build_profile_pod");
+        let (_, Value::Object(set_obj)) =
+            PodDeserializer::deserialize_any_from(&set_pod).expect("deserialize set_profile")
+        else {
+            panic!("expected Object");
+        };
+        assert_eq!(set_obj.id, ParamType::Profile.as_raw());
     }
 
     #[test]

@@ -21,13 +21,32 @@ use super::types::{AudioEvent, AudioSnapshot};
 #[derive(Debug, Clone)]
 pub(crate) enum AudioCommand {
     SetVolumeLinear(f32),
+    SetBalance(f32),
+    SetChannelVolumes(Vec<f32>),
     SetMuted(bool),
     ToggleMute,
     SelectDevice(u32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SelectPort(Option<u32>, String),
     SetSourceVolumeLinear(f32),
+    SetSourceBalance(f32),
+    SetSourceChannelVolumes(Vec<f32>),
     SetSourceMuted(bool),
     ToggleSourceMute,
     SelectSource(u32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SelectSourcePort(Option<u32>, String),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SelectCardProfile(u32, String),
     /// Per-app stream commands are only observed by the PulseAudio and PipeWire backends; the
     /// ALSA mixer has no per-application routing.
     #[cfg_attr(
@@ -35,6 +54,16 @@ pub(crate) enum AudioCommand {
         allow(dead_code)
     )]
     SetStreamVolumeLinear(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SetStreamBalance(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SetStreamChannelVolumes(u32, Vec<f32>),
     #[cfg_attr(
         not(any(feature = "pulseaudio", feature = "pipewire")),
         allow(dead_code)
@@ -50,6 +79,16 @@ pub(crate) enum AudioCommand {
         allow(dead_code)
     )]
     SetCaptureVolumeLinear(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SetCaptureBalance(u32, f32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
+    SetCaptureChannelVolumes(u32, Vec<f32>),
     #[cfg_attr(
         not(any(feature = "pulseaudio", feature = "pipewire")),
         allow(dead_code)
@@ -405,6 +444,7 @@ mod snapshot_tests {
                 id: 1,
                 name: "alsa_output.pci".into(),
                 description: "Built-in".into(),
+                ..AudioDevice::default()
             }],
             default_sink: None,
             streams: vec![AudioStream {
@@ -415,6 +455,7 @@ mod snapshot_tests {
                 app_id: None,
                 sink_id: Some(1),
                 linear,
+                channels: vec![linear, linear],
                 db: None,
                 muted: false,
             }],

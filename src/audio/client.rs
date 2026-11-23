@@ -9,7 +9,7 @@ use crate::error::{Result, WaywiError};
 use super::backend::{
     AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, default_backend,
 };
-use super::types::{AudioEvent, AudioSnapshot};
+use super::types::{AudioEvent, AudioSnapshot, sanitize_linear_channels};
 
 struct RunningWorker {
     sender: Option<Box<dyn AudioCommandSender>>,
@@ -117,9 +117,30 @@ impl AudioClient {
         Ok(guard.snapshot.clone())
     }
 
-    /// Sets the linear volume multiplier on the active sink (clamped to `[0.0, 1.5]`).
+    /// Sets the linear volume multiplier on the active sink (clamped to `[0.0, 1.5]`),
+    /// preserving any existing per-channel stereo balance ratio.
     pub fn set_volume_linear(&self, level: f32) -> Result<()> {
         self.send_command(AudioCommand::SetVolumeLinear(level.clamp(0.0, 1.5)))
+    }
+
+    /// Adjusts stereo L/R balance on the active sink (`-1.0` = full left, `0.0` = center,
+    /// `+1.0` = full right) while preserving its peak master level.
+    pub fn set_balance(&self, balance: f32) -> Result<()> {
+        let b = if balance.is_finite() {
+            balance.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.send_command(AudioCommand::SetBalance(b))
+    }
+
+    /// Sets explicit per-channel linear volumes on the active sink (each channel clamped to
+    /// `[0.0, 1.5]`).
+    pub fn set_channel_volumes(&self, volumes: &[f32]) -> Result<()> {
+        let Some(clean) = sanitize_linear_channels(volumes) else {
+            return Ok(());
+        };
+        self.send_command(AudioCommand::SetChannelVolumes(clean))
     }
 
     /// Sets mute state on the active sink.
@@ -137,9 +158,40 @@ impl AudioClient {
         self.send_command(AudioCommand::SelectDevice(id))
     }
 
-    /// Sets the linear volume multiplier on the active input source / mic (clamped to `[0.0, 1.5]`).
+    /// Switches the active output port/route on the default sink by port name
+    /// (e.g. `"analog-output-headphones"` or `"analog-output-lineout"`).
+    pub fn select_port(&self, port_name: impl Into<String>) -> Result<()> {
+        self.send_command(AudioCommand::SelectPort(None, port_name.into()))
+    }
+
+    /// Switches the active output port/route on a specific sink `sink_id` by port name.
+    pub fn select_device_port(&self, sink_id: u32, port_name: impl Into<String>) -> Result<()> {
+        self.send_command(AudioCommand::SelectPort(Some(sink_id), port_name.into()))
+    }
+
+    /// Sets the linear volume multiplier on the active input source / mic (clamped to `[0.0, 1.5]`),
+    /// preserving any existing per-channel stereo balance ratio.
     pub fn set_source_volume_linear(&self, level: f32) -> Result<()> {
         self.send_command(AudioCommand::SetSourceVolumeLinear(level.clamp(0.0, 1.5)))
+    }
+
+    /// Adjusts stereo L/R balance on the active input source / mic (`-1.0..=1.0`).
+    pub fn set_source_balance(&self, balance: f32) -> Result<()> {
+        let b = if balance.is_finite() {
+            balance.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.send_command(AudioCommand::SetSourceBalance(b))
+    }
+
+    /// Sets explicit per-channel linear volumes on the active input source / mic (each channel
+    /// clamped to `[0.0, 1.5]`).
+    pub fn set_source_channel_volumes(&self, volumes: &[f32]) -> Result<()> {
+        let Some(clean) = sanitize_linear_channels(volumes) else {
+            return Ok(());
+        };
+        self.send_command(AudioCommand::SetSourceChannelVolumes(clean))
     }
 
     /// Sets mute state on the active input source / mic.
@@ -157,7 +209,35 @@ impl AudioClient {
         self.send_command(AudioCommand::SelectSource(id))
     }
 
-    /// Sets the linear volume multiplier on a playback stream (clamped to `[0.0, 1.5]`).
+    /// Switches the active input port/route on the default source / mic by port name
+    /// (e.g. `"analog-input-front-mic"` or `"analog-input-rear-mic"`).
+    pub fn select_source_port(&self, port_name: impl Into<String>) -> Result<()> {
+        self.send_command(AudioCommand::SelectSourcePort(None, port_name.into()))
+    }
+
+    /// Switches the active input port/route on a specific source `source_id` by port name.
+    pub fn select_source_device_port(
+        &self,
+        source_id: u32,
+        port_name: impl Into<String>,
+    ) -> Result<()> {
+        self.send_command(AudioCommand::SelectSourcePort(
+            Some(source_id),
+            port_name.into(),
+        ))
+    }
+
+    /// Switches the active card profile on `card_id` by profile name
+    /// (e.g. `"output:analog-stereo+input:analog-stereo"`, `"pro-audio"`, `"off"`).
+    pub fn select_card_profile(&self, card_id: u32, profile_name: impl Into<String>) -> Result<()> {
+        self.send_command(AudioCommand::SelectCardProfile(
+            card_id,
+            profile_name.into(),
+        ))
+    }
+
+    /// Sets the linear volume multiplier on a playback stream (clamped to `[0.0, 1.5]`),
+    /// preserving any existing per-channel stereo balance ratio.
     ///
     /// Unknown stream IDs are silently ignored: the stream may have ended between the snapshot
     /// and this command.
@@ -166,6 +246,24 @@ impl AudioClient {
             id,
             level.clamp(0.0, 1.5),
         ))
+    }
+
+    /// Adjusts stereo L/R balance on a playback stream (`-1.0..=1.0`); unknown stream IDs are ignored.
+    pub fn set_stream_balance(&self, id: u32, balance: f32) -> Result<()> {
+        let b = if balance.is_finite() {
+            balance.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.send_command(AudioCommand::SetStreamBalance(id, b))
+    }
+
+    /// Sets explicit per-channel linear volumes on a playback stream; unknown stream IDs are ignored.
+    pub fn set_stream_channel_volumes(&self, id: u32, volumes: &[f32]) -> Result<()> {
+        let Some(clean) = sanitize_linear_channels(volumes) else {
+            return Ok(());
+        };
+        self.send_command(AudioCommand::SetStreamChannelVolumes(id, clean))
     }
 
     /// Sets mute state on a playback stream; unknown stream IDs are ignored.
@@ -178,7 +276,8 @@ impl AudioClient {
         self.send_command(AudioCommand::ToggleStreamMute(id))
     }
 
-    /// Sets the linear volume multiplier on a capture stream (clamped to `[0.0, 1.5]`).
+    /// Sets the linear volume multiplier on a capture stream (clamped to `[0.0, 1.5]`),
+    /// preserving any existing per-channel stereo balance ratio.
     ///
     /// Unknown stream IDs are silently ignored: the stream may have ended between the snapshot
     /// and this command.
@@ -187,6 +286,24 @@ impl AudioClient {
             id,
             level.clamp(0.0, 1.5),
         ))
+    }
+
+    /// Adjusts stereo L/R balance on a capture stream (`-1.0..=1.0`); unknown stream IDs are ignored.
+    pub fn set_capture_balance(&self, id: u32, balance: f32) -> Result<()> {
+        let b = if balance.is_finite() {
+            balance.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.send_command(AudioCommand::SetCaptureBalance(id, b))
+    }
+
+    /// Sets explicit per-channel linear volumes on a capture stream; unknown stream IDs are ignored.
+    pub fn set_capture_channel_volumes(&self, id: u32, volumes: &[f32]) -> Result<()> {
+        let Some(clean) = sanitize_linear_channels(volumes) else {
+            return Ok(());
+        };
+        self.send_command(AudioCommand::SetCaptureChannelVolumes(id, clean))
     }
 
     /// Sets mute state on a capture stream; unknown stream IDs are ignored.

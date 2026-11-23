@@ -23,4 +23,7 @@ pub use client::AudioClient;
 pub use player::AudioPlayer;
 pub use sound::{SoundAsset, SoundData, SoundPreset, default_sound_dirs, resolve_sound_theme_path};
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-pub use types::{Audio, AudioCapture, AudioDevice, AudioEvent, AudioSnapshot, AudioStream};
+pub use types::{
+    Audio, AudioCapture, AudioCard, AudioDevice, AudioEvent, AudioPort, AudioPortAvailability,
+    AudioProfile, AudioSnapshot, AudioStream, compute_stereo_balance,
+};
