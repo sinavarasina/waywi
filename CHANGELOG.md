@@ -2,6 +2,62 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-11-24
+
+### Breaking Changes
+- **Runtime & `EffectCtx` (`app`, `effect`, `render`)**:
+  - `Application::init` and `Application::update` now take `&mut EffectCtx<'_, Self::Message>` instead of an untyped `&mut EffectCtx<'_>`.
+  - `EffectCtx::after(delay, msg)` now takes `msg: M` directly instead of a closure; `load_image_async` and `request_activation_token` no longer require `Send` on callbacks/messages.
+  - Removed duplicate `App::start` (use `App::run`).
+  - Standardized `EffectCtx` image lifecycle methods to `reload_image`, `set_image_retention`, `image_retention`, `evict_image_pixels`, and `unload_image` (replacing the `*_asset_*` names).
+  - Removed 9 redundant `EffectCtx::*_sound*` wrappers (use `ctx.player()?`) and `EffectCtx::{set_ddc_brightness, privacy_snapshot}` (use `ctx.system()`).
+  - Gated all clipboard setters on `EffectCtx` consistently under the `clipboard` feature.
+  - `ActiveRenderer::from_preference` now returns `Result` and fails with `WaywiError::UnsupportedCapability` when an explicitly requested `RendererPreference::Gpu` or `RendererPreference::Software` backend is unavailable.
+- **Geometry, Display, Surface & Elements (`geometry`, `display`, `surface`, `render`, `image`, `sprite`)**:
+  - Replaced `geometry::Rect` and `GeoRect` with `Bounds`; removed `Size::px` (use `Size::new` or `(w, h)` tuples); renamed `display::Transform` -> `OutputTransform`.
+  - Removed PascalCase `Anchor::{Top, Bottom, Left, Right}` duplicates (use bitflags such as `Anchor::TOP | Anchor::LEFT`).
+  - Removed the 6 `Surface` popup passthrough setters in favor of `Surface::positioner(PopupPositioner::new(...))`; changed default `PopupPositioner` anchor/gravity to `PopupAnchor::BottomLeft` / `PopupGravity::BottomRight`.
+  - Removed `CommonProps::element_key` (use `.key`), dead element-level `.on_key` (use `Surface::on_key`), `Image::source_rect` (use `.region`), `Text::optical_bounds` (use `.bounds_mode(TextBoundsMode::Optical)`), and `DecodedGifFrame`.
+  - Changed `SpriteSheet::frame_size` to take pixel integers `(u32, u32)`, made `Canvas::new(size, draw)` draw directly without caching by default (pass `.cache_key(...)` to opt in), and unified `.on_click_sound` / `.on_hover_sound` onto `impl Into<SoundPlay>` (removing `.on_click_sound_volume` / `.on_hover_sound_volume`).
+- **Audio (`audio`)**:
+  - Replaced the 27 per-target methods on `AudioClient` with 10 target-based methods (`set_volume`, `set_volume_percent`, `adjust_volume`, `set_channel_volumes`, `set_balance`, `set_mute`, `toggle_mute`, `set_default_device`, `set_port`, `set_card_profile`) taking `AudioTarget` / `AudioPortTarget` / `AudioDirection`.
+  - Merged `AudioCapture` into `AudioStream`, moved volume/mute/channel fields on `AudioDevice` and `AudioStream` into `AudioVolume`, switched `Audio::subscribe` to emit `Arc<AudioSnapshot>`, and renamed `Audio::subscribe_events` -> `Audio::events`.
+- **D-Bus (`dbus`)**:
+  - Removed `zbus::blocking::Connection` and all blocking D-Bus helpers.
+  - Replaced the 81 flat methods on `DbusClient` with 13 domain clients (`mpris`, `nm`, `bluetooth`, `udisks`, `logind`, `tray`, `notifications`, `power_profiles`, `upower`, `modem`, `portal`, `screensaver`, `geoclue`).
+  - Removed `set_property_value`, `call_method_unit`, `drain_action_results`, `last_action_*`, and the duplicate `GlobalShortcuts` struct (use `Dbus::global_shortcuts`).
+- **System & Desktop (`system`, `desktop`)**:
+  - Replaced raw `f64` disk byte-rate fields with `DataRate`.
+  - Split `SystemProviders` (`sample_*`) from internal typed `SystemSamplers<M>` (removing `Box<dyn Any>`).
+  - Made `system::hardware::set_backlight_percent` pure sysfs (use `EffectCtx::set_backlight_percent` for sysfs-first with shared logind D-Bus fallback).
+  - Collapsed `DesktopEntry::launch*` and `spawn_detached*` variants onto `LaunchOptions` and `SpawnOptions` (`spawn_with`, `spawn_shell`), and removed the 7 redundant `xdg_*` free functions in favor of `XdgBaseDirs`.
+- **Compositor, Control & Prelude (`compositor`, `control`, `lib`, `prelude`)**:
+  - Removed crate-root `waywi::{hyprland, sway}` aliases (use `waywi::compositor::{hyprland, sway}`).
+  - Unified `switch_workspace` onto `WorkspaceTarget<'_>`, removed `sway::WorkspaceRef` and redundant Hyprland workspace/keyboard helpers, and renamed `WorkspaceRefJson` -> `HyprlandWorkspaceRef`.
+  - Unified `Control::socket` onto `ControlRequest -> M` and removed `Control::socket_requests`.
+  - Pruned internal/leaf types from `waywi::prelude`.
+
+### Added
+- **Memory configuration presets & manual trimming (`app`, `effect`, `render`, `asset`, `text`, `audio`, `dbus`, `wayland`)**: Added `MemoryConfig` (`MemoryConfig::balanced()`, `MemoryConfig::low_memory()`, `MemoryConfig::high_throughput()`, plus builders for `default_buffer_retention`, `default_asset_retention`, `arena_limits`, `text_cache`, `load_system_fonts`, `software_scratch_bytes`, `canvas_cache_bytes`, `gpu_cache`, `sound_cache_bytes`, `icon_lookup_max_entries`, `dbus_cache_snapshots`, and `dbus_idle_disconnect`), `App::memory(config)`, `HeadlessRuntime::{with_memory, memory_config, trim_memory}`, and `EffectCtx::{memory_config, trim_memory}`. Calling `ctx.trim_memory()` immediately trims reclaimable decoded image pixels, renderer text/canvas/scratch/GPU caches, `FrameArenaPool`, `MemoStore`, system/D-Bus caches, sound cache, and idle `wl_shm` pools.
+- **Static image loading & builder ergonomics (`effect`, `geometry`, `image`, `sprite`, `surface`)**: Added `EffectCtx::{load_image_static, load_image_static_sized}` backed by `AssetSource::StaticBytes`, `SpriteSheet::grid(asset, cols, rows)`, `Surfaces::none()`, `From<(W, H)> for Size`, `From<LogicalSize> for Size`, `From<LogicalPx> for Edges`, `From<(LogicalPx, LogicalPx)> for Edges`, `From<(u32, u32, u32, u32)> for SourceRect`, and crate-root re-exports for `ErrorKind`, `MemoryConfig`, and `OutputTransform`.
+- **Unified compositor events & workspace targeting (`compositor`)**: Added `Compositor::subscribe`, `CompositorEvent`, `CompositorClient` enum (`Hyprland`, `Sway`), `WorkspaceTarget<'a>` (`Id`, `Name`, `Relative { delta, existing_only }`, `Previous`), and `KeyboardLayoutSwitch` (`Next`, `Prev`, `Index(u32)`).
+- **Target-based audio & sound API (`audio`)**: Added `SoundId`, `SoundPlay` (with `From` conversions for `SoundAsset`, `(SoundAsset, f32)`, `SoundPreset`, `(SoundPreset, f32)`), `AudioDirection`, `AudioTarget`, `AudioPortTarget`, `AudioVolume`, and `AudioPlayer::{unload, clear_cache, play_at, play_trigger}` with LRU cache limits.
+- **Domain-grouped `DbusClient` API & typed action replies (`dbus`)**: Added 13 lightweight `Copy` domain clients (`mpris`, `nm`, `bluetooth`, `udisks`, `logind`, `tray`, `notifications`, `power_profiles`, `upower`, `modem`, `portal`, `screensaver`, `geoclue`), `DbusActionReply`, `WifiConnectOptions`, `UDisksMountOptions`, `PowerAction`, `BluetoothAgentReply`, and `DbusClient::trim_cache()`.
+- **Unified desktop launch/spawn options & bounded icon lookup (`desktop`, `system`)**: Added `LaunchOptions`, `SpawnOptions`, `spawn_with`, `spawn_shell`, `XdgBaseDirs::{application_dirs, icon_dirs, sound_dirs}`, `XdgIconLookup::{with_max_entries, set_max_entries, clear, clear_results}`, `sample_privacy_oneshot()`, `BatterySnapshot`, and `ThermalSnapshot`.
+- **Default control socket subscription (`control`)**: Added `Control::default_socket` and made `ControlRequest: Clone + Send + Sync + Deref<Target = str>`.
+
+### Changed
+- **Shared runtime engine & default surface resolution (`app`, `surface`, `render`, `error`)**: Extracted shared `CoreEngine<M>` across `LoopRuntime` and `HeadlessRuntime`, boxed `ElementKind::Sprite`, resolved empty surface `title`/`namespace` from `App::name` and omitted `buffer_retention` from `MemoryConfig::default_buffer_retention`, and updated `From<std::io::Error>` to wrap `WaywiError::Io` losslessly.
+- **Documentation**: Updated `README.md` and all `docs/*.md` guides for `v0.2.1`.
+
+### Fixed
+- **Memoization & arena stability (`arena`, `render`)**: Fixed `FrameArenaPool` slab pinning under `Element::memo` / `Surface::memo` capturing closures by storing capturing `FrameSharedFn` closures in `Rc<F>` (keeping the zero-alloc ZST fast path), added parent-child `MemoId` dependency tracking so nested `Element::memo` entries survive `MemoStore::prune_stale()`, and eliminated double-hashing when pre-hashed `ElementKey`/`SurfaceKey`/`SubscriptionKey` values pass through `Into*Key`.
+- **CPU wakeups, idle teardown & blocking calls (`dbus`, `audio`, `compositor`, `accessibility`, `app`, `wayland`, `system`, `control`)**:
+  - Replaced `TrayWorker`'s unfiltered session-bus signal subscription with 3 targeted match rules and coalesced bursts in `ServiceWatchWorker`, `PowerProfilesWorker`, and `LogindWorker`.
+  - Added lock-free `AtomicBool` pending checks and `stop_if_idle()` teardown on `AudioClient`; fixed `AudioPlayer` `RodioDriver` to play `Arc<[f32]>` without cloning, ALSA playback to release idle `PCM` handles after 2s, and PulseAudio playback to drain latency before corking.
+  - Unified Hyprland and Sway event streams onto a shared non-blocking `StreamWorkerHandle`, fixing Sway's 2-second `Drop` stall and bounded `read_frame` allocation against oversized headers.
+  - Gated `AccessibilityBridge::sync` behind screen-reader activation state so idle apps pay zero tree-build cost; stopped `OutputsChanged` from overwriting runtime-probed IPC/GPU/audio flags or invoking blocking D-Bus portal queries; eliminated per-message `wl.outputs.clone()` in `LoopRuntime::run_effect`; added zero-clone single-subscriber delivery in `BroadcastSlot`; wired `AsyncAssetWorker` draining in `HeadlessRuntime`; fixed `WaylandState::present_surface_with` to propagate render errors; fixed `DbusActionOutbox` duplicate replay on attach; fixed `kdeglobals` icon theme parsing to respect the `[Icons]` section; fixed `DesktopEntry::launch_action` to honor `Terminal=true`; and tracked/cleaned up slow-client control reply writer tokens on socket removal.
+
 ## [0.1.11] - 2026-11-23
 
 ### Added
