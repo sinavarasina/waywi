@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use waywi::capabilities::{Capabilities, Capability};
 use waywi::desktop::{
-    XdgIconLookup, filter_launcher_entries, parse_desktop_entry, scan_desktop_entries_in,
-    search_desktop_entries, spawn_detached_in,
+    SpawnOptions, XdgIconLookup, filter_launcher_entries, parse_desktop_entry,
+    scan_desktop_entries_in, search_desktop_entries, spawn_with,
 };
 use waywi::input::KeyboardLayoutInfo;
 use waywi::system::cpu::CpuCounters;
@@ -26,7 +26,7 @@ use waywi::system::os::{parse_loadavg, parse_os_release, parse_uptime};
 use waywi::system::privacy::{
     PrivacyAccessKind, PrivacyAccessSource, classify_pipewire_node, scan_proc_fd_from,
 };
-use waywi::system::{SnapshotState, SystemProviders};
+use waywi::system::{DataRate, SystemProviders};
 
 #[test]
 fn cpu_delta_math_handles_zero_and_saturated_cases() {
@@ -92,22 +92,20 @@ VERSION_ID="2026.11"
 #[test]
 fn system_providers_smoke_contracts() {
     let mut sys = SystemProviders::new();
-    assert!(matches!(sys.cpu_snapshot(), SnapshotState::Pending));
 
-    // First call sets baseline; second call yields Ready on Linux `/proc/stat`.
-    let _first = sys.poll_cpu_now();
-    let second = sys.poll_cpu_now();
-    if let SnapshotState::Ready(cpu) = second {
-        assert!(cpu.logical_cores >= 1);
-        assert!((0.0..=100.0).contains(&cpu.total_percent));
+    // First call sets baseline; second call yields real delta on Linux `/proc/stat`.
+    let _first = sys.sample_cpu();
+    let second = sys.sample_cpu();
+    if second.logical_cores > 0 {
+        assert!((0.0..=100.0).contains(&second.total_percent));
     }
 
-    let mem = sys.memory_snapshot().expect("/proc/meminfo readable");
+    let mem = sys.sample_memory();
     assert!(mem.total.as_bytes() > 0);
     assert!(mem.used <= mem.total);
 
-    let t0 = sys.time_snapshot();
-    let t1 = sys.time_snapshot();
+    let t0 = sys.sample_time();
+    let t1 = sys.sample_time();
     assert!(t1.monotonic >= t0.monotonic);
 }
 
@@ -328,13 +326,13 @@ tmpfs /run tmpfs rw 0 0
     let mut sampler = DiskSampler::new();
     let t0 = Instant::now();
     let snap0 = sampler.feed_snapshot(Vec::new(), s0, t0);
-    assert_eq!(snap0.total_read_bytes_per_sec, 0.0);
+    assert_eq!(snap0.total_read_rate, DataRate::ZERO);
 
     // After 2s: +4000 read sectors (2,048,000 B -> 1,024,000 B/s), +4000 write sectors,
     // without double-counting partition `nvme0n1p1`.
     let snap1 = sampler.feed_snapshot(Vec::new(), s1, t0 + Duration::from_secs(2));
-    assert!((snap1.total_read_bytes_per_sec - 1_024_000.0).abs() < 1.0);
-    assert!((snap1.total_write_bytes_per_sec - 1_024_000.0).abs() < 1.0);
+    assert!((snap1.total_read_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
+    assert!((snap1.total_write_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
     assert!((snap1.io[0].read_iops - 100.0).abs() < 0.01);
     assert!((snap1.io[0].write_iops - 50.0).abs() < 0.01);
 }
@@ -416,9 +414,9 @@ fn hwmon_sensors_uptime_and_live_system_providers_contracts() {
     let mut sys = SystemProviders::new();
     let up_live = sys.uptime().expect("/proc/uptime readable");
     assert!(up_live.uptime > Duration::ZERO);
-    let _gpus_live = sys.gpu_snapshot().expect("gpu discovery never crashes");
-    let _disk_live = sys.poll_disk_now().expect("/proc/diskstats readable");
-    let net_live = sys.poll_network_now().expect("/proc/net/dev readable");
+    let _gpus_live = sys.sample_gpu();
+    let _disk_live = sys.sample_disk();
+    let net_live = sys.sample_network();
     assert!(!net_live.interfaces.is_empty());
 }
 
@@ -611,7 +609,14 @@ fn desktop_entry_icon_lookup_keyboard_layout_and_sfx_preset_contracts() {
         term_parsed.terminal_argv(Some("alacritty")).unwrap(),
         vec!["alacritty", "-e", "htop", "-C"]
     );
-    assert!(spawn_detached_in("true", &[], Some(&work_dir)).is_ok());
+    assert!(
+        spawn_with(
+            "true",
+            std::iter::empty::<&str>(),
+            &SpawnOptions::new().working_dir(&work_dir),
+        )
+        .is_ok()
+    );
 
     let mut lookup = XdgIconLookup::with_dirs(vec![icons_dir], "CustomTheme");
     assert_eq!(lookup.resolve("waywi-demo", 48), Some(expected_icon));
@@ -629,7 +634,7 @@ fn desktop_entry_icon_lookup_keyboard_layout_and_sfx_preset_contracts() {
 ))]
 #[test]
 fn audio_player_presets_and_cache_contracts() {
-    use waywi::audio::{AudioPlayer, SoundData, SoundPreset};
+    use waywi::audio::{AudioPlayer, SoundData, SoundPlay, SoundPreset};
 
     let click = SoundData::from_preset(SoundPreset::Click);
     assert_eq!(click.channels, 2);
@@ -638,4 +643,72 @@ fn audio_player_presets_and_cache_contracts() {
     let a = player.load_preset(SoundPreset::DragTick);
     let b = player.load_preset(SoundPreset::DragTick);
     assert_eq!(a.id, b.id);
+    let _play_asset: SoundPlay = a.into();
+    let _play_scaled: SoundPlay = (a, 0.75).into();
+    let _play_preset: SoundPlay = SoundPreset::Hover.into();
+    assert!(player.unload(a));
+    assert!(!player.unload(a));
+    player.clear_cache();
+}
+
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+#[test]
+fn audio_volume_and_orthogonal_target_contracts() {
+    use waywi::audio::{
+        AudioChannelPosition, AudioDirection, AudioPortTarget, AudioTarget, AudioVolume,
+    };
+
+    let vol = AudioVolume {
+        linear: 0.8,
+        channels: vec![0.8, 0.4],
+        channel_map: vec![
+            AudioChannelPosition::FrontLeft,
+            AudioChannelPosition::FrontRight,
+        ],
+        db: Some(-1.9),
+        muted: false,
+    };
+    assert_eq!(vol.channel_count(), 2);
+    assert!((vol.percent() - 80.0).abs() < 0.01);
+    assert!(vol.balance().is_some_and(|b| b < 0.0));
+    assert_ne!(AudioTarget::DefaultSink, AudioTarget::DefaultSource);
+    assert_ne!(AudioPortTarget::Sink(1), AudioPortTarget::Source(1));
+    assert_ne!(AudioDirection::Output, AudioDirection::Input);
+}
+
+#[cfg(feature = "dbus")]
+#[test]
+fn dbus_client_subhandles_and_options_contracts() {
+    use waywi::dbus::{
+        BluetoothAgentReply, DbusActionReply, DbusClient, PowerAction, UDisksMountOptions,
+        WifiConnectOptions,
+    };
+
+    let client = DbusClient::new();
+    assert!(client.mpris().cached_snapshots().is_none());
+    assert!(client.nm().cached_snapshot().is_none());
+    assert!(client.bluetooth().cached_snapshot().is_none());
+    assert!(client.udisks().cached_snapshot().is_none());
+    assert!(client.logind().cached_snapshot().is_none());
+    assert!(client.tray().cached_items().is_none());
+    assert!(client.power_profiles().cached_snapshot().is_none());
+    assert!(client.upower().cached_snapshot().is_none());
+    assert!(client.modem().cached_snapshot().is_none());
+    let _ = client.notifications().capabilities();
+    let _ = client.portal();
+    let _ = client.screensaver();
+    let _ = client.geoclue();
+    client.trim_cache();
+
+    let wifi = WifiConnectOptions::new().password("secret").hidden(true);
+    assert!(wifi.hidden);
+    assert_eq!(wifi.password.as_deref(), Some("secret"));
+
+    let mount = UDisksMountOptions::new().fs_type("ext4").interactive(false);
+    assert!(!mount.interactive);
+    assert_eq!(mount.fs_type.as_deref(), Some("ext4"));
+
+    assert_eq!(DbusActionReply::default(), DbusActionReply::Unit);
+    assert_ne!(PowerAction::Suspend, PowerAction::Reboot);
+    let _ = BluetoothAgentReply::Reject;
 }

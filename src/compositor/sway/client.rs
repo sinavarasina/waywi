@@ -3,13 +3,16 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::compositor::WorkspaceTarget;
 use crate::error::{Result, WaywiError};
 
-use super::types::{CommandOutcome, SwayOutput, SwayVersion, SwayWorkspace, WorkspaceRef};
+use super::types::{CommandOutcome, SwayOutput, SwayVersion, SwayWorkspace};
 
 pub(super) const SWAY_MAGIC: &[u8; 6] = b"i3-ipc";
 pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const INITIAL_PAYLOAD_CAPACITY: usize = 4096;
+const MAX_RELATIVE_STEPS: u32 = 64;
 
 // Sway IPC request types.
 const MSG_RUN_COMMAND: u32 = 0;
@@ -88,10 +91,15 @@ impl SwayClient {
     }
 
     /// Switches workspace safely using structured escaping (never `sh -c`).
-    pub fn switch_workspace(&self, target: WorkspaceRef<'_>) -> Result<()> {
-        let cmd = match target {
-            WorkspaceRef::Number(n) => format!("workspace number {n}"),
-            WorkspaceRef::Name(name) => {
+    pub fn switch_workspace<'a>(&self, target: impl Into<WorkspaceTarget<'a>>) -> Result<()> {
+        let cmd = match target.into() {
+            WorkspaceTarget::Id(n) => format!("workspace number {n}"),
+            WorkspaceTarget::Name(name) => {
+                if name.is_empty() {
+                    return Err(WaywiError::IpcError(
+                        "Sway workspace name must not be empty".to_owned(),
+                    ));
+                }
                 if name.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r') {
                     return Err(WaywiError::IpcError(
                         "workspace name contains control characters".to_owned(),
@@ -100,6 +108,34 @@ impl SwayClient {
                 let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("workspace \"{escaped}\"")
             }
+            WorkspaceTarget::Relative {
+                delta,
+                existing_only,
+            } => {
+                if delta == 0 {
+                    return Ok(());
+                }
+                let step = match (delta > 0, existing_only) {
+                    (true, true) => "workspace next_on_output",
+                    (false, true) => "workspace prev_on_output",
+                    (true, false) => "workspace next",
+                    (false, false) => "workspace prev",
+                };
+                let steps = delta.unsigned_abs().min(MAX_RELATIVE_STEPS);
+                if steps == 1 {
+                    step.to_owned()
+                } else {
+                    let mut chained = String::with_capacity((step.len() + 2) * steps as usize);
+                    for i in 0..steps {
+                        if i > 0 {
+                            chained.push_str("; ");
+                        }
+                        chained.push_str(step);
+                    }
+                    chained
+                }
+            }
+            WorkspaceTarget::Previous => "workspace back_and_forth".to_owned(),
         };
         self.raw_command(&cmd)
     }
@@ -147,7 +183,7 @@ impl SwayClient {
 }
 
 /// Encodes one Sway `i3-ipc` binary frame (`"i3-ipc" || u32 len || u32 type || payload`).
-pub fn encode_frame(msg_type: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_frame(msg_type: u32, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(14 + payload.len());
     frame.extend_from_slice(SWAY_MAGIC);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -178,9 +214,140 @@ pub(crate) fn read_frame(stream: &mut impl Read) -> Result<(u32, Vec<u8>)> {
             "Sway IPC frame length {len} exceeds {MAX_PAYLOAD_BYTES} byte limit"
         )));
     }
-    let mut payload = vec![0u8; len];
+    let mut payload = Vec::with_capacity(len.min(INITIAL_PAYLOAD_CAPACITY));
     if len > 0 {
-        stream.read_exact(&mut payload)?;
+        let read = stream.by_ref().take(len as u64).read_to_end(&mut payload)?;
+        if read != len {
+            return Err(WaywiError::IpcError(format!(
+                "truncated Sway IPC frame payload: expected {len} bytes, got {read}"
+            )));
+        }
     }
     Ok((msg_type, payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static SWAY_SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn read_frame_validates_magic_limit_and_truncated_payloads_without_eager_oom() {
+        let frame = encode_frame(MSG_GET_VERSION, br#"{"major":1}"#);
+        let mut cursor = Cursor::new(frame);
+        let (msg_type, payload) = read_frame(&mut cursor).unwrap();
+        assert_eq!(msg_type, MSG_GET_VERSION);
+        assert_eq!(payload, br#"{"major":1}"#);
+
+        // Invalid magic header is rejected.
+        let mut bad_magic = Cursor::new(b"notipc\x00\x00\x00\x00\x00\x00\x00\x00".to_vec());
+        assert!(read_frame(&mut bad_magic).is_err());
+
+        // Oversized frame length (> 8 MiB) is rejected.
+        let mut oversized = Vec::from(&SWAY_MAGIC[..]);
+        oversized.extend_from_slice(&((MAX_PAYLOAD_BYTES as u32) + 1).to_le_bytes());
+        oversized.extend_from_slice(&0u32.to_le_bytes());
+        assert!(read_frame(&mut Cursor::new(oversized)).is_err());
+
+        // Header claiming 4 MiB with only 3 trailing bytes fails cleanly as truncated without
+        // pre-allocating 4 MiB.
+        let mut truncated = Vec::from(&SWAY_MAGIC[..]);
+        truncated.extend_from_slice(&(4u32 * 1024 * 1024).to_le_bytes());
+        truncated.extend_from_slice(&MSG_GET_WORKSPACES.to_le_bytes());
+        truncated.extend_from_slice(b"abc");
+        let err = read_frame(&mut Cursor::new(truncated)).unwrap_err();
+        assert!(err.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn switch_workspace_handles_all_workspace_target_variants() {
+        let dir = std::env::temp_dir().join(format!(
+            "waywi-sway-client-{}-{}",
+            std::process::id(),
+            SWAY_SOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("sway.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let srv = std::thread::spawn(move || {
+            let mut cmds = Vec::new();
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (msg_type, payload) = read_frame(&mut stream).unwrap();
+                assert_eq!(msg_type, MSG_RUN_COMMAND);
+                cmds.push(String::from_utf8(payload).unwrap());
+                write_frame(&mut stream, MSG_RUN_COMMAND, br#"[{"success":true}]"#).unwrap();
+            }
+            cmds
+        });
+
+        let client = SwayClient::with_socket(&sock);
+        client.switch_workspace(3).unwrap();
+        client.switch_workspace(r#"dev "1""#).unwrap();
+        client
+            .switch_workspace(WorkspaceTarget::Relative {
+                delta: 1,
+                existing_only: true,
+            })
+            .unwrap();
+        client
+            .switch_workspace(WorkspaceTarget::Relative {
+                delta: -1,
+                existing_only: true,
+            })
+            .unwrap();
+        client
+            .switch_workspace(WorkspaceTarget::Relative {
+                delta: 2,
+                existing_only: false,
+            })
+            .unwrap();
+        client
+            .switch_workspace(WorkspaceTarget::Relative {
+                delta: 0,
+                existing_only: true,
+            })
+            .unwrap();
+        client.switch_workspace(WorkspaceTarget::Previous).unwrap();
+
+        let numbered = SwayWorkspace {
+            num: 7,
+            name: "7:code".to_owned(),
+            ..SwayWorkspace::default()
+        };
+        client.switch_workspace(&numbered).unwrap();
+
+        let named = SwayWorkspace {
+            num: -1,
+            name: "music".to_owned(),
+            ..SwayWorkspace::default()
+        };
+        client.switch_workspace(&named).unwrap();
+
+        assert!(client.switch_workspace("").is_err());
+        assert!(client.switch_workspace("bad\nname").is_err());
+
+        let seen = srv.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                "workspace number 3",
+                "workspace \"dev \\\"1\\\"\"",
+                "workspace next_on_output",
+                "workspace prev_on_output",
+                "workspace next; workspace next",
+                "workspace back_and_forth",
+                "workspace number 7",
+                "workspace \"music\"",
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

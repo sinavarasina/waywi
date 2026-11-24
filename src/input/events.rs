@@ -1,7 +1,7 @@
 use crate::arena::FrameSharedFn;
 use crate::geometry::Point;
 
-use super::keys::{KeyEvent, Modifiers};
+use super::keys::Modifiers;
 
 /// Pointer button identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,21 +68,20 @@ pub(crate) struct EventHandlers<M> {
     pub(crate) on_hover: Option<M>,
     pub(crate) on_leave: Option<M>,
     pub(crate) on_scroll: Option<FrameSharedFn<ScrollEvent, M>>,
-    pub(crate) on_key: Option<FrameSharedFn<KeyEvent, Option<M>>>,
     #[cfg(any(
         feature = "pipewire",
         feature = "pulseaudio",
         feature = "alsa",
         feature = "audio-playback"
     ))]
-    pub(crate) on_click_sound: Option<(crate::audio::SoundAsset, f32)>,
+    pub(crate) on_click_sound: Option<crate::audio::SoundPlay>,
     #[cfg(any(
         feature = "pipewire",
         feature = "pulseaudio",
         feature = "alsa",
         feature = "audio-playback"
     ))]
-    pub(crate) on_hover_sound: Option<(crate::audio::SoundAsset, f32)>,
+    pub(crate) on_hover_sound: Option<crate::audio::SoundPlay>,
 }
 
 impl<M> Default for EventHandlers<M> {
@@ -95,7 +94,6 @@ impl<M> Default for EventHandlers<M> {
             on_hover: None,
             on_leave: None,
             on_scroll: None,
-            on_key: None,
             #[cfg(any(
                 feature = "pipewire",
                 feature = "pulseaudio",
@@ -163,13 +161,6 @@ impl<M: 'static> EventHandlers<M> {
         self.on_scroll = Some(FrameSharedFn::new(handler));
     }
 
-    pub(crate) fn set_on_key<F>(&mut self, handler: F)
-    where
-        F: Fn(KeyEvent) -> Option<M> + 'static,
-    {
-        self.on_key = Some(FrameSharedFn::new(handler));
-    }
-
     pub(crate) fn map<N: 'static>(self, mapper: &FrameSharedFn<M, N>) -> EventHandlers<N> {
         fn map_fn<A: 'static, M: 'static, N: 'static>(
             opt: Option<FrameSharedFn<A, M>>,
@@ -185,10 +176,6 @@ impl<M: 'static> EventHandlers<M> {
         let on_pointer_up = map_fn(self.on_pointer_up, mapper);
         let on_pointer_move = map_fn(self.on_pointer_move, mapper);
         let on_scroll = map_fn(self.on_scroll, mapper);
-        let on_key = self.on_key.map(|prev| {
-            let m = mapper.clone();
-            FrameSharedFn::new(move |ev| prev.call(ev).map(|msg| m.call(msg)))
-        });
         EventHandlers {
             on_click: self.on_click.map(|msg| mapper.call(msg)),
             on_pointer_down,
@@ -197,7 +184,6 @@ impl<M: 'static> EventHandlers<M> {
             on_hover: self.on_hover.map(|msg| mapper.call(msg)),
             on_leave: self.on_leave.map(|msg| mapper.call(msg)),
             on_scroll,
-            on_key,
             #[cfg(any(
                 feature = "pipewire",
                 feature = "pulseaudio",

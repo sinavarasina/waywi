@@ -5,9 +5,41 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 
 use crate::error::{Result, WaywiError};
+
+/// Options controlling how a [`DesktopEntry`] or [`DesktopAction`] is launched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    pub working_dir: Option<PathBuf>,
+    pub activation_token: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl LaunchOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn activation_token(mut self, token: impl Into<String>) -> Self {
+        self.activation_token = Some(token.into());
+        self
+    }
+
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
 
 /// Parsed `[Desktop Action <id>]` sub-action metadata from an XDG `.desktop` file (e.g.,
 /// `"New Private Window"`).
@@ -33,27 +65,21 @@ impl DesktopAction {
         expand_exec_argv(self.exec.as_deref()?, &self.name, icon, &entry.path)
     }
 
-    /// Spawns this action detached in its own session (reaping on exit).
-    pub fn launch_detached(&self, entry: &DesktopEntry) -> Result<()> {
-        self.launch_with_token(entry, None)
+    /// Spawns this action detached in its own session (reaping on exit), honoring `entry.terminal`
+    /// and `entry.working_dir`, and returns the spawned child PID.
+    pub fn launch(&self, entry: &DesktopEntry) -> Result<u32> {
+        self.launch_with(entry, &LaunchOptions::default())
     }
 
-    /// Spawns this action detached with an optional Wayland `XDG_ACTIVATION_TOKEN` passed to the
-    /// child process environment.
-    pub fn launch_with_token(
-        &self,
-        entry: &DesktopEntry,
-        activation_token: Option<&str>,
-    ) -> Result<()> {
-        let argv = self.exec_argv(entry).ok_or_else(|| {
-            WaywiError::InvalidState(format!(
-                "desktop action `{}` on `{}` has no Exec command",
-                self.id, entry.id
-            ))
-        })?;
-        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        let env_vars = activation_env_vars(activation_token);
-        super::spawn_detached_with_env(&argv[0], &args, entry.valid_working_dir(), &env_vars)
+    /// Spawns this action detached with explicit [`LaunchOptions`], honoring `entry.terminal` and
+    /// `entry.working_dir`, and returns the spawned child PID.
+    pub fn launch_with(&self, entry: &DesktopEntry, options: &LaunchOptions) -> Result<u32> {
+        let path_dirs = split_env_path();
+        let env_terminal = env::var("TERMINAL").ok();
+        let argv =
+            entry.resolve_action_argv_with(self, None, &path_dirs, env_terminal.as_deref())?;
+        let spawn_opts = entry.build_spawn_options(options);
+        super::spawn_with(&argv[0], &argv[1..], &spawn_opts)
     }
 }
 
@@ -168,15 +194,13 @@ impl DesktopEntry {
             .ok()
     }
 
-    fn resolve_argv_with(
+    fn wrap_if_terminal(
         &self,
+        app_argv: Vec<String>,
         terminal: Option<&str>,
         path_dirs: &[PathBuf],
         env_terminal: Option<&str>,
     ) -> Result<Vec<String>> {
-        let app_argv = self.exec_argv().ok_or_else(|| {
-            WaywiError::InvalidState(format!("desktop entry `{}` has no Exec command", self.id))
-        })?;
         if !self.terminal {
             return Ok(app_argv);
         }
@@ -194,84 +218,88 @@ impl DesktopEntry {
         })
     }
 
+    fn resolve_argv_with(
+        &self,
+        terminal: Option<&str>,
+        path_dirs: &[PathBuf],
+        env_terminal: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let app_argv = self.exec_argv().ok_or_else(|| {
+            WaywiError::InvalidState(format!("desktop entry `{}` has no Exec command", self.id))
+        })?;
+        self.wrap_if_terminal(app_argv, terminal, path_dirs, env_terminal)
+    }
+
+    fn resolve_action_argv_with(
+        &self,
+        action: &DesktopAction,
+        terminal: Option<&str>,
+        path_dirs: &[PathBuf],
+        env_terminal: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let app_argv = action.exec_argv(self).ok_or_else(|| {
+            WaywiError::InvalidState(format!(
+                "desktop action `{}` on `{}` has no Exec command",
+                action.id, self.id
+            ))
+        })?;
+        self.wrap_if_terminal(app_argv, terminal, path_dirs, env_terminal)
+    }
+
     fn valid_working_dir(&self) -> Option<&Path> {
         self.working_dir.as_deref().filter(|p| p.is_dir())
     }
 
-    /// Spawns this application with null stdio handles and returns the [`Child`] handle.
-    ///
-    /// Automatically wraps `Terminal=true` entries using the detected terminal emulator and applies
-    /// `Path=` when it points to an existing directory. Callers are responsible for waiting on the
-    /// returned [`Child`] to avoid zombie processes; prefer [`Self::launch_detached`] or
-    /// [`Self::launch_with_terminal`] when the handle is not needed.
-    pub fn launch(&self) -> Result<Child> {
-        let path_dirs = split_env_path();
-        let env_terminal = env::var("TERMINAL").ok();
-        let argv = self.resolve_argv_with(None, &path_dirs, env_terminal.as_deref())?;
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(dir) = self.valid_working_dir() {
-            cmd.current_dir(dir);
+    fn build_spawn_options(&self, options: &LaunchOptions) -> super::SpawnOptions {
+        let working_dir = options
+            .working_dir
+            .clone()
+            .or_else(|| self.valid_working_dir().map(Path::to_path_buf));
+        let mut env = Vec::with_capacity(options.env.len() + 2);
+        if let Some(tok) = options
+            .activation_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            env.push(("XDG_ACTIVATION_TOKEN".to_owned(), tok.to_owned()));
+            env.push(("DESKTOP_STARTUP_ID".to_owned(), tok.to_owned()));
         }
-        cmd.spawn().map_err(WaywiError::Io)
+        env.extend(options.env.iter().cloned());
+        super::SpawnOptions { working_dir, env }
     }
 
-    /// Spawns this application detached in its own session and reaps it on exit.
+    /// Spawns this application detached in its own session (reaping on exit) and returns the
+    /// spawned child PID.
     ///
     /// Applies `Path=` if it points to an existing directory and wraps `Terminal=true` entries in
     /// the detected system terminal (`xdg-terminal-exec`, `$TERMINAL`, or common Wayland/X11
     /// terminal emulators).
-    pub fn launch_detached(&self) -> Result<()> {
-        self.launch_with_terminal(None)
+    pub fn launch(&self) -> Result<u32> {
+        self.launch_with(&LaunchOptions::default())
     }
 
-    /// Spawns this application detached, using `terminal` when `self.terminal` is `true` (or
-    /// auto-detecting the system terminal when `terminal` is `None`).
-    pub fn launch_with_terminal(&self, terminal: Option<&str>) -> Result<()> {
-        self.launch_with_terminal_and_token(terminal, None)
-    }
-
-    /// Spawns this application detached with an optional Wayland `XDG_ACTIVATION_TOKEN` passed to
-    /// the child process environment (along with `DESKTOP_STARTUP_ID` for legacy toolkits).
-    pub fn launch_with_token(&self, activation_token: Option<&str>) -> Result<()> {
-        self.launch_with_terminal_and_token(None, activation_token)
-    }
-
-    /// Spawns this application detached with explicit optional `terminal` override and optional
-    /// Wayland `XDG_ACTIVATION_TOKEN`.
-    pub fn launch_with_terminal_and_token(
-        &self,
-        terminal: Option<&str>,
-        activation_token: Option<&str>,
-    ) -> Result<()> {
+    /// Spawns this application detached with explicit [`LaunchOptions`] (optional `working_dir`
+    /// override, Wayland `XDG_ACTIVATION_TOKEN`, and child-only environment variables) and returns
+    /// the spawned child PID.
+    pub fn launch_with(&self, options: &LaunchOptions) -> Result<u32> {
         let path_dirs = split_env_path();
         let env_terminal = env::var("TERMINAL").ok();
-        let argv = self.resolve_argv_with(terminal, &path_dirs, env_terminal.as_deref())?;
-        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        let env_vars = activation_env_vars(activation_token);
-        super::spawn_detached_with_env(&argv[0], &args, self.valid_working_dir(), &env_vars)
+        let argv = self.resolve_argv_with(None, &path_dirs, env_terminal.as_deref())?;
+        let spawn_opts = self.build_spawn_options(options);
+        super::spawn_with(&argv[0], &argv[1..], &spawn_opts)
     }
 
-    /// Launches a declared `[Desktop Action <action_id>]` detached with an optional Wayland
-    /// `XDG_ACTIVATION_TOKEN`.
-    pub fn launch_action(&self, action_id: &str, activation_token: Option<&str>) -> Result<()> {
+    /// Launches a declared `[Desktop Action <action_id>]` detached with explicit [`LaunchOptions`],
+    /// honoring `self.terminal` and `self.working_dir`, and returns the spawned child PID.
+    pub fn launch_action(&self, action_id: &str, options: &LaunchOptions) -> Result<u32> {
         let action = self.action(action_id).ok_or_else(|| {
             WaywiError::InvalidState(format!(
                 "desktop entry `{}` has no action `{action_id}`",
                 self.id
             ))
         })?;
-        action.launch_with_token(self, activation_token)
-    }
-}
-
-fn activation_env_vars(token: Option<&str>) -> Vec<(&'static str, &str)> {
-    match token.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(tok) => vec![("XDG_ACTIVATION_TOKEN", tok), ("DESKTOP_STARTUP_ID", tok)],
-        None => Vec::new(),
+        action.launch_with(self, options)
     }
 }
 
@@ -324,9 +352,13 @@ fn is_valid_dbus_well_known_name(name: &str) -> bool {
 }
 
 /// Filters `entries` to applications visible in a standard launcher on the current desktop,
-/// caching `XDG_CURRENT_DESKTOP` and `PATH` `TryExec` checks across all entries.
+/// pre-splitting `PATH` and caching `XDG_CURRENT_DESKTOP` / `TryExec` lookups once outside the
+/// entry loop.
 #[must_use]
 pub fn filter_launcher_entries(entries: &[DesktopEntry]) -> Vec<&DesktopEntry> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
     let mut ctx = LauncherFilterContext::from_env();
     entries
         .iter()
@@ -355,6 +387,9 @@ pub fn search_desktop_entries_with_weights<'a>(
     query: &str,
     launch_counts: Option<&HashMap<String, u32>>,
 ) -> Vec<DesktopSearchMatch<'a>> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
     let mut ctx = LauncherFilterContext::from_env();
     search_entries_with_ctx(entries, query, launch_counts, &mut ctx)
 }
@@ -418,7 +453,7 @@ fn search_entries_with_ctx<'a>(
 /// Returns standard XDG application directories ordered from highest to lowest priority.
 #[must_use]
 pub fn default_application_dirs() -> Vec<PathBuf> {
-    super::xdg::xdg_data_dirs_for("applications")
+    super::xdg::XdgBaseDirs::from_env().application_dirs()
 }
 
 /// Scans standard XDG application directories and returns deduplicated `Type=Application` entries.
@@ -855,7 +890,11 @@ impl LauncherFilterContext {
 
 fn split_env_path() -> Vec<PathBuf> {
     env::var_os("PATH")
-        .map(|v| env::split_paths(&v).collect())
+        .map(|v| {
+            env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1363,5 +1402,61 @@ Exec=browser --ignored
             ])
         );
         assert!(entry.action("undeclared").is_none());
+    }
+
+    #[test]
+    fn launch_action_honors_entry_terminal_and_launch_options() {
+        let src = "\
+[Desktop Entry]
+Type=Application
+Name=Monitor
+Exec=btop
+Terminal=true
+Actions=logs;
+
+[Desktop Action logs]
+Name=View Logs
+Exec=journalctl -f
+";
+        let entry = parse_desktop_entry(
+            src,
+            "monitor.desktop",
+            Path::new("/usr/share/applications/monitor.desktop"),
+        )
+        .unwrap();
+        let action = entry.action("logs").unwrap();
+        assert_eq!(
+            entry
+                .resolve_action_argv_with(action, Some("foot"), &[], None)
+                .unwrap(),
+            vec!["foot", "-e", "journalctl", "-f"]
+        );
+
+        let tmp = std::env::temp_dir();
+        let opts = LaunchOptions::new()
+            .working_dir(&tmp)
+            .activation_token("tok-123")
+            .env("CUSTOM_KEY", "custom_val");
+        let spawn_opts = entry.build_spawn_options(&opts);
+        assert_eq!(spawn_opts.working_dir.as_deref(), Some(tmp.as_path()));
+        assert_eq!(
+            spawn_opts.env,
+            vec![
+                ("XDG_ACTIVATION_TOKEN".to_owned(), "tok-123".to_owned()),
+                ("DESKTOP_STARTUP_ID".to_owned(), "tok-123".to_owned()),
+                ("CUSTOM_KEY".to_owned(), "custom_val".to_owned()),
+            ]
+        );
+
+        let runnable = parse_desktop_entry(
+            "[Desktop Entry]\nType=Application\nName=True\nExec=true\nActions=ok;\n\n[Desktop Action ok]\nName=Ok\nExec=true\n",
+            "true.desktop",
+            Path::new("/usr/share/applications/true.desktop"),
+        )
+        .unwrap();
+        assert!(runnable.launch().unwrap() > 0);
+        assert!(runnable.launch_with(&opts).unwrap() > 0);
+        assert!(runnable.launch_action("ok", &opts).unwrap() > 0);
+        assert!(runnable.launch_action("missing", &opts).is_err());
     }
 }

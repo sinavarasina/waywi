@@ -1,4 +1,4 @@
-use crate::geometry::{Affine2D, LogicalPx, LogicalSize, Position, Rect as GeoRect};
+use crate::geometry::{Affine2D, Bounds, Length, LogicalPx, LogicalSize, Position};
 use crate::input::EventHandlers;
 use crate::render::{
     Align, CanvasDrawHandle, Element, ElementKind, RenderBackend, RetainedNode, RetainedVisual,
@@ -13,7 +13,7 @@ use super::{FlowLayout, ParentScope, TreePass};
 
 struct PrevSnapshot {
     visible: bool,
-    world_bounds: GeoRect,
+    world_bounds: Bounds,
     affine: Affine2D,
     opacity: f32,
     z_index: i32,
@@ -24,7 +24,7 @@ fn resolve_auto_position(
     flow: LayoutFlow,
     cross_align: Align,
     gap: LogicalPx,
-    parent_rect: GeoRect,
+    parent_rect: Bounds,
     resolved_w: LogicalPx,
     resolved_h: LogicalPx,
     cursor_main: &mut LogicalPx,
@@ -56,16 +56,28 @@ fn resolve_auto_position(
 
 fn resolve_node_geometry<M: 'static, R: RenderBackend>(
     el: &Element<M>,
-    parent_rect: GeoRect,
+    parent_rect: Bounds,
     parent_affine: Affine2D,
     surface_size: LogicalSize,
     flow: FlowLayout,
     cursor_main: &mut LogicalPx,
     pass: &mut TreePass<'_, R>,
-) -> (GeoRect, Affine2D, GeoRect) {
-    let intrinsic =
-        measure_element_intrinsic(el, parent_rect, pass.renderer, pass.assets, pass.frame_seq);
+) -> (Bounds, Affine2D, Bounds) {
     let common = el.common().expect("non-memo element has common props");
+    let intrinsic = if matches!(common.size.width, Length::Auto)
+        || matches!(common.size.height, Length::Auto)
+    {
+        measure_element_intrinsic(
+            el,
+            parent_rect,
+            pass.scale,
+            pass.renderer,
+            pass.assets,
+            pass.frame_seq,
+        )
+    } else {
+        LogicalSize::ZERO
+    };
     let resolved_w = resolve_length(common.size.width, parent_rect.width, intrinsic.width);
     let resolved_h = resolve_length(common.size.height, parent_rect.height, intrinsic.height);
 
@@ -101,7 +113,7 @@ fn resolve_node_geometry<M: 'static, R: RenderBackend>(
     };
 
     let anchor_offset = common.anchor.top_left_offset(resolved_w, resolved_h);
-    let bounds = GeoRect::new(
+    let bounds = Bounds::new(
         raw_x - anchor_offset.x,
         raw_y - anchor_offset.y,
         resolved_w,
@@ -184,7 +196,7 @@ fn resolve_sprite_timeline<R: RenderBackend>(
 
 struct NodeSnapshotRef<'a> {
     visible: bool,
-    world_bounds: GeoRect,
+    world_bounds: Bounds,
     affine: Affine2D,
     opacity: f32,
     z_index: i32,
@@ -194,7 +206,7 @@ struct NodeSnapshotRef<'a> {
 fn record_dirty_bounds(
     prev_snapshot: Option<PrevSnapshot>,
     next: &NodeSnapshotRef<'_>,
-    dirty_rects: &mut Vec<GeoRect>,
+    dirty_rects: &mut Vec<Bounds>,
 ) {
     match prev_snapshot {
         None => {
@@ -305,7 +317,6 @@ impl<M: Clone + 'static> Reconciler<M> {
                 }
             }
             ElementKind::Sprite(sp) => {
-                let sp = *sp;
                 handlers = sp.common.handlers;
                 on_animation_end = sp.on_animation_end;
                 let rev = pass.assets.revision_of(sp.sheet.asset.id);
@@ -319,7 +330,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 );
                 sprite_timeline = tl;
                 RetainedVisual::Sprite {
-                    sheet: Box::new(sp.sheet),
+                    sheet: sp.sheet,
                     asset_revision: rev,
                     mode: sp.mode,
                     resolved_frame,
@@ -329,7 +340,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             ElementKind::Canvas(c) => {
                 handlers = c.common.handlers;
                 RetainedVisual::Canvas {
-                    render_key: c.render_key,
+                    cache_key: c.cache_key,
                     draw: CanvasDrawHandle { func: c.draw },
                 }
             }

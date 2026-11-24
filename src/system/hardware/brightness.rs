@@ -1,5 +1,5 @@
-//! Laptop backlight sysfs control + non-root `logind` brightness updates + background
-//! DDC/CI external monitor luminance worker (`/dev/i2c-*`, VCP `0x10`).
+//! Laptop backlight sysfs control and background DDC/CI external monitor luminance worker
+//! (`/dev/i2c-*`, VCP `0x10`).
 
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
@@ -134,24 +134,17 @@ pub(crate) fn write_backlight_sysfs_raw(device_name: &str, value: u64) -> Result
     fs::write(path, format!("{value}\n")).map_err(WaywiError::Io)
 }
 
-/// Sets laptop backlight brightness as a percentage (`0.0..=100.0`) via `logind` or sysfs.
+/// Sets laptop backlight brightness as a percentage (`0.0..=100.0`) directly via sysfs.
+///
+/// For automatic `systemd-logind` fallback when sysfs is not writable by an unprivileged user,
+/// use [`EffectCtx::set_backlight_percent`](crate::effect::EffectCtx::set_backlight_percent).
 pub fn set_backlight_percent(device_name: &str, percent: f32) -> Result<()> {
     let raw = backlight_percent_to_raw(device_name, percent)?;
-    set_backlight_raw(device_name, raw)
+    write_backlight_sysfs_raw(device_name, raw)
 }
 
-/// Writes an explicit raw hardware value to backlight `device_name` via `logind` or sysfs.
+/// Writes an explicit raw hardware value to backlight `device_name` directly via sysfs.
 pub fn set_backlight_raw(device_name: &str, value: u64) -> Result<()> {
-    #[cfg(feature = "dbus")]
-    if let Ok(val32) = u32::try_from(value) {
-        let client = crate::dbus::DbusClient::new();
-        if client
-            .set_backlight_brightness("backlight", device_name, val32)
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
     write_backlight_sysfs_raw(device_name, value)
 }
 
@@ -247,7 +240,7 @@ fn ddc_write_vcp(dev_path: &Path, vcp: u8, value: u16) -> Result<()> {
     Ok(())
 }
 
-fn scan_ddc_monitors() -> Vec<DdcMonitorInfo> {
+fn scan_ddc_monitors(stop_flag: &AtomicBool) -> Vec<DdcMonitorInfo> {
     let Ok(rd) = fs::read_dir("/dev") else {
         return Vec::new();
     };
@@ -264,6 +257,9 @@ fn scan_ddc_monitors() -> Vec<DdcMonitorInfo> {
 
     let mut monitors = Vec::new();
     for (bus, path) in candidates.into_iter().take(16) {
+        if stop_flag.load(Ordering::Acquire) {
+            break;
+        }
         if let Ok((cur, max)) = ddc_read_vcp(&path, VCP_LUMINANCE)
             && max > 0
         {
@@ -288,6 +284,7 @@ enum DdcCmd {
 pub(crate) struct DdcWorker {
     latest: Arc<Mutex<Vec<DdcMonitorInfo>>>,
     refresh_pending: Arc<AtomicBool>,
+    stop_flag: Option<Arc<AtomicBool>>,
     tx: Option<mpsc::Sender<DdcCmd>>,
     join: Option<JoinHandle<()>>,
 }
@@ -300,12 +297,7 @@ impl Default for DdcWorker {
 
 impl Drop for DdcWorker {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(DdcCmd::Shutdown);
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        self.stop();
     }
 }
 
@@ -314,8 +306,30 @@ impl DdcWorker {
         Self {
             latest: Arc::new(Mutex::new(Vec::new())),
             refresh_pending: Arc::new(AtomicBool::new(false)),
+            stop_flag: None,
             tx: None,
             join: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    pub(crate) fn stop(&mut self) {
+        if let Some(flag) = self.stop_flag.take() {
+            flag.store(true, Ordering::Release);
+        }
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(DdcCmd::Shutdown);
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        self.refresh_pending.store(false, Ordering::Release);
+        if let Ok(mut g) = self.latest.lock() {
+            g.clear();
         }
     }
 
@@ -326,19 +340,28 @@ impl DdcWorker {
         let (tx, rx) = mpsc::channel::<DdcCmd>();
         let shared = Arc::clone(&self.latest);
         let refresh_pending = Arc::clone(&self.refresh_pending);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
         if let Ok(join) = thread::Builder::new()
             .name("waywi-ddc-ci".to_owned())
             .spawn(move || {
-                let initial = scan_ddc_monitors();
-                if let Ok(mut g) = shared.lock() {
+                let initial = scan_ddc_monitors(&worker_stop);
+                if !worker_stop.load(Ordering::Acquire)
+                    && let Ok(mut g) = shared.lock()
+                {
                     *g = initial;
                 }
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         DdcCmd::Refresh => {
                             refresh_pending.store(false, Ordering::Release);
-                            let mons = scan_ddc_monitors();
-                            if let Ok(mut g) = shared.lock() {
+                            if worker_stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let mons = scan_ddc_monitors(&worker_stop);
+                            if !worker_stop.load(Ordering::Acquire)
+                                && let Ok(mut g) = shared.lock()
+                            {
                                 *g = mons;
                             }
                         }
@@ -370,6 +393,7 @@ impl DdcWorker {
                 }
             })
         {
+            self.stop_flag = Some(stop_flag);
             self.tx = Some(tx);
             self.join = Some(join);
         }
@@ -449,5 +473,15 @@ mod tests {
         assert_eq!(decode_ddc_vcp_reply(&reply, VCP_LUMINANCE), Some((65, 100)));
         reply[10] ^= 1;
         assert_eq!(decode_ddc_vcp_reply(&reply, VCP_LUMINANCE), None);
+    }
+
+    #[test]
+    fn set_backlight_percent_is_pure_sysfs_and_ddc_worker_stop_is_idempotent() {
+        assert!(set_backlight_percent("waywi-nonexistent-backlight", 50.0).is_err());
+
+        let mut worker = DdcWorker::new();
+        assert!(!worker.is_running());
+        worker.stop();
+        assert!(!worker.is_running());
     }
 }

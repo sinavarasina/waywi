@@ -1,24 +1,17 @@
-use std::io::Read;
-use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, eventfd, poll};
+use crate::compositor::stream_worker::{
+    FeedOutcome, READ_CHUNK_BYTES, StreamProtocol, StreamWorkerHandle,
+};
 
 use super::types::{HyprlandEvent, WorkspaceId};
 
 const MAX_EVENT_LINE_BYTES: usize = 16 * 1024;
-const READ_CHUNK_BYTES: usize = 4096;
-const RECONNECT_INITIAL_MS: u64 = 150;
-const RECONNECT_MAX_MS: u64 = 2_000;
 
 /// Parses a single Hyprland `socket2` event line (`NAME>>DATA`) safely without panicking on
 /// unknown or malformed lines.
 #[must_use]
-pub fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
+pub(crate) fn parse_event_line(line: &str) -> Option<HyprlandEvent> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
         return None;
@@ -247,12 +240,11 @@ fn parse_workspace_id_or_address(raw: &str) -> WorkspaceId {
 
 /// Zero-polling `socket2` listener bridge feeding Hyprland events into `calloop::channel`.
 ///
-/// Uses `poll(2)` + `eventfd(2)` so the worker thread triggers **zero wakeups while idle** and
-/// shuts down instantaneously on [`Drop`], even during reconnect backoff.
+/// Backed by [`StreamWorkerHandle`] (`poll(2)` + `eventfd(2)`), so the worker thread triggers
+/// **zero wakeups while idle** and shuts down instantaneously on [`Drop`], even during reconnect
+/// backoff.
 pub(crate) struct HyprlandListenerHandle {
-    stop: Arc<AtomicBool>,
-    stop_fd: Option<Arc<OwnedFd>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    _worker: StreamWorkerHandle,
 }
 
 impl HyprlandListenerHandle {
@@ -260,311 +252,113 @@ impl HyprlandListenerHandle {
         socket_path: PathBuf,
         sender: calloop::channel::Sender<HyprlandEvent>,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_fd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
-            .ok()
-            .map(Arc::new);
-        let stop_flag = Arc::clone(&stop);
-        let worker_stop_fd = stop_fd.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-hyprland-events".to_owned())
-            .spawn(move || {
-                run_event_listener(socket_path, sender, stop_flag, worker_stop_fd);
-            })
-            .ok();
         Self {
-            stop,
-            stop_fd,
-            join,
+            _worker: StreamWorkerHandle::spawn(
+                socket_path,
+                sender,
+                HyprlandStreamProtocol::default(),
+            ),
         }
     }
 }
 
-impl Drop for HyprlandListenerHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(ref fd) = self.stop_fd {
-            let _ = rustix::io::write(&**fd, &1u64.to_ne_bytes());
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+#[derive(Default)]
+struct HyprlandStreamProtocol {
+    line_buf: Vec<u8>,
+    discarding_oversized: bool,
+}
+
+impl StreamProtocol for HyprlandStreamProtocol {
+    type Event = HyprlandEvent;
+
+    const THREAD_NAME: &'static str = "waywi-hyprland-events";
+
+    fn disconnected_event() -> Self::Event {
+        HyprlandEvent::Disconnected
     }
-}
 
-fn run_event_listener(
-    socket_path: PathBuf,
-    sender: calloop::channel::Sender<HyprlandEvent>,
-    stop: Arc<AtomicBool>,
-    stop_fd: Option<Arc<OwnedFd>>,
-) {
-    let mut ever_connected = false;
-    let mut backoff_ms = RECONNECT_INITIAL_MS;
-    let mut chunk = [0u8; READ_CHUNK_BYTES];
-    let mut line_buf: Vec<u8> = Vec::new();
-
-    while !stop.load(Ordering::Acquire) {
-        match UnixStream::connect(&socket_path) {
-            Ok(mut stream) => {
-                if stream.set_nonblocking(true).is_err() {
-                    if wait_reconnect_or_stop(stop_fd.as_deref(), &stop, backoff_ms) {
-                        return;
-                    }
-                    backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
-                    continue;
-                }
-                backoff_ms = RECONNECT_INITIAL_MS;
-                if ever_connected && sender.send(HyprlandEvent::Reconnected).is_err() {
-                    return;
-                }
-                ever_connected = true;
-
-                line_buf.clear();
-                if line_buf.capacity() > READ_CHUNK_BYTES {
-                    line_buf.shrink_to(READ_CHUNK_BYTES);
-                }
-                let mut discarding_oversized = false;
-
-                let receiver_closed = match stop_fd.as_deref() {
-                    Some(wake_fd) => pump_stream_eventfd(
-                        &mut stream,
-                        wake_fd,
-                        &stop,
-                        &sender,
-                        &mut chunk,
-                        &mut line_buf,
-                        &mut discarding_oversized,
-                    ),
-                    None => pump_stream_fallback(
-                        &mut stream,
-                        &stop,
-                        &sender,
-                        &mut chunk,
-                        &mut line_buf,
-                        &mut discarding_oversized,
-                    ),
-                };
-
-                if receiver_closed || stop.load(Ordering::Acquire) {
-                    return;
-                }
-                if sender.send(HyprlandEvent::Disconnected).is_err() {
-                    return;
-                }
-                if wait_reconnect_or_stop(stop_fd.as_deref(), &stop, backoff_ms) {
-                    return;
-                }
-            }
-            Err(_) => {
-                if wait_reconnect_or_stop(stop_fd.as_deref(), &stop, backoff_ms) {
-                    return;
-                }
-                backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
-            }
-        }
+    fn reconnected_event() -> Self::Event {
+        HyprlandEvent::Reconnected
     }
-}
 
-/// Returns `true` if the channel receiver closed or stop was requested.
-fn pump_stream_eventfd(
-    stream: &mut UnixStream,
-    stop_fd: &OwnedFd,
-    stop: &AtomicBool,
-    sender: &calloop::channel::Sender<HyprlandEvent>,
-    chunk: &mut [u8; READ_CHUNK_BYTES],
-    line_buf: &mut Vec<u8>,
-    discarding_oversized: &mut bool,
-) -> bool {
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
+    fn reset(&mut self) {
+        self.line_buf.clear();
+        if self.line_buf.capacity() > READ_CHUNK_BYTES {
+            self.line_buf.shrink_to(READ_CHUNK_BYTES);
         }
-        let mut fds = [
-            PollFd::new(&*stream, PollFlags::IN),
-            PollFd::new(stop_fd, PollFlags::IN),
-        ];
-        match poll(&mut fds, None) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(_) => return false,
-        }
-
-        if fds[1].revents().contains(PollFlags::IN) || stop.load(Ordering::Acquire) {
-            return true;
-        }
-
-        let revents = fds[0].revents();
-        if revents.contains(PollFlags::IN) || revents.contains(PollFlags::HUP) {
-            match drain_nonblocking_socket(stream, sender, chunk, line_buf, discarding_oversized) {
-                DrainStatus::Continue => {
-                    if revents.contains(PollFlags::HUP) || revents.contains(PollFlags::ERR) {
-                        return false;
-                    }
-                }
-                DrainStatus::EofOrError => return false,
-                DrainStatus::ReceiverClosed => return true,
-            }
-        } else if revents.contains(PollFlags::ERR) || revents.contains(PollFlags::NVAL) {
-            return false;
-        }
+        self.discarding_oversized = false;
     }
-}
 
-/// Fallback loop used only if `eventfd(2)` could not be allocated.
-fn pump_stream_fallback(
-    stream: &mut UnixStream,
-    stop: &AtomicBool,
-    sender: &calloop::channel::Sender<HyprlandEvent>,
-    chunk: &mut [u8; READ_CHUNK_BYTES],
-    line_buf: &mut Vec<u8>,
-    discarding_oversized: &mut bool,
-) -> bool {
-    let timeout = duration_to_timespec(Duration::from_millis(250));
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let mut fds = [PollFd::new(&*stream, PollFlags::IN)];
-        match poll(&mut fds, Some(&timeout)) {
-            Ok(0) => continue,
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(_) => return false,
-        }
-        match drain_nonblocking_socket(stream, sender, chunk, line_buf, discarding_oversized) {
-            DrainStatus::Continue => {}
-            DrainStatus::EofOrError => return false,
-            DrainStatus::ReceiverClosed => return true,
-        }
-    }
-}
-
-enum DrainStatus {
-    Continue,
-    EofOrError,
-    ReceiverClosed,
-}
-
-fn drain_nonblocking_socket(
-    stream: &mut UnixStream,
-    sender: &calloop::channel::Sender<HyprlandEvent>,
-    chunk: &mut [u8; READ_CHUNK_BYTES],
-    line_buf: &mut Vec<u8>,
-    discarding_oversized: &mut bool,
-) -> DrainStatus {
-    loop {
-        match stream.read(chunk) {
-            Ok(0) => {
-                if !*discarding_oversized && !line_buf.is_empty() {
-                    let closed = emit_line_bytes(line_buf, sender);
-                    line_buf.clear();
-                    if closed {
-                        return DrainStatus::ReceiverClosed;
-                    }
+    /// Processes a freshly read chunk of bytes, using a zero-copy fast path whenever a complete
+    /// line arrives in `remaining` with an empty carry-over `line_buf`.
+    fn feed(
+        &mut self,
+        mut remaining: &[u8],
+        emit: &mut dyn FnMut(Self::Event) -> bool,
+    ) -> FeedOutcome {
+        while !remaining.is_empty() {
+            if self.discarding_oversized {
+                if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
+                    remaining = &remaining[nl + 1..];
+                    self.discarding_oversized = false;
+                } else {
+                    break;
                 }
-                return DrainStatus::EofOrError;
+                continue;
             }
-            Ok(n) => {
-                if consume_chunk(&chunk[..n], line_buf, discarding_oversized, sender) {
-                    return DrainStatus::ReceiverClosed;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return DrainStatus::Continue;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return DrainStatus::EofOrError,
-        }
-    }
-}
 
-/// Processes a freshly read chunk of bytes, using a zero-copy fast path whenever a complete line
-/// arrives in `data` with an empty carry-over `line_buf`. Returns `true` if `sender` closed.
-fn consume_chunk(
-    mut remaining: &[u8],
-    line_buf: &mut Vec<u8>,
-    discarding_oversized: &mut bool,
-    sender: &calloop::channel::Sender<HyprlandEvent>,
-) -> bool {
-    while !remaining.is_empty() {
-        if *discarding_oversized {
             if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
+                let segment = &remaining[..nl];
                 remaining = &remaining[nl + 1..];
-                *discarding_oversized = false;
+
+                if self.line_buf.is_empty() {
+                    if segment.len() <= MAX_EVENT_LINE_BYTES && emit_line_bytes(segment, emit) {
+                        return FeedOutcome::ReceiverClosed;
+                    }
+                } else if self.line_buf.len() + segment.len() <= MAX_EVENT_LINE_BYTES {
+                    self.line_buf.extend_from_slice(segment);
+                    let closed = emit_line_bytes(&self.line_buf, emit);
+                    self.line_buf.clear();
+                    if closed {
+                        return FeedOutcome::ReceiverClosed;
+                    }
+                } else {
+                    self.line_buf.clear();
+                }
             } else {
+                if self.line_buf.len() + remaining.len() > MAX_EVENT_LINE_BYTES {
+                    self.line_buf.clear();
+                    if self.line_buf.capacity() > READ_CHUNK_BYTES {
+                        self.line_buf.shrink_to(READ_CHUNK_BYTES);
+                    }
+                    self.discarding_oversized = true;
+                } else {
+                    self.line_buf.extend_from_slice(remaining);
+                }
                 break;
             }
-            continue;
         }
-
-        if let Some(nl) = remaining.iter().position(|&b| b == b'\n') {
-            let segment = &remaining[..nl];
-            remaining = &remaining[nl + 1..];
-
-            if line_buf.is_empty() {
-                if segment.len() <= MAX_EVENT_LINE_BYTES && emit_line_bytes(segment, sender) {
-                    return true;
-                }
-            } else if line_buf.len() + segment.len() <= MAX_EVENT_LINE_BYTES {
-                line_buf.extend_from_slice(segment);
-                let closed = emit_line_bytes(line_buf, sender);
-                line_buf.clear();
-                if closed {
-                    return true;
-                }
-            } else {
-                line_buf.clear();
-            }
-        } else {
-            if line_buf.len() + remaining.len() > MAX_EVENT_LINE_BYTES {
-                line_buf.clear();
-                if line_buf.capacity() > READ_CHUNK_BYTES {
-                    line_buf.shrink_to(READ_CHUNK_BYTES);
-                }
-                *discarding_oversized = true;
-            } else {
-                line_buf.extend_from_slice(remaining);
-            }
-            break;
-        }
+        FeedOutcome::Continue
     }
-    false
+
+    fn finish(&mut self, emit: &mut dyn FnMut(Self::Event) -> bool) -> bool {
+        if !self.discarding_oversized && !self.line_buf.is_empty() {
+            let closed = emit_line_bytes(&self.line_buf, emit);
+            self.line_buf.clear();
+            return closed;
+        }
+        false
+    }
 }
 
-fn emit_line_bytes(bytes: &[u8], sender: &calloop::channel::Sender<HyprlandEvent>) -> bool {
+fn emit_line_bytes(bytes: &[u8], emit: &mut dyn FnMut(HyprlandEvent) -> bool) -> bool {
     let Ok(line) = std::str::from_utf8(bytes) else {
         return false;
     };
     if let Some(ev) = parse_event_line(line) {
-        return sender.send(ev).is_err();
+        return emit(ev);
     }
     false
-}
-
-/// Waits up to `delay_ms` for reconnect, returning `true` immediately if stop is signalled.
-fn wait_reconnect_or_stop(stop_fd: Option<&OwnedFd>, stop: &AtomicBool, delay_ms: u64) -> bool {
-    if stop.load(Ordering::Acquire) {
-        return true;
-    }
-    match stop_fd {
-        Some(fd) => {
-            let ts = duration_to_timespec(Duration::from_millis(delay_ms));
-            let mut fds = [PollFd::new(fd, PollFlags::IN)];
-            let _ = poll(&mut fds, Some(&ts));
-            stop.load(Ordering::Acquire) || fds[0].revents().contains(PollFlags::IN)
-        }
-        None => {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            stop.load(Ordering::Acquire)
-        }
-    }
-}
-
-fn duration_to_timespec(d: Duration) -> Timespec {
-    Timespec {
-        tv_sec: d.as_secs() as i64,
-        tv_nsec: i64::from(d.subsec_nanos()),
-    }
 }
 
 #[cfg(test)]
@@ -572,7 +366,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -581,7 +375,7 @@ mod tests {
     #[test]
     fn parses_extended_hyprland_socket2_events_including_edge_cases() {
         assert_eq!(
-            parse_event_line("windowtitlev2>>0x55a,Mozilla Firefox, Work"),
+            HyprlandEvent::parse_line("windowtitlev2>>0x55a,Mozilla Firefox, Work"),
             Some(HyprlandEvent::WindowTitleV2 {
                 address: "0x55a".to_owned(),
                 title: "Mozilla Firefox, Work".to_owned(),

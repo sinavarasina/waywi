@@ -8,18 +8,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::asset::AssetId;
 use crate::error::{Result, WaywiError};
 
 /// Maximum encoded sound file size (16 MiB) for bounded loading.
-const MAX_SOUND_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_SOUND_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Default decoded PCM cache budget inside [`super::player::AudioPlayer`] (8 MiB).
+pub(crate) const DEFAULT_SOUND_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// Standard mixer output rate shared by native PCM and rodio playback.
 pub(crate) const MIXER_SAMPLE_RATE: u32 = 48_000;
+
+/// Unique monotonic identifier referencing a cached sound inside [`super::player::AudioPlayer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SoundId(pub u64);
+
+impl SoundId {
+    /// Creates a [`SoundId`] from a raw monotonic identifier.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the underlying numeric identifier.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// `Copy` handle referencing a decoded audio buffer cached inside [`super::player::AudioPlayer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SoundAsset {
-    pub id: AssetId,
+    pub id: SoundId,
     pub duration: Duration,
 }
 
@@ -37,6 +56,41 @@ pub enum SoundPreset {
     Notification,
     /// Dual-pulse warning tone (~220 ms).
     Warning,
+}
+
+/// Sound playback trigger accepted by [`super::player::AudioPlayer::play_trigger`] and
+/// declarative UI sound hooks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SoundPlay {
+    Asset { asset: SoundAsset, volume: f32 },
+    Preset { preset: SoundPreset, volume: f32 },
+}
+
+impl From<SoundAsset> for SoundPlay {
+    fn from(asset: SoundAsset) -> Self {
+        Self::Asset { asset, volume: 1.0 }
+    }
+}
+
+impl From<(SoundAsset, f32)> for SoundPlay {
+    fn from((asset, volume): (SoundAsset, f32)) -> Self {
+        Self::Asset { asset, volume }
+    }
+}
+
+impl From<SoundPreset> for SoundPlay {
+    fn from(preset: SoundPreset) -> Self {
+        Self::Preset {
+            preset,
+            volume: 1.0,
+        }
+    }
+}
+
+impl From<(SoundPreset, f32)> for SoundPlay {
+    fn from((preset, volume): (SoundPreset, f32)) -> Self {
+        Self::Preset { preset, volume }
+    }
 }
 
 /// Normalized interleaved floating-point PCM audio buffer (`[-1.0, 1.0]`).
@@ -79,9 +133,7 @@ impl SoundData {
     /// Reads and decodes a sound file from disk (WAV natively; OGG/MP3/FLAC/WAV with `audio-playback`).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let meta = fs::metadata(path).map_err(|e| {
-            WaywiError::AudioError(format!("failed to stat sound {}: {e}", path.display()))
-        })?;
+        let meta = fs::metadata(path)?;
         if meta.len() > MAX_SOUND_FILE_BYTES {
             return Err(WaywiError::AudioError(format!(
                 "sound {} exceeds max size ({} > {MAX_SOUND_FILE_BYTES} bytes)",
@@ -89,9 +141,7 @@ impl SoundData {
                 meta.len()
             )));
         }
-        let bytes = fs::read(path).map_err(|e| {
-            WaywiError::AudioError(format!("failed to read sound {}: {e}", path.display()))
-        })?;
+        let bytes = fs::read(path)?;
         let hint = path.extension().and_then(|e| e.to_str());
         Self::from_vec_with_hint(bytes, hint)
     }
@@ -120,7 +170,7 @@ impl SoundData {
         }
     }
 
-    fn from_vec_with_hint(bytes: Vec<u8>, hint: Option<&str>) -> Result<Self> {
+    pub(crate) fn from_vec_with_hint(bytes: Vec<u8>, hint: Option<&str>) -> Result<Self> {
         if is_riff_wave(&bytes) {
             return Self::from_wav_bytes(&bytes);
         }
@@ -397,7 +447,7 @@ pub fn resolve_sound_theme_path(name: &str, theme_override: Option<&str>) -> Opt
 /// Returns standard XDG sound theme base directories.
 #[must_use]
 pub fn default_sound_dirs() -> Vec<PathBuf> {
-    crate::desktop::xdg::xdg_data_dirs_for("sounds")
+    crate::desktop::XdgBaseDirs::from_env().sound_dirs()
 }
 
 /// Searches explicit sound theme directories for a sound name respecting `index.theme` inheritance.
@@ -546,37 +596,132 @@ impl PolyphonicMixer {
     }
 }
 
-/// Shared asset map tracking decoded sounds by hash inside `AudioPlayer`.
-#[derive(Default)]
+/// Domain-separated lookup key inside [`SoundAssetStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SoundCacheKey {
+    ContentHash(u64),
+    Preset(SoundPreset),
+}
+
+struct CachedSoundEntry {
+    key: SoundCacheKey,
+    asset: SoundAsset,
+    stereo_48k: Arc<[f32]>,
+    byte_len: usize,
+    last_used: u64,
+}
+
+/// Shared asset store tracking decoded 48 kHz stereo PCM buffers with LRU byte-budget eviction.
 pub(crate) struct SoundAssetStore {
     next_id: u64,
-    by_hash: HashMap<u64, SoundAsset>,
-    buffers: HashMap<AssetId, Arc<[f32]>>,
+    access_clock: u64,
+    max_cache_bytes: usize,
+    cached_bytes: usize,
+    by_key: HashMap<SoundCacheKey, SoundId>,
+    entries: HashMap<SoundId, CachedSoundEntry>,
+}
+
+impl Default for SoundAssetStore {
+    fn default() -> Self {
+        Self::with_cache_limit(DEFAULT_SOUND_CACHE_BYTES)
+    }
 }
 
 impl SoundAssetStore {
-    pub(crate) fn insert_sound_data(&mut self, hash: u64, data: &SoundData) -> SoundAsset {
-        if let Some(&existing) = self.by_hash.get(&hash) {
-            return existing;
+    pub(crate) fn with_cache_limit(max_cache_bytes: usize) -> Self {
+        Self {
+            next_id: 0,
+            access_clock: 0,
+            max_cache_bytes,
+            cached_bytes: 0,
+            by_key: HashMap::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn insert_sound_data(&mut self, key: SoundCacheKey, data: &SoundData) -> SoundAsset {
+        if let Some(&existing_id) = self.by_key.get(&key)
+            && let Some(entry) = self.entries.get_mut(&existing_id)
+        {
+            self.access_clock += 1;
+            entry.last_used = self.access_clock;
+            return entry.asset;
         }
         self.next_id += 1;
-        let id = AssetId::new(self.next_id);
+        let id = SoundId::new(self.next_id);
         let asset = SoundAsset {
             id,
             duration: data.duration(),
         };
-        let stereo = data.to_stereo_48k_arc();
-        self.by_hash.insert(hash, asset);
-        self.buffers.insert(id, stereo);
+        let stereo_48k = data.to_stereo_48k_arc();
+        let byte_len = stereo_48k.len() * std::mem::size_of::<f32>();
+        self.access_clock += 1;
+        let last_used = self.access_clock;
+
+        self.by_key.insert(key, id);
+        self.entries.insert(
+            id,
+            CachedSoundEntry {
+                key,
+                asset,
+                stereo_48k,
+                byte_len,
+                last_used,
+            },
+        );
+        self.cached_bytes = self.cached_bytes.saturating_add(byte_len);
+        self.evict_over_budget(id);
         asset
     }
 
-    pub(crate) fn get_by_hash(&self, hash: u64) -> Option<SoundAsset> {
-        self.by_hash.get(&hash).copied()
+    pub(crate) fn get_by_key(&mut self, key: SoundCacheKey) -> Option<SoundAsset> {
+        let id = *self.by_key.get(&key)?;
+        let entry = self.entries.get_mut(&id)?;
+        self.access_clock += 1;
+        entry.last_used = self.access_clock;
+        Some(entry.asset)
     }
 
-    pub(crate) fn get_stereo(&self, id: AssetId) -> Option<Arc<[f32]>> {
-        self.buffers.get(&id).cloned()
+    pub(crate) fn get_stereo(&mut self, id: SoundId) -> Option<Arc<[f32]>> {
+        let entry = self.entries.get_mut(&id)?;
+        self.access_clock += 1;
+        entry.last_used = self.access_clock;
+        Some(Arc::clone(&entry.stereo_48k))
+    }
+
+    pub(crate) fn remove(&mut self, id: SoundId) -> bool {
+        let Some(entry) = self.entries.remove(&id) else {
+            return false;
+        };
+        self.by_key.remove(&entry.key);
+        self.cached_bytes = self.cached_bytes.saturating_sub(entry.byte_len);
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.by_key.clear();
+        self.cached_bytes = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    fn evict_over_budget(&mut self, keep_id: SoundId) {
+        while self.cached_bytes > self.max_cache_bytes && self.entries.len() > 1 {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|&(&id, _)| id != keep_id)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(&id, _)| id);
+            let Some(victim_id) = victim else {
+                break;
+            };
+            self.remove(victim_id);
+        }
     }
 }
 
@@ -636,6 +781,71 @@ mod tests {
         mixer.push(Arc::from([0.5f32, 0.5]), 1.0);
         mixer.clear();
         assert!(!mixer.mix_f32(&mut out));
+    }
+
+    #[test]
+    fn from_file_propagates_io_error_directly() {
+        let missing = env::temp_dir().join(format!(
+            "waywi-nonexistent-sound-{}.wav",
+            std::process::id()
+        ));
+        let err = SoundData::from_file(&missing).expect_err("missing file must error");
+        assert!(
+            matches!(err, WaywiError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound),
+            "expected WaywiError::Io(NotFound), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sound_play_conversions_and_store_eviction_work() {
+        let asset = SoundAsset {
+            id: SoundId::new(7),
+            duration: Duration::from_millis(50),
+        };
+        assert_eq!(asset.id.get(), 7);
+        assert_eq!(
+            SoundPlay::from(asset),
+            SoundPlay::Asset { asset, volume: 1.0 }
+        );
+        assert_eq!(
+            SoundPlay::from((asset, 0.5)),
+            SoundPlay::Asset { asset, volume: 0.5 }
+        );
+        assert_eq!(
+            SoundPlay::from(SoundPreset::Click),
+            SoundPlay::Preset {
+                preset: SoundPreset::Click,
+                volume: 1.0,
+            }
+        );
+        assert_eq!(
+            SoundPlay::from((SoundPreset::Hover, 0.25)),
+            SoundPlay::Preset {
+                preset: SoundPreset::Hover,
+                volume: 0.25,
+            }
+        );
+
+        let a_data = SoundData::from_pcm_f32(MIXER_SAMPLE_RATE, 2, vec![0.1_f32; 20]).unwrap();
+        let b_data = SoundData::from_pcm_f32(MIXER_SAMPLE_RATE, 2, vec![0.2_f32; 20]).unwrap();
+        let c_data = SoundData::from_pcm_f32(MIXER_SAMPLE_RATE, 2, vec![0.3_f32; 20]).unwrap();
+        // Each buffer is 20 * 4 = 80 bytes; allow at most 160 bytes (2 entries).
+        let mut store = SoundAssetStore::with_cache_limit(160);
+        let a = store.insert_sound_data(SoundCacheKey::ContentHash(1), &a_data);
+        let b = store.insert_sound_data(SoundCacheKey::ContentHash(2), &b_data);
+        // Touch `a` so `b` becomes least-recently-used.
+        assert!(store.get_stereo(a.id).is_some());
+        let c = store.insert_sound_data(SoundCacheKey::ContentHash(3), &c_data);
+        assert!(store.get_stereo(a.id).is_some());
+        assert!(store.get_stereo(b.id).is_none());
+        assert!(store.get_stereo(c.id).is_some());
+        assert_eq!(store.cached_bytes(), 160);
+        assert!(store.remove(a.id));
+        assert!(!store.remove(a.id));
+        assert_eq!(store.cached_bytes(), 80);
+        store.clear();
+        assert_eq!(store.cached_bytes(), 0);
+        assert!(store.get_stereo(c.id).is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use wayland_client::Connection;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use crate::asset::AssetCache;
+use crate::asset::{AssetCache, AssetId};
 use crate::error::Result;
 use crate::geometry::{BufferPx, BufferRect, LogicalSize, ScaleFactor};
 use crate::input::NodeId;
@@ -41,11 +41,18 @@ pub(crate) trait RenderBackend {
     /// Drops cached intermediate pixmaps/textures owned by retired canvas/text nodes.
     fn drop_canvas_cache_for(&mut self, node_ids: &[NodeId]);
 
+    /// Drops any backend textures cached for `asset_id` (e.g. after pixel eviction/unload).
+    fn evict_asset(&mut self, _asset_id: AssetId) {}
+
+    /// Trims transient scratch buffers and stale renderer caches.
+    fn trim_memory(&mut self) {}
+
     /// Measures wrapped/aligned text extents in logical coordinates for layout passes.
     fn measure_text(
         &mut self,
         content: &SharedStr,
         style: TextMeasureStyle<'_>,
+        scale: ScaleFactor,
         frame_seq: u64,
     ) -> LogicalSize;
 

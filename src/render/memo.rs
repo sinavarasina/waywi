@@ -15,12 +15,14 @@ pub(crate) struct MemoEntry {
     pub(crate) value: Box<dyn Any>,
     pub(crate) eq_fn: fn(&dyn Any, &dyn Any) -> bool,
     pub(crate) last_seen_frame: u64,
+    pub(crate) children: Vec<MemoId>,
 }
 
 #[derive(Default)]
 pub(crate) struct MemoStore {
     pub(crate) entries: HashMap<MemoId, MemoEntry>,
     pub(crate) frame_seq: u64,
+    active_stack: Vec<(MemoId, Vec<MemoId>)>,
 }
 
 impl MemoStore {
@@ -29,33 +31,90 @@ impl MemoStore {
         id: MemoId,
         dep: &D,
     ) -> bool {
+        if let Some((_, parent_children)) = self.active_stack.last_mut()
+            && !parent_children.contains(&id)
+        {
+            parent_children.push(id);
+        }
+
         if let Some(existing) = self.entries.get_mut(&id)
             && existing.type_id == TypeId::of::<D>()
             && (existing.eq_fn)(existing.value.as_ref(), dep)
         {
-            existing.last_seen_frame = self.frame_seq;
+            self.mark_subtree_seen(id);
             return true;
         }
+
         fn eq_impl<T: PartialEq + 'static>(a: &dyn Any, b: &dyn Any) -> bool {
             a.downcast_ref::<T>()
                 .zip(b.downcast_ref::<T>())
                 .is_some_and(|(x, y)| x == y)
         }
-        self.entries.insert(
-            id,
-            MemoEntry {
-                type_id: TypeId::of::<D>(),
-                value: Box::new(dep.clone()),
-                eq_fn: eq_impl::<D>,
-                last_seen_frame: self.frame_seq,
-            },
-        );
+
+        let seq = self.frame_seq;
+        if let Some(existing) = self.entries.get_mut(&id) {
+            if let Some(slot) = existing.value.downcast_mut::<D>() {
+                slot.clone_from(dep);
+            } else {
+                existing.type_id = TypeId::of::<D>();
+                existing.value = Box::new(dep.clone());
+                existing.eq_fn = eq_impl::<D>;
+            }
+            existing.last_seen_frame = seq;
+            existing.children.clear();
+        } else {
+            self.entries.insert(
+                id,
+                MemoEntry {
+                    type_id: TypeId::of::<D>(),
+                    value: Box::new(dep.clone()),
+                    eq_fn: eq_impl::<D>,
+                    last_seen_frame: seq,
+                    children: Vec::new(),
+                },
+            );
+        }
         false
+    }
+
+    fn mark_subtree_seen(&mut self, root: MemoId) {
+        let seq = self.frame_seq;
+        let mut stack = vec![root];
+        while let Some(cur) = stack.pop() {
+            if let Some(entry) = self.entries.get_mut(&cur) {
+                if entry.last_seen_frame == seq && cur != root {
+                    continue;
+                }
+                entry.last_seen_frame = seq;
+                stack.extend(entry.children.iter().copied());
+            }
+        }
+    }
+
+    fn push_build(&mut self, id: MemoId) {
+        self.active_stack.push((id, Vec::new()));
+    }
+
+    fn pop_build(&mut self) {
+        if let Some((id, children)) = self.active_stack.pop()
+            && !children.is_empty()
+            && let Some(entry) = self.entries.get_mut(&id)
+        {
+            entry.children = children;
+        }
     }
 
     pub(crate) fn prune_stale(&mut self) {
         let current = self.frame_seq;
         self.entries.retain(|_, v| v.last_seen_frame == current);
+        if self.entries.capacity() > (self.entries.len().saturating_mul(4)).max(32) {
+            self.entries
+                .shrink_to((self.entries.len().saturating_mul(2)).max(16));
+        }
+    }
+
+    pub(crate) fn trim(&mut self) {
+        self.entries.shrink_to_fit();
     }
 }
 
@@ -88,6 +147,7 @@ impl Drop for MemoScopeGuard {
 #[must_use]
 pub(crate) fn enter_memo_scope(store: &mut MemoStore) -> MemoScopeGuard {
     store.frame_seq += 1;
+    store.active_stack.clear();
     let prev = MEMO_CTX.with(|slot| {
         slot.borrow_mut().replace(ActiveMemoContext {
             store: store as *mut MemoStore,
@@ -105,11 +165,40 @@ pub(crate) fn set_memo_surface_hash(surface_hash: u64) {
     });
 }
 
-pub(crate) fn check_memo<D: PartialEq + Clone + 'static>(key: ElementKey, dep: &D) -> bool {
+pub(crate) struct MemoBuildGuard {
+    pushed: bool,
+}
+
+impl Drop for MemoBuildGuard {
+    fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
+        MEMO_CTX.with(|slot| {
+            let borrow = slot.borrow();
+            let Some(ref ctx) = *borrow else {
+                return;
+            };
+            // SAFETY: Identical unique-scope lifetime contract as `begin_memo_check`.
+            let store = unsafe { &mut *ctx.store };
+            store.pop_build();
+        });
+    }
+}
+
+/// Checks memoization for `(current_surface_hash, key)` against `dep`.
+///
+/// Returns `None` on a memo hit (automatically preserving all nested child memo entries for this
+/// frame), or `Some(MemoBuildGuard)` on a miss so nested memo calls inside the rebuild closure
+/// register as children until the guard drops.
+pub(crate) fn begin_memo_check<D: PartialEq + Clone + 'static>(
+    key: ElementKey,
+    dep: &D,
+) -> Option<MemoBuildGuard> {
     MEMO_CTX.with(|slot| {
         let borrow = slot.borrow();
         let Some(ref ctx) = *borrow else {
-            return false;
+            return Some(MemoBuildGuard { pushed: false });
         };
         // SAFETY: `store` points to the `MemoStore` whose unique borrow created this
         // context, and it is dereferenced only while it is the *current* context on
@@ -121,8 +210,18 @@ pub(crate) fn check_memo<D: PartialEq + Clone + 'static>(key: ElementKey, dep: &
             surface_hash: ctx.current_surface_hash,
             element_key: key,
         };
-        store.check_or_record(id, dep)
+        if store.check_or_record(id, dep) {
+            None
+        } else {
+            store.push_build(id);
+            Some(MemoBuildGuard { pushed: true })
+        }
     })
+}
+
+#[cfg(test)]
+pub(crate) fn check_memo<D: PartialEq + Clone + 'static>(key: ElementKey, dep: &D) -> bool {
+    begin_memo_check(key, dep).is_none()
 }
 
 #[cfg(test)]

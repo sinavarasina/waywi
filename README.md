@@ -31,11 +31,15 @@ impl Application for CounterApp {
     type State = State;
     type Message = Msg;
 
-    fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         Ok(State { count: 0 })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             Msg::Inc => state.count += 1,
             Msg::Quit => ctx.quit(),
@@ -47,7 +51,7 @@ impl Application for CounterApp {
         let mut surfaces = Surfaces::new();
         surfaces.push(
             Surface::floating("counter", Output::Primary)
-                .size(Size::px(240.logical_px(), 96.logical_px()))
+                .size((240.logical_px(), 96.logical_px()))
                 .keyboard_interactivity(KeyboardInteractivity::OnDemand)
                 .on_key(|ev| (ev.key == Key::Escape).then_some(Msg::Quit))
                 .child(
@@ -71,9 +75,14 @@ impl Application for CounterApp {
 }
 
 fn main() -> Result<()> {
-    App::new().name("counter").run::<CounterApp>()
+    App::new()
+        .name("counter")
+        .memory(MemoryConfig::balanced())
+        .run::<CounterApp>()
 }
 ```
+
+Configure buffer retention and cache limits with `MemoryConfig::low_memory()`, `MemoryConfig::balanced()`, or `MemoryConfig::high_throughput()` on `App::memory(...)` (see [Memory Configuration](docs/performance.md#memory-configuration)), and call `ctx.trim_memory()` to reclaim idle caches immediately.
 
 ## Dependencies
 

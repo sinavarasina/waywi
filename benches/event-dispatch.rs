@@ -22,11 +22,15 @@ impl<const ROWS: usize, const COLS: usize, const TILE_PX: u32> Application
     type State = DispatchState;
     type Message = DispatchMsg;
 
-    fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         Ok(DispatchState { clicks: 0 })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, _ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        _ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             DispatchMsg::TileClicked(idx) => {
                 state.clicks = state.clicks.wrapping_add(u64::from(idx) + 1);
@@ -53,10 +57,7 @@ impl<const ROWS: usize, const COLS: usize, const TILE_PX: u32> Application
                 row = row.child(
                     Rect::new()
                         .key(("hit", idx))
-                        .size(Size::px(
-                            (TILE_PX as f32).logical_px(),
-                            (TILE_PX as f32).logical_px(),
-                        ))
+                        .size(((TILE_PX as f32).logical_px(), (TILE_PX as f32).logical_px()))
                         .fill(if active {
                             Color::rgb(163, 190, 140)
                         } else {
@@ -76,7 +77,7 @@ impl<const ROWS: usize, const COLS: usize, const TILE_PX: u32> Application
         let mut surfaces = Surfaces::new();
         surfaces.push(
             Surface::floating("board", Output::Primary)
-                .size(Size::px(w.logical_px(), h.logical_px()))
+                .size((w.logical_px(), h.logical_px()))
                 .child(col),
         );
         surfaces

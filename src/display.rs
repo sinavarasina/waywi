@@ -20,7 +20,7 @@ impl OutputId {
 
 /// Output transform reported by the Wayland compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Transform {
+pub enum OutputTransform {
     #[default]
     Normal,
     Rotate90,
@@ -87,7 +87,7 @@ pub struct OutputInfo {
     pub logical_size: LogicalSize,
     pub physical_size_mm: (i32, i32),
     pub scale_factor: ScaleFactor,
-    pub transform: Transform,
+    pub transform: OutputTransform,
     pub refresh_mhz: i32,
 }
 
@@ -103,7 +103,7 @@ impl Default for OutputInfo {
             logical_size: LogicalSize::new(LogicalPx(1920.0), LogicalPx(1080.0)),
             physical_size_mm: (0, 0),
             scale_factor: ScaleFactor::ONE,
-            transform: Transform::Normal,
+            transform: OutputTransform::Normal,
             refresh_mhz: 60_000,
         }
     }

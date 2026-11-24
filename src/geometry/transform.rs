@@ -1,5 +1,5 @@
 use super::primitives::Point;
-use super::rect::Rect;
+use super::rect::Bounds;
 use super::units::LogicalPx;
 
 /// Element-local 2D transform around a normalized pivot (default `(0.5, 0.5)` = center) plus
@@ -107,7 +107,7 @@ impl Transform {
     /// Resolves this transform's logical pivot point inside `bounds`.
     #[inline]
     #[must_use]
-    pub fn pivot_point(&self, bounds: Rect) -> Point {
+    pub fn pivot_point(&self, bounds: Bounds) -> Point {
         Point::new(
             LogicalPx(bounds.x.0 + bounds.width.0 * self.pivot_x),
             LogicalPx(bounds.y.0 + bounds.height.0 * self.pivot_y),
@@ -218,7 +218,7 @@ impl Affine2D {
 
     /// Computes the axis-aligned bounding box of `rect` transformed by `self`.
     #[must_use]
-    pub fn transform_rect(&self, rect: Rect) -> Rect {
+    pub fn transform_rect(&self, rect: Bounds) -> Bounds {
         let p0 = self.transform_point(Point::new(rect.x, rect.y));
         let p1 = self.transform_point(Point::new(rect.x + rect.width, rect.y));
         let p2 = self.transform_point(Point::new(rect.x, rect.y + rect.height));
@@ -227,6 +227,6 @@ impl Affine2D {
         let max_x = p0.x.max(p1.x).max(p2.x).max(p3.x);
         let min_y = p0.y.min(p1.y).min(p2.y).min(p3.y);
         let max_y = p0.y.max(p1.y).max(p2.y).max(p3.y);
-        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+        Bounds::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }

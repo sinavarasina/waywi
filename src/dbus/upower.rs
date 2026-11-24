@@ -6,14 +6,12 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{DbusClient, DbusSharedBus};
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
-use super::zvariant_helpers::{
-    dict_bool, dict_f64, dict_i64, dict_str, dict_u32, get_all_async, get_all_blocking,
-};
+use super::zvariant_helpers::{dict_bool, dict_f64, dict_i64, dict_str, dict_u32, get_all};
 
 const UPOWER_DEST: &str = "org.freedesktop.UPower";
 const UPOWER_PATH: &str = "/org/freedesktop/UPower";
@@ -177,18 +175,28 @@ impl Dbus {
     pub fn upower<M: 'static>(map: impl Fn(UPowerSnapshot) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusUPower {
-                key: "dbus:upower".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Reads the current [`UPowerSnapshot`] from the system bus.
-    pub fn upower_snapshot(&self) -> Result<UPowerSnapshot> {
-        let conn = self.connection(DbusBus::System)?;
-        read_upower_snapshot_blocking(&conn)
+/// Zero-cost domain handle for UPower battery and peripheral power queries.
+#[derive(Clone, Copy)]
+pub struct UPowerClient<'a>(pub(super) &'a DbusClient);
+
+impl UPowerClient<'_> {
+    /// Returns the latest cached [`UPowerSnapshot`] from an active [`Dbus::upower`] subscription
+    /// without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshot(&self) -> Option<UPowerSnapshot> {
+        self.0.cache.upower.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Queries the system bus synchronously for the current [`UPowerSnapshot`].
+    pub fn snapshot_blocking(&self) -> Result<UPowerSnapshot> {
+        let conn = self.0.async_connection(DbusBus::System)?;
+        futures_lite::future::block_on(read_upower_snapshot(&conn))
     }
 }
 
@@ -203,53 +211,12 @@ pub(crate) fn spawn_upower_worker(
         None,
         sender,
         shared,
-        |conn| async move { read_upower_snapshot_async(&conn).await },
+        |conn| async move { read_upower_snapshot(&conn).await.ok() },
     )
 }
 
-fn read_upower_snapshot_blocking(conn: &zbus::blocking::Connection) -> Result<UPowerSnapshot> {
-    let root = get_all_blocking(conn, UPOWER_DEST, UPOWER_PATH, UPOWER_IFACE)?;
-    let reply = conn
-        .call_method(
-            Some(UPOWER_DEST),
-            UPOWER_PATH,
-            Some(UPOWER_IFACE),
-            "EnumerateDevices",
-            &(),
-        )
-        .map_err(|e| WaywiError::DbusError(format!("UPower.EnumerateDevices failed: {e}")))?;
-    let mut paths: Vec<OwnedObjectPath> = reply
-        .body()
-        .deserialize()
-        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-
-    let mut devices = Vec::with_capacity(paths.len() + 1);
-    if let Ok(display) = get_all_blocking(
-        conn,
-        UPOWER_DEST,
-        UPOWER_DISPLAY_DEVICE_PATH,
-        UPOWER_DEVICE_IFACE,
-    ) {
-        devices.push(parse_upower_device(
-            UPOWER_DISPLAY_DEVICE_PATH,
-            &display,
-            true,
-        ));
-    }
-    for path in paths.drain(..).take(64) {
-        let p = path.as_str();
-        if p == UPOWER_DISPLAY_DEVICE_PATH {
-            continue;
-        }
-        if let Ok(props) = get_all_blocking(conn, UPOWER_DEST, p, UPOWER_DEVICE_IFACE) {
-            devices.push(parse_upower_device(p, &props, false));
-        }
-    }
-    Ok(assemble_upower_snapshot(&root, devices))
-}
-
-async fn read_upower_snapshot_async(conn: &zbus::Connection) -> Option<UPowerSnapshot> {
-    let root = get_all_async(conn, UPOWER_DEST, UPOWER_PATH, UPOWER_IFACE).await?;
+async fn read_upower_snapshot(conn: &zbus::Connection) -> Result<UPowerSnapshot> {
+    let root = get_all(conn, UPOWER_DEST, UPOWER_PATH, UPOWER_IFACE).await?;
     let reply = conn
         .call_method(
             Some(UPOWER_DEST),
@@ -259,11 +226,14 @@ async fn read_upower_snapshot_async(conn: &zbus::Connection) -> Option<UPowerSna
             &(),
         )
         .await
-        .ok()?;
-    let paths: Vec<OwnedObjectPath> = reply.body().deserialize().ok()?;
+        .map_err(|e| WaywiError::DbusError(format!("UPower.EnumerateDevices failed: {e}")))?;
+    let paths: Vec<OwnedObjectPath> = reply
+        .body()
+        .deserialize()
+        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
 
     let mut devices = Vec::with_capacity(paths.len() + 1);
-    if let Some(display) = get_all_async(
+    if let Ok(display) = get_all(
         conn,
         UPOWER_DEST,
         UPOWER_DISPLAY_DEVICE_PATH,
@@ -282,11 +252,11 @@ async fn read_upower_snapshot_async(conn: &zbus::Connection) -> Option<UPowerSna
         if p == UPOWER_DISPLAY_DEVICE_PATH {
             continue;
         }
-        if let Some(props) = get_all_async(conn, UPOWER_DEST, p, UPOWER_DEVICE_IFACE).await {
+        if let Ok(props) = get_all(conn, UPOWER_DEST, p, UPOWER_DEVICE_IFACE).await {
             devices.push(parse_upower_device(p, &props, false));
         }
     }
-    Some(assemble_upower_snapshot(&root, devices))
+    Ok(assemble_upower_snapshot(&root, devices))
 }
 
 fn assemble_upower_snapshot(

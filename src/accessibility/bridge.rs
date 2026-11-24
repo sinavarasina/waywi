@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate};
@@ -32,11 +33,13 @@ pub(crate) fn atspi_runtime_available() -> bool {
 
 struct WaywiActivation {
     latest_tree: Arc<Mutex<Option<TreeUpdate>>>,
+    is_active: Arc<AtomicBool>,
     wakeup: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl ActivationHandler for WaywiActivation {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+        self.is_active.store(true, Ordering::Relaxed);
         let initial = self.latest_tree.lock().ok().and_then(|g| g.clone());
         if initial.is_none() {
             (self.wakeup)();
@@ -59,10 +62,18 @@ impl ActionHandler for WaywiActionHandler {
     }
 }
 
-struct WaywiDeactivation;
+struct WaywiDeactivation {
+    latest_tree: Arc<Mutex<Option<TreeUpdate>>>,
+    is_active: Arc<AtomicBool>,
+}
 
 impl DeactivationHandler for WaywiDeactivation {
-    fn deactivate_accessibility(&mut self) {}
+    fn deactivate_accessibility(&mut self) {
+        self.is_active.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = self.latest_tree.lock() {
+            *guard = None;
+        }
+    }
 }
 
 /// Runtime AT-SPI2 bridge publishing AccessKit trees and forwarding screen-reader actions.
@@ -70,6 +81,7 @@ pub(crate) struct AccessibilityBridge {
     adapter: Adapter,
     pub(crate) tree_state: AccessibilityTreeState,
     latest_tree: Arc<Mutex<Option<TreeUpdate>>>,
+    is_active: Arc<AtomicBool>,
     pending_actions: Arc<Mutex<VecDeque<ActionRequest>>>,
     last_focus_state: Option<bool>,
     app_name: String,
@@ -79,22 +91,29 @@ impl AccessibilityBridge {
     pub(crate) fn new(app_name: String, wakeup: impl Fn() + Send + Sync + 'static) -> Self {
         let wakeup_arc: Arc<dyn Fn() + Send + Sync> = Arc::new(wakeup);
         let latest_tree = Arc::new(Mutex::new(None));
+        let is_active = Arc::new(AtomicBool::new(false));
         let pending_actions = Arc::new(Mutex::new(VecDeque::new()));
 
         let activation = WaywiActivation {
             latest_tree: Arc::clone(&latest_tree),
+            is_active: Arc::clone(&is_active),
             wakeup: Arc::clone(&wakeup_arc),
         };
         let actions = WaywiActionHandler {
             pending: Arc::clone(&pending_actions),
             wakeup: wakeup_arc,
         };
-        let adapter = Adapter::new(activation, actions, WaywiDeactivation);
+        let deactivation = WaywiDeactivation {
+            latest_tree: Arc::clone(&latest_tree),
+            is_active: Arc::clone(&is_active),
+        };
+        let adapter = Adapter::new(activation, actions, deactivation);
 
         Self {
             adapter,
             tree_state: AccessibilityTreeState::default(),
             latest_tree,
+            is_active,
             pending_actions,
             last_focus_state: None,
             app_name,
@@ -107,6 +126,9 @@ impl AccessibilityBridge {
         surfaces: &HashMap<RetainedSurfaceKey, RetainedSurface<M>>,
         focused_surface: Option<RetainedSurfaceKey>,
     ) {
+        if !self.is_active.load(Ordering::Relaxed) {
+            return;
+        }
         let update = build_tree_update(
             &mut self.tree_state,
             surfaces,

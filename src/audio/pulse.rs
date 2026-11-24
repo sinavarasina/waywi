@@ -15,13 +15,91 @@ use pa::volume::{ChannelVolumes, Volume, VolumeDB, VolumeLinear};
 use crate::error::{Result, WaywiError};
 
 use super::backend::{
-    AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, update_snapshot,
+    AudioBackend, AudioCommand, AudioCommandSender, SharedAudioState, StreamMetadata,
+    update_snapshot,
 };
 use super::types::{
-    AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioEvent, AudioPort,
-    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance_with_map,
-    sanitize_linear_channels, scale_linear_channels,
+    AudioCard, AudioChannelPosition, AudioDevice, AudioDirection, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream, AudioTarget,
+    AudioVolume, apply_linear_balance_with_map, sanitize_linear_channels, scale_linear_channels,
 };
+
+/// Volume and channel-map state shared between PulseAudio devices and per-application streams.
+#[derive(Debug, Clone)]
+struct PulseVolumeState {
+    channels: u8,
+    volume_linear: f32,
+    channel_volumes: Vec<f32>,
+    channel_map: Vec<AudioChannelPosition>,
+    nonzero_template: Vec<f32>,
+    db: Option<f32>,
+    muted: bool,
+}
+
+impl PulseVolumeState {
+    fn from_pa(volume: &ChannelVolumes, raw_map: &pa::channelmap::Map, muted: bool) -> Self {
+        let (volume_linear, channel_volumes, db) = pulse_volume_parts(volume);
+        let channel_map = pulse_channel_map(raw_map, channel_volumes.len());
+        let nonzero_template = if channel_volumes.iter().any(|&v| v > 1e-6) {
+            channel_volumes.clone()
+        } else {
+            vec![1.0; channel_volumes.len().max(1)]
+        };
+        Self {
+            channels: volume.len().max(1),
+            volume_linear,
+            channel_volumes,
+            channel_map,
+            nonzero_template,
+            db,
+            muted,
+        }
+    }
+
+    fn to_audio_volume(&self) -> AudioVolume {
+        AudioVolume {
+            linear: self.volume_linear,
+            channels: self.channel_volumes.clone(),
+            channel_map: self.channel_map.clone(),
+            db: self.db,
+            muted: self.muted,
+        }
+    }
+
+    fn update_channels_optimistic(&mut self, channels: &[f32]) {
+        if channels.is_empty() {
+            return;
+        }
+        let peak = channels.iter().copied().fold(0.0_f32, f32::max);
+        self.volume_linear = peak;
+        self.channels = channels.len().min(u8::MAX as usize) as u8;
+        self.channel_volumes.clear();
+        self.channel_volumes.extend_from_slice(channels);
+        if peak > 1e-6 {
+            self.nonzero_template.clear();
+            self.nonzero_template.extend_from_slice(channels);
+        }
+    }
+
+    fn scale_for_level(&self, linear: f32) -> Vec<f32> {
+        scale_linear_channels(
+            &self.channel_volumes,
+            &self.nonzero_template,
+            self.channels as usize,
+            linear,
+        )
+    }
+
+    fn scale_for_balance(&self, balance: f32) -> Vec<f32> {
+        apply_linear_balance_with_map(
+            &self.channel_volumes,
+            &self.channel_map,
+            self.channels as usize,
+            self.volume_linear,
+            balance,
+        )
+    }
+}
 
 /// Device record shared by output sinks and input sources (mics).
 #[derive(Debug, Clone)]
@@ -29,35 +107,23 @@ struct PulseDeviceRecord {
     id: u32,
     name: String,
     description: String,
-    channels: u8,
-    volume_linear: f32,
-    channel_volumes: Vec<f32>,
-    channel_map: Vec<AudioChannelPosition>,
-    nonzero_template: Vec<f32>,
-    db: Option<f32>,
-    muted: bool,
-    card_id: Option<u32>,
+    vol: PulseVolumeState,
     active_port: Option<String>,
     ports: Vec<AudioPort>,
 }
 
-/// Per-application stream record shared by sink inputs (playback) and source outputs (capture);
-/// `target_id` is the sink / source index the stream is attached to.
+/// Per-application stream record shared by sink inputs (playback) and source outputs (capture).
 #[derive(Debug, Clone)]
 struct PulseStreamRecord {
     id: u32,
+    direction: AudioDirection,
     name: String,
-    binary: Option<String>,
-    icon_name: Option<String>,
-    app_id: Option<String>,
+    app_name: Option<String>,
+    binary_name: Option<String>,
+    media_role: Option<String>,
     target_id: u32,
-    channels: u8,
-    volume_linear: f32,
-    channel_volumes: Vec<f32>,
-    channel_map: Vec<AudioChannelPosition>,
-    nonzero_template: Vec<f32>,
-    db: Option<f32>,
-    muted: bool,
+    corked: bool,
+    vol: PulseVolumeState,
 }
 
 /// Device and per-app stream state owned by the PulseAudio worker; rebuilt from introspection
@@ -74,78 +140,68 @@ struct PulseRecordState {
 }
 
 impl PulseRecordState {
+    fn device_map(&self, dir: AudioDirection) -> &BTreeMap<u32, PulseDeviceRecord> {
+        match dir {
+            AudioDirection::Output => &self.sinks,
+            AudioDirection::Input => &self.sources,
+        }
+    }
+
+    fn device_map_mut(&mut self, dir: AudioDirection) -> &mut BTreeMap<u32, PulseDeviceRecord> {
+        match dir {
+            AudioDirection::Output => &mut self.sinks,
+            AudioDirection::Input => &mut self.sources,
+        }
+    }
+
+    fn stream_map_mut(&mut self, dir: AudioDirection) -> &mut BTreeMap<u32, PulseStreamRecord> {
+        match dir {
+            AudioDirection::Output => &mut self.sink_inputs,
+            AudioDirection::Input => &mut self.source_outputs,
+        }
+    }
+
+    fn default_device_id(&self, dir: AudioDirection) -> Option<u32> {
+        let name = match dir {
+            AudioDirection::Output => self.default_sink_name.as_deref(),
+            AudioDirection::Input => self.default_source_name.as_deref(),
+        };
+        resolve_target(name, self.device_map(dir)).map(|d| d.id)
+    }
+
     fn publish(
         &self,
         shared: &Arc<Mutex<SharedAudioState>>,
-        last_snapshot: &mut Option<AudioSnapshot>,
+        last_snapshot: &mut Option<Arc<AudioSnapshot>>,
     ) {
-        let devices: Vec<AudioDevice> = self.sinks.values().map(rec_device).collect();
-        let sources: Vec<AudioDevice> = self.sources.values().map(rec_device).collect();
+        let default_sink_id = self.default_device_id(AudioDirection::Output);
+        let default_source_id = self.default_device_id(AudioDirection::Input);
+
+        let sinks: Vec<AudioDevice> = self
+            .sinks
+            .values()
+            .map(|rec| rec_device(rec, Some(rec.id) == default_sink_id))
+            .collect();
+        let sources: Vec<AudioDevice> = self
+            .sources
+            .values()
+            .map(|rec| rec_device(rec, Some(rec.id) == default_source_id))
+            .collect();
         let cards: Vec<AudioCard> = self.cards.values().cloned().collect();
         let streams: Vec<AudioStream> = self
             .sink_inputs
             .values()
-            .map(|rec| AudioStream {
-                id: rec.id,
-                name: rec.name.clone(),
-                binary: rec.binary.clone(),
-                icon_name: rec.icon_name.clone(),
-                app_id: rec.app_id.clone(),
-                sink_id: Some(rec.target_id),
-                linear: rec.volume_linear,
-                channels: rec.channel_volumes.clone(),
-                channel_map: rec.channel_map.clone(),
-                db: rec.db,
-                muted: rec.muted,
-            })
+            .chain(self.source_outputs.values())
+            .map(rec_stream)
             .collect();
-        let captures: Vec<AudioCapture> = self
-            .source_outputs
-            .values()
-            .map(|rec| AudioCapture {
-                id: rec.id,
-                name: rec.name.clone(),
-                binary: rec.binary.clone(),
-                icon_name: rec.icon_name.clone(),
-                app_id: rec.app_id.clone(),
-                source_id: Some(rec.target_id),
-                linear: rec.volume_linear,
-                channels: rec.channel_volumes.clone(),
-                channel_map: rec.channel_map.clone(),
-                db: rec.db,
-                muted: rec.muted,
-            })
-            .collect();
-
-        let sink_target = resolve_target(self.default_sink_name.as_deref(), &self.sinks);
-        let source_target = resolve_target(self.default_source_name.as_deref(), &self.sources);
 
         let snapshot = AudioSnapshot {
-            linear: sink_target.as_ref().map_or(0.0, |s| s.volume_linear),
-            channels: sink_target
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.channel_volumes.clone()),
-            channel_map: sink_target
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.channel_map.clone()),
-            db: sink_target.as_ref().and_then(|s| s.db),
-            muted: sink_target.as_ref().is_some_and(|s| s.muted),
-            default_sink: sink_target.as_ref().map(|s| rec_device(s)),
-            devices,
-            source_linear: source_target.as_ref().map_or(0.0, |s| s.volume_linear),
-            source_channels: source_target
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.channel_volumes.clone()),
-            source_channel_map: source_target
-                .as_ref()
-                .map_or_else(Vec::new, |s| s.channel_map.clone()),
-            source_db: source_target.as_ref().and_then(|s| s.db),
-            source_muted: source_target.as_ref().is_some_and(|s| s.muted),
-            default_source: source_target.as_ref().map(|s| rec_device(s)),
+            sinks,
             sources,
-            cards,
+            default_sink_id,
+            default_source_id,
             streams,
-            captures,
+            cards,
         };
 
         update_snapshot(shared, last_snapshot, snapshot);
@@ -159,20 +215,16 @@ enum PulseWorkerMsg {
         sink: Option<String>,
         source: Option<String>,
     },
-    SinkBatch {
-        sinks: Vec<PulseDeviceRecord>,
-    },
-    SourceBatch {
-        sources: Vec<PulseDeviceRecord>,
+    DeviceBatch {
+        direction: AudioDirection,
+        devices: Vec<PulseDeviceRecord>,
     },
     CardBatch {
         cards: Vec<AudioCard>,
     },
-    SinkInputBatch {
-        inputs: Vec<PulseStreamRecord>,
-    },
-    SourceOutputBatch {
-        outputs: Vec<PulseStreamRecord>,
+    StreamBatch {
+        direction: AudioDirection,
+        streams: Vec<PulseStreamRecord>,
     },
     Cmd(AudioCommand),
 }
@@ -237,7 +289,7 @@ fn run_pulse_worker(
 
     let mut ready = false;
     let mut subscribed = false;
-    let mut last_snapshot: Option<AudioSnapshot> = None;
+    let mut last_snapshot: Option<Arc<AudioSnapshot>> = None;
     let mut records = PulseRecordState::default();
 
     while !stop_flag.load(Ordering::Acquire) {
@@ -257,7 +309,7 @@ fn run_pulse_worker(
                         ready = true;
                         if let Ok(mut guard) = shared.lock() {
                             guard.connected = true;
-                            guard.push_event(AudioEvent::Reconnected);
+                            guard.push_event(AudioEvent::BackendReconnected);
                         }
                         if !subscribed {
                             subscribed = true;
@@ -282,7 +334,7 @@ fn run_pulse_worker(
                     ContextState::Failed | ContextState::Terminated => {
                         if ready && let Ok(mut guard) = shared.lock() {
                             guard.connected = false;
-                            guard.push_event(AudioEvent::Disconnected);
+                            guard.push_event(AudioEvent::BackendDisconnected);
                         }
                         break;
                     }
@@ -299,57 +351,33 @@ fn run_pulse_worker(
                 records.default_source_name = source;
                 records.publish(&shared, &mut last_snapshot);
             }
-            PulseWorkerMsg::SinkBatch { sinks: batch } => {
-                let mut prev = std::mem::take(&mut records.sinks);
-                records.sinks = batch
+            PulseWorkerMsg::DeviceBatch { direction, devices } => {
+                let map = records.device_map_mut(direction);
+                let mut prev = std::mem::take(map);
+                *map = devices
                     .into_iter()
                     .map(|mut rec| {
-                        let prev_tpl = prev.remove(&rec.id).map(|p| p.nonzero_template);
-                        rec.nonzero_template =
-                            merge_nonzero_template(prev_tpl, &rec.channel_volumes);
+                        let prev_tpl = prev.remove(&rec.id).map(|p| p.vol.nonzero_template);
+                        rec.vol.nonzero_template =
+                            merge_nonzero_template(prev_tpl, &rec.vol.channel_volumes);
                         (rec.id, rec)
                     })
                     .collect();
                 records.publish(&shared, &mut last_snapshot);
             }
-            PulseWorkerMsg::SourceBatch { sources: batch } => {
-                let mut prev = std::mem::take(&mut records.sources);
-                records.sources = batch
-                    .into_iter()
-                    .map(|mut rec| {
-                        let prev_tpl = prev.remove(&rec.id).map(|p| p.nonzero_template);
-                        rec.nonzero_template =
-                            merge_nonzero_template(prev_tpl, &rec.channel_volumes);
-                        (rec.id, rec)
-                    })
-                    .collect();
+            PulseWorkerMsg::CardBatch { cards } => {
+                records.cards = cards.into_iter().map(|c| (c.id, c)).collect();
                 records.publish(&shared, &mut last_snapshot);
             }
-            PulseWorkerMsg::CardBatch { cards: batch } => {
-                records.cards = batch.into_iter().map(|c| (c.id, c)).collect();
-                records.publish(&shared, &mut last_snapshot);
-            }
-            PulseWorkerMsg::SinkInputBatch { inputs: batch } => {
-                let mut prev = std::mem::take(&mut records.sink_inputs);
-                records.sink_inputs = batch
+            PulseWorkerMsg::StreamBatch { direction, streams } => {
+                let map = records.stream_map_mut(direction);
+                let mut prev = std::mem::take(map);
+                *map = streams
                     .into_iter()
                     .map(|mut rec| {
-                        let prev_tpl = prev.remove(&rec.id).map(|p| p.nonzero_template);
-                        rec.nonzero_template =
-                            merge_nonzero_template(prev_tpl, &rec.channel_volumes);
-                        (rec.id, rec)
-                    })
-                    .collect();
-                records.publish(&shared, &mut last_snapshot);
-            }
-            PulseWorkerMsg::SourceOutputBatch { outputs: batch } => {
-                let mut prev = std::mem::take(&mut records.source_outputs);
-                records.source_outputs = batch
-                    .into_iter()
-                    .map(|mut rec| {
-                        let prev_tpl = prev.remove(&rec.id).map(|p| p.nonzero_template);
-                        rec.nonzero_template =
-                            merge_nonzero_template(prev_tpl, &rec.channel_volumes);
+                        let prev_tpl = prev.remove(&rec.id).map(|p| p.vol.nonzero_template);
+                        rec.vol.nonzero_template =
+                            merge_nonzero_template(prev_tpl, &rec.vol.channel_volumes);
                         (rec.id, rec)
                     })
                     .collect();
@@ -372,6 +400,30 @@ fn run_pulse_worker(
     ml.stop();
 }
 
+fn collect_ports<'a>(
+    iter: impl Iterator<
+        Item = (
+            Option<&'a str>,
+            Option<&'a str>,
+            u32,
+            pa::def::PortAvailable,
+        ),
+    >,
+) -> Vec<AudioPort> {
+    iter.filter_map(|(name, desc, priority, avail)| {
+        let port_name = name.filter(|s| !s.is_empty())?;
+        let port_desc = desc.filter(|s| !s.is_empty()).unwrap_or(port_name);
+        Some(AudioPort {
+            index: 0,
+            name: port_name.to_owned(),
+            description: port_desc.to_owned(),
+            priority,
+            availability: pulse_port_availability(avail),
+        })
+    })
+    .collect()
+}
+
 fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWorkerMsg>) {
     ml.lock();
     let introspect = ctx.introspect();
@@ -384,31 +436,20 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
         });
     });
 
-    let collected = Arc::new(Mutex::new(Vec::<PulseDeviceRecord>::new()));
-    let collected_cb = Arc::clone(&collected);
+    let collected_sinks = Arc::new(Mutex::new(Vec::<PulseDeviceRecord>::new()));
+    let collected_sinks_cb = Arc::clone(&collected_sinks);
     let tx_sinks = tx.clone();
     let _sink_op = introspect.get_sink_info_list(move |res| match res {
         ListResult::Item(sink) => {
-            let ports: Vec<AudioPort> = sink
-                .ports
-                .iter()
-                .filter_map(|p| {
-                    let port_name = p.name.as_deref().filter(|s| !s.is_empty())?;
-                    let port_desc = p
-                        .description
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(port_name);
-                    Some(AudioPort {
-                        index: 0,
-                        name: port_name.to_owned(),
-                        description: port_desc.to_owned(),
-                        priority: p.priority,
-                        availability: pulse_port_availability(p.available),
-                    })
-                })
-                .collect();
-            if let Ok(mut list) = collected_cb.lock()
+            let ports = collect_ports(sink.ports.iter().map(|p| {
+                (
+                    p.name.as_deref(),
+                    p.description.as_deref(),
+                    p.priority,
+                    p.available,
+                )
+            }));
+            if let Ok(mut list) = collected_sinks_cb.lock()
                 && let Some(rec) = pulse_device_record(
                     sink.index,
                     sink.name.as_deref(),
@@ -416,7 +457,6 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     &sink.volume,
                     &sink.channel_map,
                     sink.mute,
-                    sink.card,
                     sink.active_port
                         .as_ref()
                         .and_then(|p| p.name.as_deref())
@@ -428,9 +468,12 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
             }
         }
         ListResult::End => {
-            if let Ok(mut list) = collected_cb.lock() {
-                let sinks = std::mem::take(&mut *list);
-                let _ = tx_sinks.send(PulseWorkerMsg::SinkBatch { sinks });
+            if let Ok(mut list) = collected_sinks_cb.lock() {
+                let devices = std::mem::take(&mut *list);
+                let _ = tx_sinks.send(PulseWorkerMsg::DeviceBatch {
+                    direction: AudioDirection::Output,
+                    devices,
+                });
             }
         }
         ListResult::Error => {}
@@ -445,25 +488,14 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
             if source.monitor_of_sink.is_some() {
                 return;
             }
-            let ports: Vec<AudioPort> = source
-                .ports
-                .iter()
-                .filter_map(|p| {
-                    let port_name = p.name.as_deref().filter(|s| !s.is_empty())?;
-                    let port_desc = p
-                        .description
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(port_name);
-                    Some(AudioPort {
-                        index: 0,
-                        name: port_name.to_owned(),
-                        description: port_desc.to_owned(),
-                        priority: p.priority,
-                        availability: pulse_port_availability(p.available),
-                    })
-                })
-                .collect();
+            let ports = collect_ports(source.ports.iter().map(|p| {
+                (
+                    p.name.as_deref(),
+                    p.description.as_deref(),
+                    p.priority,
+                    p.available,
+                )
+            }));
             if let Ok(mut list) = collected_sources_cb.lock()
                 && let Some(rec) = pulse_device_record(
                     source.index,
@@ -472,7 +504,6 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
                     &source.volume,
                     &source.channel_map,
                     source.mute,
-                    source.card,
                     source
                         .active_port
                         .as_ref()
@@ -486,8 +517,11 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
         }
         ListResult::End => {
             if let Ok(mut list) = collected_sources_cb.lock() {
-                let sources = std::mem::take(&mut *list);
-                let _ = tx_sources.send(PulseWorkerMsg::SourceBatch { sources });
+                let devices = std::mem::take(&mut *list);
+                let _ = tx_sources.send(PulseWorkerMsg::DeviceBatch {
+                    direction: AudioDirection::Input,
+                    devices,
+                });
             }
         }
         ListResult::Error => {}
@@ -524,9 +558,11 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
             if let Ok(mut list) = collected_inputs_cb.lock() {
                 list.push(pulse_stream_record(
                     info.index,
+                    AudioDirection::Output,
                     &info.proplist,
                     info.name.as_deref(),
                     info.sink,
+                    info.corked,
                     &info.volume,
                     &info.channel_map,
                     info.mute,
@@ -535,8 +571,11 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
         }
         ListResult::End => {
             if let Ok(mut list) = collected_inputs_cb.lock() {
-                let inputs = std::mem::take(&mut *list);
-                let _ = tx_inputs.send(PulseWorkerMsg::SinkInputBatch { inputs });
+                let streams = std::mem::take(&mut *list);
+                let _ = tx_inputs.send(PulseWorkerMsg::StreamBatch {
+                    direction: AudioDirection::Output,
+                    streams,
+                });
             }
         }
         ListResult::Error => {}
@@ -550,9 +589,11 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
             if let Ok(mut list) = collected_outputs_cb.lock() {
                 list.push(pulse_stream_record(
                     info.index,
+                    AudioDirection::Input,
                     &info.proplist,
                     info.name.as_deref(),
                     info.source,
+                    info.corked,
                     &info.volume,
                     &info.channel_map,
                     info.mute,
@@ -561,8 +602,11 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
         }
         ListResult::End => {
             if let Ok(mut list) = collected_outputs_cb.lock() {
-                let outputs = std::mem::take(&mut *list);
-                let _ = tx_outputs.send(PulseWorkerMsg::SourceOutputBatch { outputs });
+                let streams = std::mem::take(&mut *list);
+                let _ = tx_outputs.send(PulseWorkerMsg::StreamBatch {
+                    direction: AudioDirection::Input,
+                    streams,
+                });
             }
         }
         ListResult::Error => {}
@@ -571,316 +615,199 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
     ml.unlock();
 }
 
+enum VolumeMutation {
+    SetLinear(f32),
+    AdjustLinear(f32),
+    SetBalance(f32),
+    SetChannels(Vec<f32>),
+}
+
+impl VolumeMutation {
+    fn apply(&self, vol: &mut PulseVolumeState) -> Option<ChannelVolumes> {
+        let next = match self {
+            Self::SetLinear(level) => vol.scale_for_level(*level),
+            Self::AdjustLinear(delta) => {
+                let target = (vol.volume_linear + delta).clamp(0.0, 1.5);
+                vol.scale_for_level(target)
+            }
+            Self::SetBalance(balance) => vol.scale_for_balance(*balance),
+            Self::SetChannels(channels) => sanitize_linear_channels(channels)?,
+        };
+        vol.update_channels_optimistic(&next);
+        Some(pulse_channel_volumes_from_slice(&next))
+    }
+}
+
+fn apply_target_volume(
+    ctx: &mut Context,
+    records: &mut PulseRecordState,
+    target: AudioTarget,
+    mutation: VolumeMutation,
+) {
+    let mut introspect = ctx.introspect();
+    match target {
+        AudioTarget::DefaultSink | AudioTarget::Sink(_) => {
+            let id = match target {
+                AudioTarget::Sink(id) => Some(id),
+                _ => records.default_device_id(AudioDirection::Output),
+            };
+            if let Some(id) = id
+                && let Some(sink) = records.sinks.get_mut(&id)
+                && let Some(cv) = mutation.apply(&mut sink.vol)
+            {
+                let _op = introspect.set_sink_volume_by_name(&sink.name, &cv, None);
+            }
+        }
+        AudioTarget::DefaultSource | AudioTarget::Source(_) => {
+            let id = match target {
+                AudioTarget::Source(id) => Some(id),
+                _ => records.default_device_id(AudioDirection::Input),
+            };
+            if let Some(id) = id
+                && let Some(source) = records.sources.get_mut(&id)
+                && let Some(cv) = mutation.apply(&mut source.vol)
+            {
+                let _op = introspect.set_source_volume_by_name(&source.name, &cv, None);
+            }
+        }
+        AudioTarget::PlaybackStream(id) => {
+            if let Some(rec) = records.sink_inputs.get_mut(&id)
+                && let Some(cv) = mutation.apply(&mut rec.vol)
+            {
+                let _op = introspect.set_sink_input_volume(id, &cv, None);
+            }
+        }
+        AudioTarget::CaptureStream(id) => {
+            if let Some(rec) = records.source_outputs.get_mut(&id)
+                && let Some(cv) = mutation.apply(&mut rec.vol)
+            {
+                let _op = introspect.set_source_output_volume(id, &cv, None);
+            }
+        }
+    }
+}
+
+fn apply_target_mute(
+    ctx: &mut Context,
+    records: &mut PulseRecordState,
+    target: AudioTarget,
+    explicit: Option<bool>,
+) {
+    let mut introspect = ctx.introspect();
+    match target {
+        AudioTarget::DefaultSink | AudioTarget::Sink(_) => {
+            let id = match target {
+                AudioTarget::Sink(id) => Some(id),
+                _ => records.default_device_id(AudioDirection::Output),
+            };
+            if let Some(id) = id
+                && let Some(sink) = records.sinks.get_mut(&id)
+            {
+                let next = explicit.unwrap_or(!sink.vol.muted);
+                sink.vol.muted = next;
+                let _op = introspect.set_sink_mute_by_name(&sink.name, next, None);
+            }
+        }
+        AudioTarget::DefaultSource | AudioTarget::Source(_) => {
+            let id = match target {
+                AudioTarget::Source(id) => Some(id),
+                _ => records.default_device_id(AudioDirection::Input),
+            };
+            if let Some(id) = id
+                && let Some(source) = records.sources.get_mut(&id)
+            {
+                let next = explicit.unwrap_or(!source.vol.muted);
+                source.vol.muted = next;
+                let _op = introspect.set_source_mute_by_name(&source.name, next, None);
+            }
+        }
+        AudioTarget::PlaybackStream(id) => {
+            if let Some(rec) = records.sink_inputs.get_mut(&id) {
+                let next = explicit.unwrap_or(!rec.vol.muted);
+                rec.vol.muted = next;
+                let _op = introspect.set_sink_input_mute(id, next, None);
+            }
+        }
+        AudioTarget::CaptureStream(id) => {
+            if let Some(rec) = records.source_outputs.get_mut(&id) {
+                let next = explicit.unwrap_or(!rec.vol.muted);
+                rec.vol.muted = next;
+                let _op = introspect.set_source_output_mute(id, next, None);
+            }
+        }
+    }
+}
+
 fn apply_pulse_command(
     ml: &mut Mainloop,
     ctx: &mut Context,
     cmd: AudioCommand,
     records: &mut PulseRecordState,
 ) {
-    let target_id =
-        resolve_target(records.default_sink_name.as_deref(), &records.sinks).map(|s| s.id);
-    let source_target_id =
-        resolve_target(records.default_source_name.as_deref(), &records.sources).map(|s| s.id);
     ml.lock();
     match cmd {
-        AudioCommand::SetVolumeLinear(linear) => {
-            if let Some(id) = target_id
-                && let Some(sink) = records.sinks.get_mut(&id)
+        AudioCommand::SetVolume(target, linear) => {
+            apply_target_volume(ctx, records, target, VolumeMutation::SetLinear(linear));
+        }
+        AudioCommand::AdjustVolume(target, delta) => {
+            apply_target_volume(ctx, records, target, VolumeMutation::AdjustLinear(delta));
+        }
+        AudioCommand::SetBalance(target, balance) => {
+            apply_target_volume(ctx, records, target, VolumeMutation::SetBalance(balance));
+        }
+        AudioCommand::SetChannelVolumes(target, channels) => {
+            apply_target_volume(ctx, records, target, VolumeMutation::SetChannels(channels));
+        }
+        AudioCommand::SetMute(target, muted) => {
+            apply_target_mute(ctx, records, target, Some(muted));
+        }
+        AudioCommand::ToggleMute(target) => {
+            apply_target_mute(ctx, records, target, None);
+        }
+        AudioCommand::SetDefaultDevice(direction, id) => {
+            if let Some(dev) = records.device_map(direction).get(&id)
+                && is_valid_pa_str(&dev.name)
             {
-                let scaled = scale_linear_channels(
-                    &sink.channel_volumes,
-                    &sink.nonzero_template,
-                    sink.channels as usize,
-                    linear,
-                );
-                update_device_channels_optimistic(sink, &scaled);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_volume_by_name(
-                    &sink.name,
-                    &pulse_channel_volumes_from_slice(&scaled),
-                    None,
-                );
+                match direction {
+                    AudioDirection::Output => {
+                        let _op = ctx.set_default_sink(&dev.name, |_| {});
+                    }
+                    AudioDirection::Input => {
+                        let _op = ctx.set_default_source(&dev.name, |_| {});
+                    }
+                }
             }
         }
-        AudioCommand::SetBalance(balance) => {
-            if let Some(id) = target_id
-                && let Some(sink) = records.sinks.get_mut(&id)
-            {
-                let balanced = apply_linear_balance_with_map(
-                    &sink.channel_volumes,
-                    &sink.channel_map,
-                    sink.channels as usize,
-                    sink.volume_linear,
-                    balance,
-                );
-                update_device_channels_optimistic(sink, &balanced);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_volume_by_name(
-                    &sink.name,
-                    &pulse_channel_volumes_from_slice(&balanced),
-                    None,
-                );
+        AudioCommand::SetPort(target, port_name) => {
+            if is_valid_pa_str(&port_name) {
+                let (direction, explicit_id) = match target {
+                    AudioPortTarget::DefaultSink => (AudioDirection::Output, None),
+                    AudioPortTarget::Sink(id) => (AudioDirection::Output, Some(id)),
+                    AudioPortTarget::DefaultSource => (AudioDirection::Input, None),
+                    AudioPortTarget::Source(id) => (AudioDirection::Input, Some(id)),
+                };
+                let id = explicit_id.or_else(|| records.default_device_id(direction));
+                if let Some(id) = id
+                    && let Some(dev) = records.device_map(direction).get(&id)
+                    && is_valid_pa_str(&dev.name)
+                {
+                    let mut introspect = ctx.introspect();
+                    match direction {
+                        AudioDirection::Output => {
+                            let _op = introspect.set_sink_port_by_name(&dev.name, &port_name, None);
+                        }
+                        AudioDirection::Input => {
+                            let _op =
+                                introspect.set_source_port_by_name(&dev.name, &port_name, None);
+                        }
+                    }
+                }
             }
         }
-        AudioCommand::SetChannelVolumes(channels) => {
-            if let Some(channels) = sanitize_linear_channels(&channels)
-                && let Some(id) = target_id
-                && let Some(sink) = records.sinks.get_mut(&id)
-            {
-                update_device_channels_optimistic(sink, &channels);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_volume_by_name(
-                    &sink.name,
-                    &pulse_channel_volumes_from_slice(&channels),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetMuted(muted) => {
-            if let Some(id) = target_id
-                && let Some(sink) = records.sinks.get(&id)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_mute_by_name(&sink.name, muted, None);
-            }
-        }
-        AudioCommand::ToggleMute => {
-            if let Some(id) = target_id
-                && let Some(sink) = records.sinks.get(&id)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_mute_by_name(&sink.name, !sink.muted, None);
-            }
-        }
-        AudioCommand::SelectDevice(id) => {
-            if let Some(sink) = records.sinks.get(&id)
-                && is_valid_pa_str(&sink.name)
-            {
-                let _op = ctx.set_default_sink(&sink.name, |_| {});
-            }
-        }
-        AudioCommand::SelectPort(device_id, port_name) => {
-            let id = device_id.or(target_id);
-            if is_valid_pa_str(&port_name)
-                && let Some(id) = id
-                && let Some(sink) = records.sinks.get(&id)
-                && is_valid_pa_str(&sink.name)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_port_by_name(&sink.name, &port_name, None);
-            }
-        }
-        AudioCommand::SetSourceVolumeLinear(linear) => {
-            if let Some(id) = source_target_id
-                && let Some(source) = records.sources.get_mut(&id)
-            {
-                let scaled = scale_linear_channels(
-                    &source.channel_volumes,
-                    &source.nonzero_template,
-                    source.channels as usize,
-                    linear,
-                );
-                update_device_channels_optimistic(source, &scaled);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_volume_by_name(
-                    &source.name,
-                    &pulse_channel_volumes_from_slice(&scaled),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetSourceBalance(balance) => {
-            if let Some(id) = source_target_id
-                && let Some(source) = records.sources.get_mut(&id)
-            {
-                let balanced = apply_linear_balance_with_map(
-                    &source.channel_volumes,
-                    &source.channel_map,
-                    source.channels as usize,
-                    source.volume_linear,
-                    balance,
-                );
-                update_device_channels_optimistic(source, &balanced);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_volume_by_name(
-                    &source.name,
-                    &pulse_channel_volumes_from_slice(&balanced),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetSourceChannelVolumes(channels) => {
-            if let Some(channels) = sanitize_linear_channels(&channels)
-                && let Some(id) = source_target_id
-                && let Some(source) = records.sources.get_mut(&id)
-            {
-                update_device_channels_optimistic(source, &channels);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_volume_by_name(
-                    &source.name,
-                    &pulse_channel_volumes_from_slice(&channels),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetSourceMuted(muted) => {
-            if let Some(id) = source_target_id
-                && let Some(source) = records.sources.get(&id)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_mute_by_name(&source.name, muted, None);
-            }
-        }
-        AudioCommand::ToggleSourceMute => {
-            if let Some(id) = source_target_id
-                && let Some(source) = records.sources.get(&id)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_mute_by_name(&source.name, !source.muted, None);
-            }
-        }
-        AudioCommand::SelectSource(id) => {
-            if let Some(source) = records.sources.get(&id)
-                && is_valid_pa_str(&source.name)
-            {
-                let _op = ctx.set_default_source(&source.name, |_| {});
-            }
-        }
-        AudioCommand::SelectSourcePort(device_id, port_name) => {
-            let id = device_id.or(source_target_id);
-            if is_valid_pa_str(&port_name)
-                && let Some(id) = id
-                && let Some(source) = records.sources.get(&id)
-                && is_valid_pa_str(&source.name)
-            {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_port_by_name(&source.name, &port_name, None);
-            }
-        }
-        AudioCommand::SelectCardProfile(card_id, profile_name) => {
+        AudioCommand::SetCardProfile(card_id, profile_name) => {
             if is_valid_pa_str(&profile_name) && records.cards.contains_key(&card_id) {
                 let mut introspect = ctx.introspect();
                 let _op = introspect.set_card_profile_by_index(card_id, &profile_name, None);
-            }
-        }
-        AudioCommand::SetStreamVolumeLinear(id, linear) => {
-            if let Some(rec) = records.sink_inputs.get_mut(&id) {
-                let scaled = scale_linear_channels(
-                    &rec.channel_volumes,
-                    &rec.nonzero_template,
-                    rec.channels as usize,
-                    linear,
-                );
-                update_stream_channels_optimistic(rec, &scaled);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_input_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&scaled),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetStreamBalance(id, balance) => {
-            if let Some(rec) = records.sink_inputs.get_mut(&id) {
-                let balanced = apply_linear_balance_with_map(
-                    &rec.channel_volumes,
-                    &rec.channel_map,
-                    rec.channels as usize,
-                    rec.volume_linear,
-                    balance,
-                );
-                update_stream_channels_optimistic(rec, &balanced);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_input_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&balanced),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetStreamChannelVolumes(id, channels) => {
-            if let Some(channels) = sanitize_linear_channels(&channels)
-                && let Some(rec) = records.sink_inputs.get_mut(&id)
-            {
-                update_stream_channels_optimistic(rec, &channels);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_input_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&channels),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetStreamMuted(id, muted) => {
-            if records.sink_inputs.contains_key(&id) {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_input_mute(id, muted, None);
-            }
-        }
-        AudioCommand::ToggleStreamMute(id) => {
-            if let Some(rec) = records.sink_inputs.get(&id) {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_sink_input_mute(id, !rec.muted, None);
-            }
-        }
-        AudioCommand::SetCaptureVolumeLinear(id, linear) => {
-            if let Some(rec) = records.source_outputs.get_mut(&id) {
-                let scaled = scale_linear_channels(
-                    &rec.channel_volumes,
-                    &rec.nonzero_template,
-                    rec.channels as usize,
-                    linear,
-                );
-                update_stream_channels_optimistic(rec, &scaled);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_output_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&scaled),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetCaptureBalance(id, balance) => {
-            if let Some(rec) = records.source_outputs.get_mut(&id) {
-                let balanced = apply_linear_balance_with_map(
-                    &rec.channel_volumes,
-                    &rec.channel_map,
-                    rec.channels as usize,
-                    rec.volume_linear,
-                    balance,
-                );
-                update_stream_channels_optimistic(rec, &balanced);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_output_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&balanced),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetCaptureChannelVolumes(id, channels) => {
-            if let Some(channels) = sanitize_linear_channels(&channels)
-                && let Some(rec) = records.source_outputs.get_mut(&id)
-            {
-                update_stream_channels_optimistic(rec, &channels);
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_output_volume(
-                    id,
-                    &pulse_channel_volumes_from_slice(&channels),
-                    None,
-                );
-            }
-        }
-        AudioCommand::SetCaptureMuted(id, muted) => {
-            if records.source_outputs.contains_key(&id) {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_output_mute(id, muted, None);
-            }
-        }
-        AudioCommand::ToggleCaptureMute(id) => {
-            if let Some(rec) = records.source_outputs.get(&id) {
-                let mut introspect = ctx.introspect();
-                let _op = introspect.set_source_output_mute(id, !rec.muted, None);
             }
         }
         AudioCommand::Shutdown => {}
@@ -901,36 +828,6 @@ fn merge_nonzero_template(prev: Option<Vec<f32>>, current: &[f32]) -> Vec<f32> {
         prev
     } else {
         vec![1.0; current.len().max(1)]
-    }
-}
-
-fn update_device_channels_optimistic(rec: &mut PulseDeviceRecord, channels: &[f32]) {
-    if channels.is_empty() {
-        return;
-    }
-    let peak = channels.iter().copied().fold(0.0_f32, f32::max);
-    rec.volume_linear = peak;
-    rec.channels = channels.len().min(u8::MAX as usize) as u8;
-    rec.channel_volumes.clear();
-    rec.channel_volumes.extend_from_slice(channels);
-    if peak > 1e-6 {
-        rec.nonzero_template.clear();
-        rec.nonzero_template.extend_from_slice(channels);
-    }
-}
-
-fn update_stream_channels_optimistic(rec: &mut PulseStreamRecord, channels: &[f32]) {
-    if channels.is_empty() {
-        return;
-    }
-    let peak = channels.iter().copied().fold(0.0_f32, f32::max);
-    rec.volume_linear = peak;
-    rec.channels = channels.len().min(u8::MAX as usize) as u8;
-    rec.channel_volumes.clear();
-    rec.channel_volumes.extend_from_slice(channels);
-    if peak > 1e-6 {
-        rec.nonzero_template.clear();
-        rec.nonzero_template.extend_from_slice(channels);
     }
 }
 
@@ -957,15 +854,29 @@ fn resolve_target<'a>(
         .or_else(|| records.values().next())
 }
 
-fn rec_device(rec: &PulseDeviceRecord) -> AudioDevice {
+fn rec_device(rec: &PulseDeviceRecord, is_default: bool) -> AudioDevice {
     AudioDevice {
         id: rec.id,
         name: rec.name.clone(),
         description: rec.description.clone(),
-        card_id: rec.card_id,
+        is_default,
+        volume: rec.vol.to_audio_volume(),
         active_port: rec.active_port.clone(),
         ports: rec.ports.clone(),
-        channel_map: rec.channel_map.clone(),
+    }
+}
+
+fn rec_stream(rec: &PulseStreamRecord) -> AudioStream {
+    AudioStream {
+        id: rec.id,
+        direction: rec.direction,
+        name: rec.name.clone(),
+        app_name: rec.app_name.clone(),
+        binary_name: rec.binary_name.clone(),
+        media_role: rec.media_role.clone(),
+        device_id: Some(rec.target_id),
+        corked: rec.corked,
+        volume: rec.vol.to_audio_volume(),
     }
 }
 
@@ -1071,7 +982,6 @@ fn pulse_device_record(
     volume: &ChannelVolumes,
     raw_channel_map: &pa::channelmap::Map,
     muted: bool,
-    card_id: Option<u32>,
     active_port: Option<&str>,
     mut ports: Vec<AudioPort>,
 ) -> Option<PulseDeviceRecord> {
@@ -1080,30 +990,16 @@ fn pulse_device_record(
         .filter(|s| !s.is_empty())
         .unwrap_or(name)
         .to_owned();
-    let (volume_linear, channel_volumes, db) = pulse_volume_parts(volume);
-    let channel_map = pulse_channel_map(raw_channel_map, channel_volumes.len());
     ports.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
             .then_with(|| a.name.cmp(&b.name))
     });
-    let nonzero_template = if channel_volumes.iter().any(|&v| v > 1e-6) {
-        channel_volumes.clone()
-    } else {
-        vec![1.0; channel_volumes.len().max(1)]
-    };
     Some(PulseDeviceRecord {
         id,
         name: name.to_owned(),
         description,
-        channels: volume.len().max(1),
-        volume_linear,
-        channel_volumes,
-        channel_map,
-        nonzero_template,
-        db,
-        muted,
-        card_id,
+        vol: PulseVolumeState::from_pa(volume, raw_channel_map, muted),
         active_port: active_port.map(str::to_owned),
         ports,
     })
@@ -1156,37 +1052,29 @@ fn pulse_card_record(card: &pa::context::introspect::CardInfo<'_>) -> Option<Aud
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pulse_stream_record(
     id: u32,
+    direction: AudioDirection,
     proplist: &pa::proplist::Proplist,
     stream_name: Option<&str>,
     target_id: u32,
+    corked: bool,
     volume: &ChannelVolumes,
     raw_channel_map: &pa::channelmap::Map,
     muted: bool,
 ) -> PulseStreamRecord {
-    let meta = super::backend::StreamMetadata::extract(stream_name, |k| proplist.get_str(k));
-    let (volume_linear, channel_volumes, db) = pulse_volume_parts(volume);
-    let channel_map = pulse_channel_map(raw_channel_map, channel_volumes.len());
-    let nonzero_template = if channel_volumes.iter().any(|&v| v > 1e-6) {
-        channel_volumes.clone()
-    } else {
-        vec![1.0; channel_volumes.len().max(1)]
-    };
+    let meta = StreamMetadata::extract(stream_name, |k| proplist.get_str(k));
     PulseStreamRecord {
         id,
+        direction,
         name: meta.name,
-        binary: meta.binary,
-        icon_name: meta.icon_name,
-        app_id: meta.app_id,
+        app_name: meta.app_name,
+        binary_name: meta.binary_name,
+        media_role: meta.media_role,
         target_id,
-        channels: volume.len().max(1),
-        volume_linear,
-        channel_volumes,
-        channel_map,
-        nonzero_template,
-        db,
-        muted,
+        corked,
+        vol: PulseVolumeState::from_pa(volume, raw_channel_map, muted),
     }
 }
 

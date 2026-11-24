@@ -141,6 +141,29 @@ impl Capabilities {
         }
     }
 
+    /// Updates Wayland protocol and seat capabilities from a live [`Capabilities`] snapshot
+    /// without clobbering runtime-probed IPC, GPU, audio, or accessibility flags.
+    pub(crate) fn refresh_wayland_from(&mut self, wl_caps: &Self) {
+        const WAYLAND_CAPS: [Capability; 13] = [
+            Capability::Wayland,
+            Capability::LayerShell,
+            Capability::XdgShell,
+            Capability::XdgActivation,
+            Capability::FractionalScale,
+            Capability::Viewporter,
+            Capability::PointerInput,
+            Capability::KeyboardInput,
+            Capability::KeyboardLayout,
+            Capability::TouchInput,
+            Capability::IdleNotify,
+            Capability::Clipboard,
+            Capability::TextInput,
+        ];
+        for cap in WAYLAND_CAPS {
+            self.set(cap, wl_caps.has(cap));
+        }
+    }
+
     /// Iterates over all currently supported capabilities.
     pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
         self.supported.iter().copied()

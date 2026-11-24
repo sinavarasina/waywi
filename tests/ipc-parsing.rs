@@ -12,26 +12,26 @@ fn hyprland_ipc_parsing_and_mock_socket_roundtrip() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
-    use waywi::hyprland::{
+    use waywi::compositor::hyprland::{
         HyprlandClient, HyprlandEvent, HyprlandSockets, WorkspaceId, WorkspaceInfo,
-        apply_workspace_event, parse_event_line,
+        apply_workspace_event,
     };
 
     assert_eq!(
-        parse_event_line("workspacev2>>2,term"),
+        HyprlandEvent::parse_line("workspacev2>>2,term"),
         Some(HyprlandEvent::WorkspaceV2 {
             id: WorkspaceId(2),
             name: "term".into(),
         })
     );
     assert_eq!(
-        parse_event_line("activewindow>>Alacritty,vim"),
+        HyprlandEvent::parse_line("activewindow>>Alacritty,vim"),
         Some(HyprlandEvent::ActiveWindow {
             class: "Alacritty".into(),
             title: "vim".into(),
         })
     );
-    assert_eq!(parse_event_line("malformed-no-delimiter"), None);
+    assert_eq!(HyprlandEvent::parse_line("malformed-no-delimiter"), None);
 
     let mut list = vec![
         WorkspaceInfo {
@@ -138,16 +138,25 @@ fn sway_ipc_framing_and_mock_socket_roundtrip() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
-    use waywi::sway::{SwayClient, SwayEvent, encode_frame, parse_event_frame};
+    use waywi::compositor::sway::{SwayClient, SwayEvent};
 
-    let frame = encode_frame(1, br#"{"ok":true}"#);
+    fn make_i3_frame(msg_type: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + payload.len());
+        frame.extend_from_slice(b"i3-ipc");
+        frame.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(&msg_type.to_ne_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    let frame = make_i3_frame(1, br#"{"ok":true}"#);
     assert_eq!(&frame[..6], b"i3-ipc");
 
-    let ev = parse_event_frame(
+    let ev = SwayEvent::parse_frame(
         0x8000_0000,
         br#"{"change":"focus","current":null,"old":null}"#,
     );
-    assert!(matches!(ev, SwayEvent::Workspace { ref change, .. } if change == "focus"));
+    assert!(matches!(ev, Some(SwayEvent::Workspace { ref change, .. }) if change == "focus"));
 
     let dir = temp_dir::TestTempDir::new("sway-ipc");
     let sock = dir.path().join("sway-ipc.sock");
@@ -158,7 +167,7 @@ fn sway_ipc_framing_and_mock_socket_roundtrip() {
             let mut hdr = [0u8; 14];
             let _ = stream.read_exact(&mut hdr);
             let body = br#"[{"id":10,"num":1,"name":"1","visible":true,"focused":true,"urgent":false,"output":"DP-1"}]"#;
-            let resp = encode_frame(1, body);
+            let resp = make_i3_frame(1, body);
             let _ = stream.write_all(&resp);
         }
     });
@@ -199,4 +208,32 @@ fn control_ipc_socket_roundtrip() {
     send_command(&sock, "toggle-osd").expect("send_command");
     let received = srv.join().unwrap();
     assert!(received.contains("toggle-osd"));
+
+    fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
+    assert_send_sync_clone::<waywi::control::ControlRequest>();
+}
+
+#[cfg(feature = "hyprland-ipc")]
+#[test]
+fn workspace_target_maps_special_and_normal_workspaces_consistently() {
+    use waywi::compositor::WorkspaceTarget;
+    use waywi::compositor::hyprland::{WorkspaceId, WorkspaceInfo, WorkspaceType};
+
+    let normal = WorkspaceInfo {
+        id: WorkspaceId(2),
+        name: "2".into(),
+        ..WorkspaceInfo::default()
+    };
+    assert_eq!(WorkspaceTarget::from(&normal), WorkspaceTarget::Id(2));
+
+    let special = WorkspaceInfo {
+        id: WorkspaceId(-98),
+        workspace_type: WorkspaceType::Special,
+        name: "special:magic".into(),
+        ..WorkspaceInfo::default()
+    };
+    assert_eq!(
+        WorkspaceTarget::from(&special),
+        WorkspaceTarget::Name("special:magic")
+    );
 }

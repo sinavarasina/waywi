@@ -66,17 +66,6 @@ impl<M: 'static> Text<M> {
         self
     }
 
-    /// Convenience setter toggling [`TextBoundsMode::Optical`] tight ink bounds (ideal for
-    /// centering single icon glyphs such as Nerd Font PUA symbols).
-    pub fn optical_bounds(mut self, optical: bool) -> Self {
-        self.bounds_mode = if optical {
-            TextBoundsMode::Optical
-        } else {
-            TextBoundsMode::Typographic
-        };
-        self
-    }
-
     crate::input::impl_common_builders!();
 
     /// Maps emitted messages into a parent message type `N`.

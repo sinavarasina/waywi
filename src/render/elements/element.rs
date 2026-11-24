@@ -4,7 +4,7 @@ use crate::input::{CommonProps, ElementKey, IntoElementKey};
 use crate::render::canvas::Canvas;
 use crate::render::elements::containers::{Clip, Column, Group, Row};
 use crate::render::elements::rect::Rect;
-use crate::render::memo::check_memo;
+use crate::render::memo::begin_memo_check;
 use crate::sprite::Sprite;
 use crate::text::Text;
 
@@ -19,7 +19,7 @@ pub struct Element<M = ()> {
 pub(crate) enum ElementKind<M> {
     Text(Text<M>),
     Image(Image<M>),
-    Sprite(Box<Sprite<M>>),
+    Sprite(Sprite<M>),
     Rect(Rect<M>),
     Canvas(Canvas<M>),
     Group(Group<M>),
@@ -44,16 +44,16 @@ impl<M: 'static> Element<M> {
         F: FnOnce(&D) -> Element<M>,
     {
         let el_key = key.into_element_key();
-        if check_memo(el_key, dep) {
-            Self {
-                kind: ElementKind::MemoHit { key: el_key },
-            }
-        } else {
+        if let Some(_build_guard) = begin_memo_check(el_key, dep) {
             let mut built = build(dep);
             if let Some(common) = built.common_mut() {
                 common.key = Some(el_key);
             }
             built
+        } else {
+            Self {
+                kind: ElementKind::MemoHit { key: el_key },
+            }
         }
     }
 
@@ -87,7 +87,7 @@ impl<M: 'static> Element<M> {
                 flip_x: img.flip_x,
                 flip_y: img.flip_y,
             }),
-            ElementKind::Sprite(sp) => ElementKind::Sprite(Box::new(Sprite {
+            ElementKind::Sprite(sp) => ElementKind::Sprite(Sprite {
                 common: sp.common.map_with(mapper),
                 sheet: sp.sheet,
                 mode: sp.mode,
@@ -95,7 +95,7 @@ impl<M: 'static> Element<M> {
                 flip_x: sp.flip_x,
                 flip_y: sp.flip_y,
                 on_animation_end: sp.on_animation_end.map(|m| mapper.call(m)),
-            })),
+            }),
             ElementKind::Rect(r) => ElementKind::Rect(Rect {
                 common: r.common.map_with(mapper),
                 fill: r.fill,
@@ -104,7 +104,7 @@ impl<M: 'static> Element<M> {
             }),
             ElementKind::Canvas(c) => ElementKind::Canvas(Canvas {
                 common: c.common.map_with(mapper),
-                render_key: c.render_key,
+                cache_key: c.cache_key,
                 draw: c.draw,
             }),
             ElementKind::Group(g) => {
@@ -209,7 +209,7 @@ impl<M: 'static> From<Image<M>> for Element<M> {
 impl<M: 'static> From<Sprite<M>> for Element<M> {
     fn from(value: Sprite<M>) -> Self {
         Self {
-            kind: ElementKind::Sprite(Box::new(value)),
+            kind: ElementKind::Sprite(value),
         }
     }
 }

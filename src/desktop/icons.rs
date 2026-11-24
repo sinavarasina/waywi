@@ -1,9 +1,11 @@
-//! Specification-aware XDG Icon Theme resolver (`index.theme` inheritance + caching).
+//! Specification-aware XDG Icon Theme resolver (`index.theme` inheritance + bounded caching).
 
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const DEFAULT_MAX_RESULTS: usize = 2048;
 
 /// Parsed icon subdirectory descriptor from a theme's `index.theme`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,38 +26,83 @@ pub struct IconThemeInfo {
 }
 
 /// Stateful caching resolver for XDG icon theme lookups.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct XdgIconLookup {
+    pinned_theme: Option<String>,
     themes_order: Option<Vec<String>>,
     dirs: Vec<PathBuf>,
     theme_cache: HashMap<String, Option<IconThemeInfo>>,
     result_cache: HashMap<(String, u16), Option<PathBuf>>,
+    max_results: usize,
+}
+
+impl Default for XdgIconLookup {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl XdgIconLookup {
-    /// Creates an XDG icon lookup using standard environment icon search paths.
+    /// Creates an XDG icon lookup using standard environment icon search paths and a default
+    /// result cache capacity of `2048` entries.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_entries(DEFAULT_MAX_RESULTS)
+    }
+
+    /// Creates an XDG icon lookup using standard environment icon search paths with an explicit
+    /// maximum number of cached resolution results (`0` disables result caching).
+    #[must_use]
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
+            pinned_theme: None,
             themes_order: None,
             dirs: default_icon_dirs(),
             theme_cache: HashMap::new(),
             result_cache: HashMap::new(),
+            max_results: max_entries,
         }
     }
 
     /// Creates an XDG icon lookup pinned to explicit base directories (for deterministic tests).
     #[must_use]
     pub fn with_dirs(dirs: Vec<PathBuf>, primary_theme: impl Into<String>) -> Self {
+        let primary = primary_theme.into();
         let mut s = Self {
+            pinned_theme: Some(primary.clone()),
             themes_order: None,
             dirs,
             theme_cache: HashMap::new(),
             result_cache: HashMap::new(),
+            max_results: DEFAULT_MAX_RESULTS,
         };
-        let order = s.build_theme_chain(&primary_theme.into());
+        let order = s.build_theme_chain(&primary);
         s.themes_order = Some(order);
         s
+    }
+
+    /// Updates the maximum number of cached resolution results (`0` disables result caching).
+    pub fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_results = max_entries;
+        if self.max_results == 0 || self.result_cache.len() > self.max_results {
+            self.result_cache.clear();
+        }
+    }
+
+    /// Clears all cached icon resolution results and parsed theme metadata.
+    pub fn clear(&mut self) {
+        self.themes_order = None;
+        self.theme_cache.clear();
+        self.theme_cache.shrink_to_fit();
+        self.result_cache.clear();
+        self.result_cache.shrink_to_fit();
+    }
+
+    /// Clears only cached `(icon_name, size)` resolution results while retaining parsed
+    /// `index.theme` metadata.
+    pub fn clear_results(&mut self) {
+        self.result_cache.clear();
+        self.result_cache.shrink_to_fit();
     }
 
     /// Resolves an icon name, `file://` URI, or absolute file path for `preferred_size` px.
@@ -71,12 +118,17 @@ impl XdgIconLookup {
         }
 
         let cache_key = (trimmed.to_owned(), preferred_size);
-        if let Some(hit) = self.result_cache.get(&cache_key) {
+        if self.max_results > 0
+            && let Some(hit) = self.result_cache.get(&cache_key)
+        {
             return hit.clone();
         }
 
         if self.themes_order.is_none() {
-            let active = detect_active_icon_theme();
+            let active = self
+                .pinned_theme
+                .clone()
+                .unwrap_or_else(detect_active_icon_theme);
             self.themes_order = Some(self.build_theme_chain(&active));
         }
 
@@ -127,7 +179,12 @@ impl XdgIconLookup {
         }
         self.themes_order = Some(order);
 
-        self.result_cache.insert(cache_key, found.clone());
+        if self.max_results > 0 {
+            if self.result_cache.len() >= self.max_results {
+                self.result_cache.clear();
+            }
+            self.result_cache.insert(cache_key, found.clone());
+        }
         found
     }
 
@@ -165,10 +222,12 @@ pub fn resolve_icon_path(icon_name_or_path: &str, preferred_size: u16) -> Option
 #[must_use]
 pub fn default_icon_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(home) = env::var("HOME") {
-        dirs.push(PathBuf::from(&home).join(".icons"));
+    if let Ok(home) = env::var("HOME")
+        && Path::new(&home).is_absolute()
+    {
+        dirs.push(PathBuf::from(home).join(".icons"));
     }
-    dirs.extend(super::xdg::xdg_data_dirs_for("icons"));
+    dirs.extend(super::xdg::XdgBaseDirs::from_env().icon_dirs());
     dirs
 }
 
@@ -184,13 +243,39 @@ pub fn detect_active_icon_theme() -> String {
     if let Some(val) = super::xdg::read_gtk_setting("gtk-icon-theme-name") {
         return val;
     }
-    if let Some(config_home) = super::xdg::xdg_config_home()
+    if let Some(config_home) = super::xdg::XdgBaseDirs::from_env().config_home
         && let Ok(text) = fs::read_to_string(config_home.join("kdeglobals"))
-        && let Some(val) = super::xdg::ini_key(&text, "Theme")
+        && let Some(val) = parse_kdeglobals_icon_theme(&text)
     {
         return val;
     }
     "hicolor".to_owned()
+}
+
+fn parse_kdeglobals_icon_theme(text: &str) -> Option<String> {
+    let mut in_icons = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_icons = line[1..line.len() - 1].trim() == "Icons";
+            continue;
+        }
+        if !in_icons {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == "Theme"
+        {
+            let clean = v.trim().trim_matches('"');
+            if !clean.is_empty() {
+                return Some(clean.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Parses a freedesktop `index.theme` file into structured directory metadata.
@@ -344,8 +429,75 @@ mod tests {
         fs::write(&target, "<svg/>").unwrap();
 
         let mut lookup = XdgIconLookup::with_dirs(vec![root.clone()], "CustomTheme");
+        assert_eq!(
+            lookup.resolve("audio-volume-high", 48),
+            Some(target.clone())
+        );
+
+        // Bounded cache eviction and explicit clear / clear_results.
+        lookup.set_max_entries(2);
+        assert_eq!(
+            lookup.resolve("audio-volume-high", 48),
+            Some(target.clone())
+        );
+        assert_eq!(lookup.resolve("audio-volume-low", 48), Some(target.clone()));
+        assert_eq!(lookup.result_cache.len(), 2);
+        assert_eq!(lookup.resolve("missing-icon-check", 48), None);
+        assert_eq!(lookup.result_cache.len(), 1);
+
+        lookup.clear_results();
+        assert!(lookup.result_cache.is_empty());
+        assert!(!lookup.theme_cache.is_empty());
+
+        lookup.clear();
+        assert!(lookup.result_cache.is_empty());
+        assert!(lookup.theme_cache.is_empty());
         assert_eq!(lookup.resolve("audio-volume-high", 48), Some(target));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kdeglobals_reads_theme_only_inside_icons_section() {
+        let sample = "\
+[General]
+Theme=WrongGlobalTheme
+ColorScheme=BreezeDark
+
+[Icons]
+# Theme=CommentedOut
+Theme=Papirus-Dark
+
+[KDE]
+Theme=WrongKdeTheme
+";
+        assert_eq!(
+            parse_kdeglobals_icon_theme(sample).as_deref(),
+            Some("Papirus-Dark")
+        );
+
+        let after_section = "\
+[Icons]
+ForceFontDPI=96
+
+[ColorScheme]
+Theme=NotAnIconTheme
+";
+        assert_eq!(parse_kdeglobals_icon_theme(after_section), None);
+
+        let before_section = "\
+Theme=TopLevelIgnored
+[General]
+Theme=GeneralIgnored
+";
+        assert_eq!(parse_kdeglobals_icon_theme(before_section), None);
+    }
+
+    #[test]
+    fn with_max_entries_zero_disables_result_caching() {
+        let mut lookup = XdgIconLookup::with_max_entries(0);
+        assert_eq!(lookup.max_results, 0);
+        let _ = lookup.resolve("definitely-nonexistent-waywi-icon-xyz", 24);
+        assert!(lookup.result_cache.is_empty());
     }
 }

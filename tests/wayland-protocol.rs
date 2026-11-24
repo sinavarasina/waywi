@@ -24,11 +24,12 @@ use waywi::capabilities::Capability;
 use waywi::display::Output;
 use waywi::effect::EffectCtx;
 use waywi::error::{Result, WaywiError};
-use waywi::geometry::{GeoRect, LogicalPxExt, ScaleFactor, Size};
+use waywi::geometry::{Bounds, LogicalPxExt, ScaleFactor};
 #[cfg(feature = "ime")]
 use waywi::input::{ImeConfig, ImeContentPurpose, ImeEvent, TextInputState};
 use waywi::surface::{
-    Anchor, PopupAnchor, PopupConstraintAdjustment, PopupGravity, Surface, Surfaces,
+    Anchor, PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupPositioner, Surface,
+    Surfaces,
 };
 use waywi::{App, Application};
 
@@ -943,7 +944,7 @@ fn socketpair_probes_outputs_capabilities_and_exits_cleanly() {
     impl Application for ProbeApp {
         type State = ();
         type Message = ();
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             let caps = ctx.capabilities();
             assert!(caps.has(Capability::Wayland));
             assert!(!caps.has(Capability::LayerShell));
@@ -958,7 +959,7 @@ fn socketpair_probes_outputs_capabilities_and_exits_cleanly() {
             ctx.quit();
             Ok(())
         }
-        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_, Self::Message>) -> Result<()> {
             Ok(())
         }
         fn view(_: &()) -> Surfaces<()> {
@@ -979,17 +980,16 @@ fn missing_layer_shell_fails_honestly_without_silent_fallback() {
     impl Application for LayerApp {
         type State = ();
         type Message = ();
-        fn init(_: &mut EffectCtx<'_>) -> Result<()> {
+        fn init(_: &mut EffectCtx<'_, Self::Message>) -> Result<()> {
             Ok(())
         }
-        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_, Self::Message>) -> Result<()> {
             Ok(())
         }
         fn view(_: &()) -> Surfaces<()> {
             let mut s = Surfaces::new();
             s.push(
-                Surface::floating("osd", Output::Primary)
-                    .size(Size::px(120.logical_px(), 40.logical_px())),
+                Surface::floating("osd", Output::Primary).size((120.logical_px(), 40.logical_px())),
             );
             s
         }
@@ -1011,15 +1011,15 @@ fn missing_xdg_shell_for_window_fails_honestly() {
     impl Application for WindowApp {
         type State = ();
         type Message = ();
-        fn init(_: &mut EffectCtx<'_>) -> Result<()> {
+        fn init(_: &mut EffectCtx<'_, Self::Message>) -> Result<()> {
             Ok(())
         }
-        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(_: &mut (), _: (), _: &mut EffectCtx<'_, Self::Message>) -> Result<()> {
             Ok(())
         }
         fn view(_: &()) -> Surfaces<()> {
             let mut s = Surfaces::new();
-            s.push(Surface::window("win").size(Size::px(200.logical_px(), 100.logical_px())));
+            s.push(Surface::window("win").size((200.logical_px(), 100.logical_px())));
             s
         }
     }
@@ -1059,7 +1059,7 @@ fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
         type State = ImeProtoState;
         type Message = ImeProtoMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             assert!(ctx.capabilities().has(Capability::Wayland));
             assert!(ctx.capabilities().has(Capability::XdgShell));
             assert!(ctx.capabilities().has(Capability::TextInput));
@@ -1069,7 +1069,7 @@ fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 ImeProtoMsg::Ime(ev) => {
@@ -1078,7 +1078,7 @@ fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
                     if state.input.text() == "日本" {
                         state.final_text = Some(state.input.text().to_owned());
                         // Give the view -> Wayland update + socket flush one tick before exit.
-                        ctx.after(Duration::from_millis(40), || ImeProtoMsg::Quit);
+                        ctx.after(Duration::from_millis(40), ImeProtoMsg::Quit);
                     }
                 }
                 ImeProtoMsg::Quit => {
@@ -1095,12 +1095,12 @@ fn socketpair_text_input_v3_roundtrip_preedit_commit_and_surrounding() {
             let cursor_x = 10 + (state.input.before_cursor().chars().count() as i32 * 8);
             s.push(
                 Surface::window("ime-win")
-                    .size(Size::px(320.logical_px(), 64.logical_px()))
+                    .size((320.logical_px(), 64.logical_px()))
                     .ime(
                         ImeConfig::enabled()
                             .from_text_input(&state.input)
                             .content_purpose(ImeContentPurpose::Email)
-                            .cursor_rect(GeoRect::new(
+                            .cursor_rect(Bounds::new(
                                 (cursor_x as f32).logical_px(),
                                 20.logical_px(),
                                 2.logical_px(),
@@ -1170,20 +1170,20 @@ fn socketpair_xdg_activation_v1_token_and_activate_roundtrip() {
         type State = ();
         type Message = ActMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             assert!(ctx.capabilities().has(Capability::XdgShell));
             assert!(ctx.capabilities().has(Capability::XdgActivation));
             // Trigger token request once the initial toplevel surface is mapped.
-            ctx.after(Duration::from_millis(20), || ActMsg::RequestToken);
+            ctx.after(Duration::from_millis(20), ActMsg::RequestToken);
             // Failsafe timeout so protocol regressions fail assertions instead of hanging.
-            ctx.after(Duration::from_secs(5), || ActMsg::Quit);
+            ctx.after(Duration::from_secs(5), ActMsg::Quit);
             Ok(())
         }
 
         fn update(
             _state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 ActMsg::RequestToken => {
@@ -1196,7 +1196,7 @@ fn socketpair_xdg_activation_v1_token_and_activate_roundtrip() {
                     if let Some(t) = tok {
                         ctx.activate_surface("act-win", t)?;
                     }
-                    ctx.after(Duration::from_millis(30), || ActMsg::Quit);
+                    ctx.after(Duration::from_millis(30), ActMsg::Quit);
                 }
                 ActMsg::Quit => {
                     ctx.quit();
@@ -1207,7 +1207,7 @@ fn socketpair_xdg_activation_v1_token_and_activate_roundtrip() {
 
         fn view(_state: &Self::State) -> Surfaces<Self::Message> {
             let mut s = Surfaces::new();
-            s.push(Surface::window("act-win").size(Size::px(240.logical_px(), 80.logical_px())));
+            s.push(Surface::window("act-win").size((240.logical_px(), 80.logical_px())));
             s
         }
     }
@@ -1247,7 +1247,7 @@ fn socketpair_missing_xdg_activation_delivers_unsupported_capability() {
         type State = ();
         type Message = MissingActMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             assert!(!ctx.capabilities().has(Capability::XdgActivation));
             ctx.request_activation_token(Some("org.waywi.Launcher"), |res| {
                 MissingActMsg::GotResult(matches!(
@@ -1261,7 +1261,7 @@ fn socketpair_missing_xdg_activation_delivers_unsupported_capability() {
         fn update(
             _state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             let MissingActMsg::GotResult(is_unsupported) = msg;
             SAW_UNSUPPORTED.store(is_unsupported, Ordering::Relaxed);
@@ -1305,13 +1305,13 @@ fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
         type State = PopupState;
         type Message = PopupMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             assert!(ctx.capabilities().has(Capability::LayerShell));
             assert!(ctx.capabilities().has(Capability::XdgShell));
             // Give initial layer + popup creation & configure one tick before repositioning.
-            ctx.after(Duration::from_millis(30), || PopupMsg::Reposition);
+            ctx.after(Duration::from_millis(30), PopupMsg::Reposition);
             // Failsafe timeout so protocol regressions fail assertions instead of hanging.
-            ctx.after(Duration::from_secs(5), || PopupMsg::Quit);
+            ctx.after(Duration::from_secs(5), PopupMsg::Quit);
             Ok(PopupState {
                 open: true,
                 offset_y: 8,
@@ -1322,7 +1322,7 @@ fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 PopupMsg::Reposition => {
@@ -1333,7 +1333,7 @@ fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
                     state.open = false;
                     OBSERVED_DISMISSED.store(true, Ordering::Relaxed);
                     // Wait briefly so view sync + destroy flushes cleanly before quitting.
-                    ctx.after(Duration::from_millis(30), || PopupMsg::Quit);
+                    ctx.after(Duration::from_millis(30), PopupMsg::Quit);
                 }
                 PopupMsg::Quit => {
                     ctx.quit();
@@ -1347,20 +1347,23 @@ fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
             s.push(
                 Surface::panel("bar", Output::Primary)
                     .anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT)
-                    .size(Size::px(1920.logical_px(), 32.logical_px())),
+                    .size((1920.logical_px(), 32.logical_px())),
             );
             if state.open {
                 s.push(
                     Surface::popup("menu", "bar")
-                        .size(Size::px(180.logical_px(), 120.logical_px()))
-                        .anchor_rect(GeoRect::from_xywh(12.0, 0.0, 80.0, 32.0))
-                        .popup_anchor(PopupAnchor::BottomLeft)
-                        .popup_gravity(PopupGravity::BottomRight)
-                        .popup_offset(4.logical_px(), state.offset_y.logical_px())
-                        .popup_constraints(
-                            PopupConstraintAdjustment::FLIP_Y | PopupConstraintAdjustment::SLIDE_X,
+                        .size((180.logical_px(), 120.logical_px()))
+                        .positioner(
+                            PopupPositioner::new(Bounds::from_xywh(12.0, 0.0, 80.0, 32.0))
+                                .anchor(PopupAnchor::BottomLeft)
+                                .gravity(PopupGravity::BottomRight)
+                                .offset(4.logical_px(), state.offset_y.logical_px())
+                                .constraint_adjustment(
+                                    PopupConstraintAdjustment::FLIP_Y
+                                        | PopupConstraintAdjustment::SLIDE_X,
+                                )
+                                .reactive(true),
                         )
-                        .popup_reactive(true)
                         .on_close(PopupMsg::Dismissed),
                 );
             }

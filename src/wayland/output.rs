@@ -4,22 +4,22 @@ use smithay_client_toolkit::output::{OutputInfo as SctkOutputInfo, OutputState};
 use wayland_client::Proxy;
 use wayland_client::protocol::wl_output;
 
-use crate::display::{OutputId, OutputInfo, Transform};
+use crate::display::{OutputId, OutputInfo, OutputTransform};
 use crate::geometry::{LogicalPx, LogicalSize, Point, ScaleFactor};
 
-/// Maps Wayland `wl_output::Transform` onto WayWi's [`Transform`].
+/// Maps Wayland `wl_output::Transform` onto WayWi's [`OutputTransform`].
 #[must_use]
-pub(crate) fn map_transform(tr: wl_output::Transform) -> Transform {
+pub(crate) fn map_transform(tr: wl_output::Transform) -> OutputTransform {
     match tr {
-        wl_output::Transform::Normal => Transform::Normal,
-        wl_output::Transform::_90 => Transform::Rotate90,
-        wl_output::Transform::_180 => Transform::Rotate180,
-        wl_output::Transform::_270 => Transform::Rotate270,
-        wl_output::Transform::Flipped => Transform::Flipped,
-        wl_output::Transform::Flipped90 => Transform::Flipped90,
-        wl_output::Transform::Flipped180 => Transform::Flipped180,
-        wl_output::Transform::Flipped270 => Transform::Flipped270,
-        _ => Transform::Normal,
+        wl_output::Transform::Normal => OutputTransform::Normal,
+        wl_output::Transform::_90 => OutputTransform::Rotate90,
+        wl_output::Transform::_180 => OutputTransform::Rotate180,
+        wl_output::Transform::_270 => OutputTransform::Rotate270,
+        wl_output::Transform::Flipped => OutputTransform::Flipped,
+        wl_output::Transform::Flipped90 => OutputTransform::Flipped90,
+        wl_output::Transform::Flipped180 => OutputTransform::Flipped180,
+        wl_output::Transform::Flipped270 => OutputTransform::Flipped270,
+        _ => OutputTransform::Normal,
     }
 }
 

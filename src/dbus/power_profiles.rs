@@ -7,13 +7,14 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
     DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
 };
 use super::types::{Dbus, DbusBus};
-use super::worker::AsyncStopSignal;
+use super::worker::DbusWorkerHandle;
+use super::zvariant_helpers::get_all;
 
 const POWER_PROFILE_TARGETS: &[(&str, &str)] = &[
     ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles"),
@@ -83,52 +84,42 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusPowerProfiles {
-                key: "dbus:power-profiles".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Reads the current [`PowerProfileSnapshot`] from the subscription cache (0 ms) or the
-    /// system bus.
-    pub fn power_profile_snapshot(&self) -> Result<PowerProfileSnapshot> {
-        if let Ok(guard) = self.cache.power_profiles.read()
-            && let Some(ref snap) = *guard
-        {
-            return Ok(snap.clone());
-        }
-        let conn = self.connection(DbusBus::System)?;
-        let mut last_err = None;
-        for &(dest, path) in POWER_PROFILE_TARGETS {
-            match conn.call_method(
-                Some(dest),
-                path,
-                Some("org.freedesktop.DBus.Properties"),
-                "GetAll",
-                &(dest,),
-            ) {
-                Ok(reply) => {
-                    let props: HashMap<String, OwnedValue> = reply
-                        .body()
-                        .deserialize()
-                        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-                    return Ok(parse_power_profile_props(dest, &props));
-                }
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(WaywiError::DbusError(format!(
-            "power profiles service unavailable: {}",
-            last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
-        )))
+/// Zero-cost domain handle for `power-profiles-daemon` / `tuned-ppd` queries and profile switching.
+#[derive(Clone, Copy)]
+pub struct PowerProfilesClient<'a>(pub(super) &'a DbusClient);
+
+impl PowerProfilesClient<'_> {
+    /// Returns the latest cached [`PowerProfileSnapshot`] from an active [`Dbus::power_profiles`]
+    /// subscription without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshot(&self) -> Option<PowerProfileSnapshot> {
+        self.0
+            .cache
+            .power_profiles
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Queries the system bus synchronously for the current [`PowerProfileSnapshot`].
+    pub fn snapshot_blocking(&self) -> Result<PowerProfileSnapshot> {
+        let conn = self.0.async_connection(DbusBus::System)?;
+        futures_lite::future::block_on(async move {
+            let (_, _, snap) = fetch_power_profile_snapshot(&conn).await?;
+            Ok(snap)
+        })
     }
 
     /// Switches the active system power profile (`"power-saver"`, `"balanced"`, `"performance"`).
-    pub fn set_power_profile(&self, profile: PowerProfileKind) -> Result<()> {
+    pub fn set_profile(&self, profile: PowerProfileKind) -> Result<()> {
         let target = profile.as_str().to_owned();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -164,42 +155,50 @@ impl DbusClient {
         )
     }
 
-    /// Acquires a temporary power profile hold and returns the hold cookie for [`Self::release_power_profile`].
-    pub fn hold_power_profile(
+    /// Acquires a temporary power profile hold synchronously and returns the hold cookie for
+    /// [`Self::release_hold`].
+    pub fn hold_blocking(
         &self,
         profile: PowerProfileKind,
         reason: &str,
-        application_id: &str,
+        app_id: &str,
     ) -> Result<u32> {
-        let conn = self.connection(DbusBus::System)?;
-        let mut last_err = None;
-        for &(dest, path) in POWER_PROFILE_TARGETS {
-            match conn.call_method(
-                Some(dest),
-                path,
-                Some(dest),
-                "HoldProfile",
-                &(profile.as_str(), reason, application_id),
-            ) {
-                Ok(reply) => {
-                    let cookie: u32 = reply
-                        .body()
-                        .deserialize()
-                        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-                    return Ok(cookie);
+        let conn = self.0.async_connection(DbusBus::System)?;
+        let reason = reason.to_owned();
+        let app_id = app_id.to_owned();
+        futures_lite::future::block_on(async move {
+            let mut last_err = None;
+            for &(dest, path) in POWER_PROFILE_TARGETS {
+                match conn
+                    .call_method(
+                        Some(dest),
+                        path,
+                        Some(dest),
+                        "HoldProfile",
+                        &(profile.as_str(), reason.as_str(), app_id.as_str()),
+                    )
+                    .await
+                {
+                    Ok(reply) => {
+                        let cookie: u32 = reply
+                            .body()
+                            .deserialize()
+                            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                        return Ok(cookie);
+                    }
+                    Err(err) => last_err = Some(err),
                 }
-                Err(err) => last_err = Some(err),
             }
-        }
-        Err(WaywiError::DbusError(format!(
-            "HoldProfile failed: {}",
-            last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
-        )))
+            Err(WaywiError::DbusError(format!(
+                "HoldProfile failed: {}",
+                last_err.map_or_else(|| "unknown error".to_owned(), |e| e.to_string())
+            )))
+        })
     }
 
     /// Releases a previously acquired power profile hold cookie.
-    pub fn release_power_profile(&self, cookie: u32) -> Result<()> {
-        self.submit_lane_action(
+    pub fn release_hold(&self, cookie: u32) -> Result<()> {
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -300,107 +299,82 @@ fn non_empty_str_prop(val: Option<&OwnedValue>) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(crate) struct PowerProfilesWorker {
-    stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
-}
+pub(crate) struct PowerProfilesWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl PowerProfilesWorker {
     pub(crate) fn spawn(
         sender: calloop::channel::Sender<PowerProfileSnapshot>,
         shared: DbusSharedBus,
     ) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-ppd".to_owned())
-            .spawn(move || {
-                let Ok(conn) = connect_shared_bus(DbusBus::System, &shared) else {
-                    return;
-                };
-                futures_lite::future::block_on(async move {
-                    if let Some((dest, path, snap)) = fetch_async_snapshot(&conn).await {
-                        let _ = sender.send(snap);
-                        let Ok(rule) = zbus::MatchRule::builder()
-                            .msg_type(zbus::message::Type::Signal)
-                            .interface("org.freedesktop.DBus.Properties")
-                            .and_then(|b| b.member("PropertiesChanged"))
-                            .and_then(|b| b.path(path))
-                        else {
-                            return;
-                        };
-                        let Ok(mut stream) =
-                            zbus::MessageStream::for_match_rule(rule.build(), &conn, Some(32))
-                                .await
-                        else {
-                            return;
-                        };
-                        use futures_lite::StreamExt;
-                        while !stop_sig.is_stopped() {
-                            let next_msg = futures_lite::future::or(
-                                async { Some(stream.next().await) },
-                                async {
-                                    stop_sig.wait_stopped().await;
-                                    None
-                                },
-                            )
+        Self(DbusWorkerHandle::spawn("waywi-dbus-ppd", move |stop_sig| {
+            let Ok(conn) = connect_shared_bus(DbusBus::System, &shared) else {
+                return;
+            };
+            futures_lite::future::block_on(async move {
+                if let Ok((dest, path, snap)) = fetch_power_profile_snapshot(&conn).await {
+                    let _ = sender.send(snap);
+                    let Ok(rule) = zbus::MatchRule::builder()
+                        .msg_type(zbus::message::Type::Signal)
+                        .interface("org.freedesktop.DBus.Properties")
+                        .and_then(|b| b.member("PropertiesChanged"))
+                        .and_then(|b| b.path(path))
+                    else {
+                        return;
+                    };
+                    let Ok(mut stream) =
+                        zbus::MessageStream::for_match_rule(rule.build(), &conn, Some(32)).await
+                    else {
+                        return;
+                    };
+                    use futures_lite::StreamExt;
+                    while !stop_sig.is_stopped() {
+                        let next_msg =
+                            futures_lite::future::or(async { Some(stream.next().await) }, async {
+                                stop_sig.wait_stopped().await;
+                                None
+                            })
                             .await;
-                            let Some(Some(Ok(_))) = next_msg else {
-                                break;
-                            };
-                            if let Ok(reply) = conn
-                                .call_method(
-                                    Some(dest),
-                                    path,
-                                    Some("org.freedesktop.DBus.Properties"),
-                                    "GetAll",
-                                    &(dest,),
-                                )
-                                .await
-                                && let Ok(props) =
-                                    reply.body().deserialize::<HashMap<String, OwnedValue>>()
-                            {
-                                let _ = sender.send(parse_power_profile_props(dest, &props));
+                        let Some(Some(Ok(_))) = next_msg else {
+                            break;
+                        };
+                        let mut stream_closed = false;
+                        while let Some(item) = futures_lite::future::poll_once(stream.next()).await
+                        {
+                            match item {
+                                Some(Ok(_)) => {}
+                                Some(Err(_)) | None => {
+                                    stream_closed = true;
+                                    break;
+                                }
                             }
                         }
-                    } else {
-                        stop_sig.wait_stopped().await;
+                        if let Ok(props) = get_all(&conn, dest, path, dest).await {
+                            let _ = sender.send(parse_power_profile_props(dest, &props));
+                        }
+                        if stream_closed {
+                            break;
+                        }
                     }
-                });
-            })
-            .ok();
-        Self { stop, join }
+                } else {
+                    stop_sig.wait_stopped().await;
+                }
+            });
+        }))
     }
 }
 
-impl Drop for PowerProfilesWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-}
-
-async fn fetch_async_snapshot(
+async fn fetch_power_profile_snapshot(
     conn: &zbus::Connection,
-) -> Option<(&'static str, &'static str, PowerProfileSnapshot)> {
+) -> Result<(&'static str, &'static str, PowerProfileSnapshot)> {
+    let mut last_err = None;
     for &(dest, path) in POWER_PROFILE_TARGETS {
-        if let Ok(reply) = conn
-            .call_method(
-                Some(dest),
-                path,
-                Some("org.freedesktop.DBus.Properties"),
-                "GetAll",
-                &(dest,),
-            )
-            .await
-            && let Ok(props) = reply.body().deserialize::<HashMap<String, OwnedValue>>()
-        {
-            return Some((dest, path, parse_power_profile_props(dest, &props)));
+        match get_all(conn, dest, path, dest).await {
+            Ok(props) => return Ok((dest, path, parse_power_profile_props(dest, &props))),
+            Err(err) => last_err = Some(err),
         }
     }
-    None
+    Err(last_err
+        .unwrap_or_else(|| WaywiError::DbusError("power profiles service unavailable".to_owned())))
 }
 
 #[cfg(test)]

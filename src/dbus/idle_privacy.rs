@@ -3,11 +3,12 @@
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec};
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
+use super::zvariant_helpers::{dict_bool, get_all};
 
 const SCREENSAVER_DEST: &str = "org.freedesktop.ScreenSaver";
 const SCREENSAVER_PATH: &str = "/org/freedesktop/ScreenSaver";
@@ -36,7 +37,6 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusScreenSaver {
-                key: "dbus:screensaver".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
@@ -46,35 +46,27 @@ impl Dbus {
     pub fn geoclue<M: 'static>(map: impl Fn(GeoClueSnapshot) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusGeoClue {
-                key: "dbus:geoclue2".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Queries whether `org.freedesktop.ScreenSaver` reports the screensaver/lock as active.
-    pub fn screensaver_active(&self) -> Result<bool> {
-        let conn = self.connection(DbusBus::Session)?;
-        let reply = conn
-            .call_method(
-                Some(SCREENSAVER_DEST),
-                SCREENSAVER_PATH,
-                Some(SCREENSAVER_IFACE),
-                "GetActive",
-                &(),
-            )
-            .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.GetActive failed: {e}")))?;
-        reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))
+/// Zero-cost domain handle for `org.freedesktop.ScreenSaver` state and idle inhibition.
+#[derive(Clone, Copy)]
+pub struct ScreenSaverClient<'a>(pub(super) &'a DbusClient);
+
+impl ScreenSaverClient<'_> {
+    /// Queries synchronously whether `org.freedesktop.ScreenSaver` reports active lock/blanking.
+    pub fn active_blocking(&self) -> Result<bool> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(query_screensaver_active(&conn))
     }
 
     /// Locks the desktop screensaver via `org.freedesktop.ScreenSaver.Lock`.
-    pub fn lock_screensaver(&self) -> Result<()> {
-        self.call_method_unit(
+    pub fn lock(&self) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Desktop,
             DbusBus::Session,
             SCREENSAVER_DEST,
             SCREENSAVER_PATH,
@@ -83,27 +75,33 @@ impl DbusClient {
         )
     }
 
-    /// Inhibits idle screensaver activation and returns the cookie for [`Self::uninhibit_screensaver`].
-    pub fn inhibit_screensaver(&self, app_name: &str, reason: &str) -> Result<u32> {
-        let conn = self.connection(DbusBus::Session)?;
-        let reply = conn
-            .call_method(
-                Some(SCREENSAVER_DEST),
-                SCREENSAVER_PATH,
-                Some(SCREENSAVER_IFACE),
-                "Inhibit",
-                &(app_name, reason),
-            )
-            .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.Inhibit failed: {e}")))?;
-        reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))
+    /// Inhibits idle screensaver activation synchronously and returns the cookie for
+    /// [`Self::uninhibit`].
+    pub fn inhibit_blocking(&self, app: &str, reason: &str) -> Result<u32> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        let app = app.to_owned();
+        let reason = reason.to_owned();
+        futures_lite::future::block_on(async move {
+            let reply = conn
+                .call_method(
+                    Some(SCREENSAVER_DEST),
+                    SCREENSAVER_PATH,
+                    Some(SCREENSAVER_IFACE),
+                    "Inhibit",
+                    &(app.as_str(), reason.as_str()),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.Inhibit failed: {e}")))?;
+            reply
+                .body()
+                .deserialize()
+                .map_err(|e| WaywiError::DbusError(e.to_string()))
+        })
     }
 
     /// Releases a previously acquired `org.freedesktop.ScreenSaver` inhibit cookie.
-    pub fn uninhibit_screensaver(&self, cookie: u32) -> Result<()> {
-        self.submit_lane_action(
+    pub fn uninhibit(&self, cookie: u32) -> Result<()> {
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::Session,
@@ -124,10 +122,16 @@ impl DbusClient {
             },
         )
     }
+}
 
-    /// Reads `org.freedesktop.GeoClue2.Manager.InUse` from the system bus.
-    pub fn geoclue_in_use(&self) -> Result<bool> {
-        let val = self.get_property(
+/// Zero-cost domain handle for `org.freedesktop.GeoClue2` location access queries.
+#[derive(Clone, Copy)]
+pub struct GeoClueClient<'a>(pub(super) &'a DbusClient);
+
+impl GeoClueClient<'_> {
+    /// Reads `org.freedesktop.GeoClue2.Manager.InUse` synchronously from the system bus.
+    pub fn in_use_blocking(&self) -> Result<bool> {
+        let val = self.0.get_property(
             DbusBus::System,
             GEOCLUE_DEST,
             GEOCLUE_PATH,
@@ -136,6 +140,23 @@ impl DbusClient {
         )?;
         Ok(val.as_bool().unwrap_or(false))
     }
+}
+
+async fn query_screensaver_active(conn: &zbus::Connection) -> Result<bool> {
+    let reply = conn
+        .call_method(
+            Some(SCREENSAVER_DEST),
+            SCREENSAVER_PATH,
+            Some(SCREENSAVER_IFACE),
+            "GetActive",
+            &(),
+        )
+        .await
+        .map_err(|e| WaywiError::DbusError(format!("ScreenSaver.GetActive failed: {e}")))?;
+    reply
+        .body()
+        .deserialize()
+        .map_err(|e| WaywiError::DbusError(e.to_string()))
 }
 
 pub(crate) fn spawn_screensaver_worker(
@@ -150,17 +171,7 @@ pub(crate) fn spawn_screensaver_worker(
         sender,
         shared,
         |conn| async move {
-            let reply = conn
-                .call_method(
-                    Some(SCREENSAVER_DEST),
-                    SCREENSAVER_PATH,
-                    Some(SCREENSAVER_IFACE),
-                    "GetActive",
-                    &(),
-                )
-                .await
-                .ok()?;
-            let active: bool = reply.body().deserialize().ok()?;
+            let active = query_screensaver_active(&conn).await.ok()?;
             Some(ScreenSaverSnapshot { active })
         },
     )
@@ -178,14 +189,10 @@ pub(crate) fn spawn_geoclue_worker(
         sender,
         shared,
         |conn| async move {
-            let props = super::zvariant_helpers::get_all_async(
-                &conn,
-                GEOCLUE_DEST,
-                GEOCLUE_PATH,
-                GEOCLUE_IFACE,
-            )
-            .await?;
-            let in_use = super::zvariant_helpers::dict_bool(&props, "InUse").unwrap_or(false);
+            let props = get_all(&conn, GEOCLUE_DEST, GEOCLUE_PATH, GEOCLUE_IFACE)
+                .await
+                .ok()?;
+            let in_use = dict_bool(&props, "InUse").unwrap_or(false);
             Some(GeoClueSnapshot { in_use })
         },
     )

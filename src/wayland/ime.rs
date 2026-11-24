@@ -11,7 +11,7 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_v3::{self, ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3},
 };
 
-use crate::geometry::Rect as GeoRect;
+use crate::geometry::Bounds;
 use crate::input::{ImeConfig, ImeContentPurpose, ImeEvent, ImePreedit};
 use crate::wayland::connection::WaylandState;
 use crate::wayland::surface_state::WaylandEvent;
@@ -242,7 +242,7 @@ fn to_wire_purpose(purpose: ImeContentPurpose) -> ContentPurpose {
     }
 }
 
-fn to_wire_cursor_rect(rect: GeoRect) -> (i32, i32, i32, i32) {
+fn to_wire_cursor_rect(rect: Bounds) -> (i32, i32, i32, i32) {
     (
         rect.x.0.round() as i32,
         rect.y.0.round() as i32,

@@ -21,13 +21,13 @@ use crate::render::style::Color;
 #[cfg(feature = "text")]
 use crate::text::engine::{TextDrawParams, TextEngine, TextRasterTarget};
 
-/// Maximum cumulative RGBA GPU upload budget tracked across cached assets, sprites, and text.
-const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Default cumulative RGBA GPU upload budget tracked across cached assets, sprites, and text.
+const DEFAULT_MAX_IMAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ASSET_IMAGES: usize = 256;
 const MAX_SPRITE_IMAGES: usize = 256;
 #[cfg(feature = "text")]
 const MAX_TEXT_IMAGES: usize = 512;
-const STALE_IMAGE_AGE_FRAMES: u64 = 240;
+const DEFAULT_STALE_IMAGE_AGE_FRAMES: u64 = 120;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CachedImageMeta<I = ImageId> {
@@ -48,7 +48,7 @@ impl<I> CachedImageMeta<I> {
 pub(crate) type CachedGpuImage = CachedImageMeta<ImageId>;
 
 pub(crate) struct CachedCanvasOps {
-    pub(crate) render_key: u64,
+    pub(crate) cache_key: u64,
     pub(crate) width_px: u32,
     pub(crate) height_px: u32,
     pub(crate) ops: Vec<CanvasOp>,
@@ -72,16 +72,25 @@ struct GpuImageStore<I: Copy> {
     texts: HashMap<u64, CachedImageMeta<I>>,
     total_bytes: usize,
     max_bytes: usize,
+    stale_age_frames: u64,
 }
 
 impl<I: Copy> Default for GpuImageStore<I> {
     fn default() -> Self {
-        Self::with_max_bytes(MAX_IMAGE_CACHE_BYTES)
+        Self::with_limits(
+            DEFAULT_MAX_IMAGE_CACHE_BYTES,
+            DEFAULT_STALE_IMAGE_AGE_FRAMES,
+        )
     }
 }
 
 impl<I: Copy> GpuImageStore<I> {
+    #[cfg(test)]
     fn with_max_bytes(max_bytes: usize) -> Self {
+        Self::with_limits(max_bytes, 240)
+    }
+
+    fn with_limits(max_bytes: usize, stale_age_frames: u64) -> Self {
         Self {
             assets: HashMap::new(),
             sprites: HashMap::new(),
@@ -89,6 +98,7 @@ impl<I: Copy> GpuImageStore<I> {
             texts: HashMap::new(),
             total_bytes: 0,
             max_bytes,
+            stale_age_frames: stale_age_frames.max(1),
         }
     }
 
@@ -96,11 +106,12 @@ impl<I: Copy> GpuImageStore<I> {
         map: &mut HashMap<K, CachedImageMeta<I>>,
         total_bytes: &mut usize,
         frame_seq: u64,
+        stale_age: u64,
         evicted: &mut Vec<I>,
     ) {
         let stale: Vec<_> = map
             .iter()
-            .filter(|(_, v)| frame_seq.saturating_sub(v.last_used_frame) >= STALE_IMAGE_AGE_FRAMES)
+            .filter(|(_, v)| frame_seq.saturating_sub(v.last_used_frame) >= stale_age)
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
@@ -124,12 +135,13 @@ impl<I: Copy> GpuImageStore<I> {
         total_bytes: &mut usize,
         cap: usize,
         frame_seq: u64,
+        stale_age: u64,
         evicted: &mut Vec<I>,
     ) {
         if map.len() < cap {
             return;
         }
-        Self::prune_map_stale(map, total_bytes, frame_seq, evicted);
+        Self::prune_map_stale(map, total_bytes, frame_seq, stale_age, evicted);
         while map.len() >= cap {
             let Some((oldest_key, _)) = Self::oldest_key_in(map) else {
                 break;
@@ -139,6 +151,49 @@ impl<I: Copy> GpuImageStore<I> {
                 evicted.push(old.id);
             }
         }
+    }
+
+    fn evict_asset(&mut self, asset_id: AssetId) -> Vec<I> {
+        let mut evicted = Vec::new();
+        let asset_keys: Vec<_> = self
+            .assets
+            .keys()
+            .filter(|(id, _, _)| *id == asset_id)
+            .copied()
+            .collect();
+        for k in asset_keys {
+            if let Some(old) = self.assets.remove(&k) {
+                self.total_bytes = self.total_bytes.saturating_sub(old.byte_size());
+                evicted.push(old.id);
+            }
+        }
+        let sprite_keys: Vec<_> = self
+            .sprites
+            .keys()
+            .filter(|(id, _, _, _, _, _, _)| *id == asset_id)
+            .copied()
+            .collect();
+        for k in sprite_keys {
+            if let Some(old) = self.sprites.remove(&k) {
+                self.total_bytes = self.total_bytes.saturating_sub(old.byte_size());
+                evicted.push(old.id);
+            }
+        }
+        evicted
+    }
+
+    fn clear_all(&mut self) -> Vec<I> {
+        let mut evicted = Vec::new();
+        evicted.extend(self.assets.drain().map(|(_, v)| v.id));
+        evicted.extend(self.sprites.drain().map(|(_, v)| v.id));
+        #[cfg(feature = "text")]
+        evicted.extend(self.texts.drain().map(|(_, v)| v.id));
+        self.assets.shrink_to_fit();
+        self.sprites.shrink_to_fit();
+        #[cfg(feature = "text")]
+        self.texts.shrink_to_fit();
+        self.total_bytes = 0;
+        evicted
     }
 
     fn evict_oldest_global(&mut self) -> Option<I> {
@@ -184,10 +239,29 @@ impl<I: Copy> GpuImageStore<I> {
         if self.total_bytes.saturating_add(incoming_bytes) <= self.max_bytes {
             return;
         }
-        Self::prune_map_stale(&mut self.assets, &mut self.total_bytes, frame_seq, evicted);
-        Self::prune_map_stale(&mut self.sprites, &mut self.total_bytes, frame_seq, evicted);
+        let stale_age = self.stale_age_frames;
+        Self::prune_map_stale(
+            &mut self.assets,
+            &mut self.total_bytes,
+            frame_seq,
+            stale_age,
+            evicted,
+        );
+        Self::prune_map_stale(
+            &mut self.sprites,
+            &mut self.total_bytes,
+            frame_seq,
+            stale_age,
+            evicted,
+        );
         #[cfg(feature = "text")]
-        Self::prune_map_stale(&mut self.texts, &mut self.total_bytes, frame_seq, evicted);
+        Self::prune_map_stale(
+            &mut self.texts,
+            &mut self.total_bytes,
+            frame_seq,
+            stale_age,
+            evicted,
+        );
         while self.total_bytes.saturating_add(incoming_bytes) > self.max_bytes {
             let Some(id) = self.evict_oldest_global() else {
                 break;
@@ -203,11 +277,13 @@ impl<I: Copy> GpuImageStore<I> {
         frame_seq: u64,
     ) -> Vec<I> {
         let mut evicted = Vec::new();
+        let stale_age = self.stale_age_frames;
         Self::evict_map_for_cap(
             &mut self.assets,
             &mut self.total_bytes,
             MAX_ASSET_IMAGES,
             frame_seq,
+            stale_age,
             &mut evicted,
         );
         self.prepare_budget(entry.byte_size(), frame_seq, &mut evicted);
@@ -226,11 +302,13 @@ impl<I: Copy> GpuImageStore<I> {
         frame_seq: u64,
     ) -> Vec<I> {
         let mut evicted = Vec::new();
+        let stale_age = self.stale_age_frames;
         Self::evict_map_for_cap(
             &mut self.sprites,
             &mut self.total_bytes,
             MAX_SPRITE_IMAGES,
             frame_seq,
+            stale_age,
             &mut evicted,
         );
         self.prepare_budget(entry.byte_size(), frame_seq, &mut evicted);
@@ -245,11 +323,13 @@ impl<I: Copy> GpuImageStore<I> {
     #[cfg(feature = "text")]
     fn insert_text(&mut self, key: u64, entry: CachedImageMeta<I>, frame_seq: u64) -> Vec<I> {
         let mut evicted = Vec::new();
+        let stale_age = self.stale_age_frames;
         Self::evict_map_for_cap(
             &mut self.texts,
             &mut self.total_bytes,
             MAX_TEXT_IMAGES,
             frame_seq,
+            stale_age,
             &mut evicted,
         );
         self.prepare_budget(entry.byte_size(), frame_seq, &mut evicted);
@@ -292,10 +372,31 @@ pub(crate) struct GpuTextureCache {
 }
 
 impl GpuTextureCache {
+    pub(crate) fn with_limits(max_bytes: usize, stale_age_frames: u64) -> Self {
+        Self {
+            images: GpuImageStore::with_limits(max_bytes, stale_age_frames),
+            canvases: HashMap::new(),
+        }
+    }
+
     pub(crate) fn drop_nodes(&mut self, node_ids: &[NodeId]) {
         for id in node_ids {
             self.canvases.remove(id);
         }
+    }
+
+    pub(crate) fn evict_asset(&mut self, canvas: &mut Canvas<WGPURenderer>, asset_id: AssetId) {
+        for old_id in self.images.evict_asset(asset_id) {
+            canvas.delete_image(old_id);
+        }
+    }
+
+    pub(crate) fn trim(&mut self, canvas: &mut Canvas<WGPURenderer>) {
+        for old_id in self.images.clear_all() {
+            canvas.delete_image(old_id);
+        }
+        self.canvases.clear();
+        self.canvases.shrink_to_fit();
     }
 
     pub(crate) fn resolve_asset_image(
@@ -478,28 +579,38 @@ impl GpuTextureCache {
         Some(entry)
     }
 
+    pub(crate) fn record_uncached_ops(
+        &self,
+        logical_size: LogicalSize,
+        scale_f: f32,
+        draw: &CanvasDrawHandle,
+    ) -> Vec<CanvasOp> {
+        let mut painter = Painter::new_recorded(logical_size, scale_f);
+        let painter_ptr = (&mut painter as *mut Painter<'_>).cast::<Painter<'static>>();
+        draw.func.call(painter_ptr);
+        painter.take_recorded_ops()
+    }
+
     pub(crate) fn resolve_canvas_ops(
         &mut self,
         node_id: NodeId,
-        render_key: u64,
+        cache_key: u64,
         logical_size: LogicalSize,
         scale_f: f32,
         draw: &CanvasDrawHandle,
     ) -> &[CanvasOp] {
         let px_w = (logical_size.width.0 * scale_f).ceil().max(1.0) as u32;
         let px_h = (logical_size.height.0 * scale_f).ceil().max(1.0) as u32;
-        let hit = self.canvases.get(&node_id).is_some_and(|c| {
-            c.render_key == render_key && c.width_px == px_w && c.height_px == px_h
-        });
+        let hit = self
+            .canvases
+            .get(&node_id)
+            .is_some_and(|c| c.cache_key == cache_key && c.width_px == px_w && c.height_px == px_h);
         if !hit {
-            let mut painter = Painter::new_recorded(logical_size, scale_f);
-            let painter_ptr = (&mut painter as *mut Painter<'_>).cast::<Painter<'static>>();
-            draw.func.call(painter_ptr);
-            let ops = painter.take_recorded_ops();
+            let ops = self.record_uncached_ops(logical_size, scale_f, draw);
             self.canvases.insert(
                 node_id,
                 CachedCanvasOps {
-                    render_key,
+                    cache_key,
                     width_px: px_w,
                     height_px: px_h,
                     ops,

@@ -10,7 +10,7 @@ use pipewire as pw;
 use pw::channel as pw_channel;
 use pw::device::{Device, DeviceChangeMask};
 use pw::metadata::Metadata;
-use pw::node::Node;
+use pw::node::{Node, NodeState};
 use pw::proxy::{Listener, ProxyListener, ProxyT};
 use pw::spa;
 use pw::types::ObjectType;
@@ -18,26 +18,34 @@ use spa::param::{ParamInfoFlags, ParamType};
 use spa::pod::Pod;
 use spa::sys as spa_sys;
 
-use crate::audio::backend::{AudioCommand, SharedAudioState, StreamMetadata};
+use crate::audio::backend::{AudioCommand, SharedAudioState, StreamMetadata, update_snapshot};
 use crate::audio::types::{
-    AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioEvent, AudioPort,
-    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance_with_map,
-    sanitize_linear_channels, scale_linear_channels,
+    AudioCard, AudioChannelPosition, AudioDevice, AudioDirection, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream, AudioTarget,
+    AudioVolume, apply_linear_balance_with_map, sanitize_linear_channels, scale_linear_channels,
 };
 
 use super::pod::{
     PropsExtracted, RouteParams, build_mute_pod, build_profile_pod, build_route_mute_pod,
     build_route_select_pod, build_route_volume_pod_channels, build_volume_pod_channels,
-    escape_json, parse_default_node_name, parse_profile_pod, parse_props_pod, parse_route_pod,
-    raw_to_db, raw_to_linear,
+    escape_json, linear_to_raw, parse_default_node_name, parse_profile_pod, parse_props_pod,
+    parse_route_pod, raw_to_db, raw_to_linear,
 };
+
+#[inline]
+const fn to_spa_direction(dir: AudioDirection) -> u32 {
+    match dir {
+        AudioDirection::Output => spa_sys::SPA_DIRECTION_OUTPUT,
+        AudioDirection::Input => spa_sys::SPA_DIRECTION_INPUT,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AudioNodeRecord {
     id: u32,
     name: String,
     description: String,
-    direction: u32,
+    direction: AudioDirection,
     device_id: Option<u32>,
     card_profile_device: Option<i32>,
     channels: usize,
@@ -53,7 +61,7 @@ impl AudioNodeRecord {
         id: u32,
         name: String,
         description: String,
-        direction: u32,
+        direction: AudioDirection,
         device_id: Option<u32>,
         card_profile_device: Option<i32>,
     ) -> Self {
@@ -71,6 +79,11 @@ impl AudioNodeRecord {
             nonzero_linear_template: Vec::new(),
             muted: false,
         }
+    }
+
+    #[inline]
+    const fn spa_direction(&self) -> u32 {
+        to_spa_direction(self.direction)
     }
 
     fn effective_channel_map(&self) -> Vec<AudioChannelPosition> {
@@ -91,6 +104,16 @@ impl AudioNodeRecord {
                 .copied()
                 .map(raw_to_linear)
                 .collect()
+        }
+    }
+
+    fn to_audio_volume(&self) -> AudioVolume {
+        AudioVolume {
+            linear: raw_to_linear(self.raw_volume),
+            channels: self.linear_channels(),
+            channel_map: self.effective_channel_map(),
+            db: raw_to_db(self.raw_volume),
+            muted: self.muted,
         }
     }
 
@@ -162,21 +185,13 @@ impl AudioNodeRecord {
     }
 }
 
-/// Direction of a per-application stream node (`Stream/Output/Audio` plays back,
-/// `Stream/Input/Audio` records).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamClass {
-    Playback,
-    Capture,
-}
-
 /// Classifies a PipeWire `media.class` value into a stream direction; only audio streams,
 /// matching either exact nodes or suffixed subclasses, are accepted.
-fn classify_media_class(class: &str) -> Option<StreamClass> {
+fn classify_media_class(class: &str) -> Option<AudioDirection> {
     if class.starts_with("Stream/Output/Audio") {
-        Some(StreamClass::Playback)
+        Some(AudioDirection::Output)
     } else if class.starts_with("Stream/Input/Audio") {
-        Some(StreamClass::Capture)
+        Some(AudioDirection::Input)
     } else {
         None
     }
@@ -186,18 +201,19 @@ fn classify_media_class(class: &str) -> Option<StreamClass> {
 #[derive(Debug, Clone)]
 struct AudioStreamRecord {
     id: u32,
+    direction: AudioDirection,
     name: String,
-    binary: Option<String>,
-    icon_name: Option<String>,
-    app_id: Option<String>,
+    app_name: Option<String>,
+    binary_name: Option<String>,
+    media_role: Option<String>,
     target_id: Option<u32>,
+    corked: bool,
     channels: usize,
     raw_volume: f32,
     raw_channels: Vec<f32>,
     channel_map: Vec<AudioChannelPosition>,
     nonzero_linear_template: Vec<f32>,
     muted: bool,
-    playback: bool,
 }
 
 impl AudioStreamRecord {
@@ -222,19 +238,51 @@ impl AudioStreamRecord {
         }
     }
 
-    fn apply_props(&mut self, props: &PropsExtracted) {
-        if let Some(ref ch_vols) = props.channel_volumes {
-            self.channels = ch_vols.len().max(1);
-            let peak = ch_vols
+    fn to_audio_stream(&self) -> AudioStream {
+        AudioStream {
+            id: self.id,
+            direction: self.direction,
+            name: self.name.clone(),
+            app_name: self.app_name.clone(),
+            binary_name: self.binary_name.clone(),
+            media_role: self.media_role.clone(),
+            device_id: self.target_id,
+            corked: self.corked,
+            volume: AudioVolume {
+                linear: raw_to_linear(self.raw_volume),
+                channels: self.linear_channels(),
+                channel_map: self.effective_channel_map(),
+                db: raw_to_db(self.raw_volume),
+                muted: self.muted,
+            },
+        }
+    }
+
+    fn set_raw_channel_volumes(&mut self, ch_vols: Vec<f32>) {
+        if ch_vols.is_empty() {
+            return;
+        }
+        self.channels = ch_vols.len().max(1);
+        let peak = ch_vols
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0_f32, f32::max);
+        self.raw_volume = peak;
+        self.raw_channels = ch_vols;
+        if peak > 1e-6 {
+            self.nonzero_linear_template = self
+                .raw_channels
                 .iter()
                 .copied()
-                .filter(|v| v.is_finite())
-                .fold(0.0_f32, f32::max);
-            self.raw_volume = peak;
-            self.raw_channels.clone_from(ch_vols);
-            if peak > 1e-6 {
-                self.nonzero_linear_template = ch_vols.iter().copied().map(raw_to_linear).collect();
-            }
+                .map(raw_to_linear)
+                .collect();
+        }
+    }
+
+    fn apply_props(&mut self, props: &PropsExtracted) {
+        if let Some(ref ch_vols) = props.channel_volumes {
+            self.set_raw_channel_volumes(ch_vols.clone());
         } else {
             if let Some(ch) = props.channels {
                 self.channels = ch.max(1);
@@ -303,7 +351,7 @@ struct WorkerState {
     configured_sink_name: Option<String>,
     default_source_name: Option<String>,
     configured_source_name: Option<String>,
-    last_snapshot: Option<AudioSnapshot>,
+    last_snapshot: Option<Arc<AudioSnapshot>>,
     nodes: HashMap<u32, Node>,
     devices: HashMap<u32, Rc<Device>>,
     device_cards: BTreeMap<u32, DeviceCardRecord>,
@@ -326,7 +374,21 @@ fn select_target_node<'a>(
 }
 
 impl WorkerState {
-    fn build_audio_device(&self, rec: &AudioNodeRecord) -> AudioDevice {
+    fn node_map(&self, dir: AudioDirection) -> &BTreeMap<u32, AudioNodeRecord> {
+        match dir {
+            AudioDirection::Output => &self.sinks,
+            AudioDirection::Input => &self.sources,
+        }
+    }
+
+    fn node_map_mut(&mut self, dir: AudioDirection) -> &mut BTreeMap<u32, AudioNodeRecord> {
+        match dir {
+            AudioDirection::Output => &mut self.sinks,
+            AudioDirection::Input => &mut self.sources,
+        }
+    }
+
+    fn build_audio_device(&self, rec: &AudioNodeRecord, is_default: bool) -> AudioDevice {
         let active_port = self
             .find_route_for_node(rec)
             .and_then(|r| r.name.clone())
@@ -340,8 +402,9 @@ impl WorkerState {
         if let Some(dev_id) = rec.device_id
             && let Some(card) = self.device_cards.get(&dev_id)
         {
+            let spa_dir = rec.spa_direction();
             for er in card.enum_routes.values() {
-                if er.direction != rec.direction {
+                if er.direction != spa_dir {
                     continue;
                 }
                 if let Some(card_dev) = rec.card_profile_device
@@ -374,56 +437,11 @@ impl WorkerState {
             id: rec.id,
             name: rec.name.clone(),
             description: rec.description.clone(),
-            card_id: rec.device_id,
+            is_default,
+            volume: rec.to_audio_volume(),
             active_port,
             ports,
-            channel_map: rec.effective_channel_map(),
         }
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn summarize_nodes(
-        &self,
-        nodes: &BTreeMap<u32, AudioNodeRecord>,
-        default_name: Option<&str>,
-        configured_name: Option<&str>,
-    ) -> (
-        Vec<AudioDevice>,
-        f32,
-        Vec<f32>,
-        Vec<AudioChannelPosition>,
-        Option<f32>,
-        bool,
-        Option<AudioDevice>,
-    ) {
-        let devices: Vec<AudioDevice> = nodes
-            .values()
-            .map(|rec| self.build_audio_device(rec))
-            .collect();
-
-        let target = select_target_node(nodes, default_name, configured_name);
-
-        let (linear, channels, channel_map, db, muted, default_dev) = if let Some(node) = target {
-            (
-                raw_to_linear(node.raw_volume),
-                node.linear_channels(),
-                node.effective_channel_map(),
-                raw_to_db(node.raw_volume),
-                node.muted,
-                Some(self.build_audio_device(node)),
-            )
-        } else {
-            (0.0, Vec::new(), Vec::new(), None, false, None)
-        };
-        (
-            devices,
-            linear,
-            channels,
-            channel_map,
-            db,
-            muted,
-            default_dev,
-        )
     }
 
     fn card_list(&self) -> Vec<AudioCard> {
@@ -447,119 +465,71 @@ impl WorkerState {
             .collect()
     }
 
-    fn stream_lists(&self) -> (Vec<AudioStream>, Vec<AudioCapture>) {
-        let mut streams = Vec::new();
-        let mut captures = Vec::new();
-        for rec in self.streams.values() {
-            let linear = raw_to_linear(rec.raw_volume);
-            let channels = rec.linear_channels();
-            let channel_map = rec.effective_channel_map();
-            let db = raw_to_db(rec.raw_volume);
-            if rec.playback {
-                streams.push(AudioStream {
-                    id: rec.id,
-                    name: rec.name.clone(),
-                    binary: rec.binary.clone(),
-                    icon_name: rec.icon_name.clone(),
-                    app_id: rec.app_id.clone(),
-                    sink_id: rec.target_id,
-                    linear,
-                    channels,
-                    channel_map,
-                    db,
-                    muted: rec.muted,
-                });
-            } else {
-                captures.push(AudioCapture {
-                    id: rec.id,
-                    name: rec.name.clone(),
-                    binary: rec.binary.clone(),
-                    icon_name: rec.icon_name.clone(),
-                    app_id: rec.app_id.clone(),
-                    source_id: rec.target_id,
-                    linear,
-                    channels,
-                    channel_map,
-                    db,
-                    muted: rec.muted,
-                });
-            }
-        }
-        (streams, captures)
-    }
-
-    fn compute_snapshot(&self) -> Option<AudioSnapshot> {
-        let (devices, linear, channels, channel_map, db, muted, default_sink) = self
-            .summarize_nodes(
-                &self.sinks,
-                self.default_sink_name.as_deref(),
-                self.configured_sink_name.as_deref(),
-            );
-        let (
-            sources,
-            source_linear,
-            source_channels,
-            source_channel_map,
-            source_db,
-            source_muted,
-            default_source,
-        ) = self.summarize_nodes(
+    fn compute_snapshot(&self) -> AudioSnapshot {
+        let default_sink_id = select_target_node(
+            &self.sinks,
+            self.default_sink_name.as_deref(),
+            self.configured_sink_name.as_deref(),
+        )
+        .map(|n| n.id);
+        let default_source_id = select_target_node(
             &self.sources,
             self.default_source_name.as_deref(),
             self.configured_source_name.as_deref(),
-        );
+        )
+        .map(|n| n.id);
 
+        let sinks = self
+            .sinks
+            .values()
+            .map(|rec| self.build_audio_device(rec, Some(rec.id) == default_sink_id))
+            .collect();
+        let sources = self
+            .sources
+            .values()
+            .map(|rec| self.build_audio_device(rec, Some(rec.id) == default_source_id))
+            .collect();
+        let streams = self
+            .streams
+            .values()
+            .map(AudioStreamRecord::to_audio_stream)
+            .collect();
         let cards = self.card_list();
-        let (streams, captures) = self.stream_lists();
 
-        Some(AudioSnapshot {
-            linear,
-            channels,
-            channel_map,
-            db,
-            muted,
-            default_sink,
-            devices,
-            source_linear,
-            source_channels,
-            source_channel_map,
-            source_db,
-            source_muted,
-            default_source,
+        AudioSnapshot {
+            sinks,
             sources,
-            cards,
+            default_sink_id,
+            default_source_id,
             streams,
-            captures,
-        })
+            cards,
+        }
     }
 
     fn publish_if_changed(&mut self, shared: &Arc<Mutex<SharedAudioState>>) {
         let next = self.compute_snapshot();
-        if next.as_ref() == self.last_snapshot.as_ref() {
-            return;
-        }
-        self.last_snapshot = next.clone();
-        if let Ok(mut guard) = shared.lock() {
-            guard.snapshot = next.clone();
-            if let Some(snapshot) = next {
-                guard.push_event(AudioEvent::Updated(snapshot));
-            }
-        }
+        update_snapshot(shared, &mut self.last_snapshot, next);
     }
 
-    fn target_node(&self, is_source: bool) -> Option<&AudioNodeRecord> {
-        if is_source {
-            select_target_node(
-                &self.sources,
-                self.default_source_name.as_deref(),
-                self.configured_source_name.as_deref(),
-            )
-        } else {
-            select_target_node(
+    fn target_node(&self, dir: AudioDirection) -> Option<&AudioNodeRecord> {
+        match dir {
+            AudioDirection::Output => select_target_node(
                 &self.sinks,
                 self.default_sink_name.as_deref(),
                 self.configured_sink_name.as_deref(),
-            )
+            ),
+            AudioDirection::Input => select_target_node(
+                &self.sources,
+                self.default_source_name.as_deref(),
+                self.configured_source_name.as_deref(),
+            ),
+        }
+    }
+
+    fn resolve_node(&self, dir: AudioDirection, node_id: Option<u32>) -> Option<&AudioNodeRecord> {
+        match node_id {
+            Some(id) => self.node_map(dir).get(&id),
+            None => self.target_node(dir),
         }
     }
 
@@ -598,14 +568,6 @@ impl WorkerState {
         }
     }
 
-    /// Processes `ParamType::Route` metadata from a `Device::info` event with
-    /// `DeviceChangeMask::PARAMS`.
-    ///
-    /// Returns `true` when the caller should invoke `device.enum_params(0, Some(Route), ..)`.
-    /// Whenever `Route` is readable we re-enumerate (making route tracking resilient even if two
-    /// rapid server updates double-toggle `SPA_PARAM_INFO_SERIAL` before flushing `info`), while
-    /// immediately invalidating cached routes whenever `route_flags` changes or `READ` is lost so
-    /// subsequent volume/mute commands can never write a stale `route.index` back to hardware.
     fn on_device_route_params_info(
         &mut self,
         dev_id: u32,
@@ -628,10 +590,6 @@ impl WorkerState {
             .is_some_and(|flags| flags.contains(ParamInfoFlags::READ))
     }
 
-    /// Records an enumerated `ParamType::Route` entry for `dev_id`.
-    ///
-    /// PipeWire assigns one monotonic async `seq` per `enum_params` batch; when a newer batch
-    /// starts (`seq != last_seq`), stale routes from any superseded batch are pruned atomically.
     fn record_device_route(
         &mut self,
         dev_id: u32,
@@ -771,12 +729,13 @@ impl WorkerState {
         true
     }
 
-    fn remove_device_state(&mut self, id: u32) {
+    fn remove_device_state(&mut self, id: u32) -> bool {
         self.devices.remove(&id);
-        self.device_cards.remove(&id);
+        let removed_card = self.device_cards.remove(&id).is_some();
         self.device_routes.retain(|&(dev_id, _, _), _| dev_id != id);
         self.device_route_flags.remove(&id);
         self.device_route_last_seq.remove(&id);
+        removed_card
     }
 
     fn find_route(
@@ -802,27 +761,31 @@ impl WorkerState {
     }
 
     fn find_route_for_node(&self, rec: &AudioNodeRecord) -> Option<&DeviceRouteRecord> {
-        self.find_route(rec.device_id, rec.direction, rec.card_profile_device)
+        self.find_route(rec.device_id, rec.spa_direction(), rec.card_profile_device)
     }
 
-    fn resolve_route_for_node(
-        &self,
-        rec: &AudioNodeRecord,
-    ) -> Option<(&Device, &DeviceRouteRecord)> {
+    fn find_route_key_for_node(&self, rec: &AudioNodeRecord) -> Option<(u32, u32, i32)> {
         let dev_obj_id = rec.device_id?;
-        let device = self.devices.get(&dev_obj_id)?.as_ref();
-        let route = self.find_route_for_node(rec)?;
-        Some((device, route))
+        let dir = rec.spa_direction();
+        if let Some(card_dev) = rec.card_profile_device {
+            let key = (dev_obj_id, dir, card_dev);
+            return self.device_routes.contains_key(&key).then_some(key);
+        }
+        let mut matches = self
+            .device_routes
+            .keys()
+            .copied()
+            .filter(|&(d, dr, _)| d == dev_obj_id && dr == dir);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
-    fn apply_node_props(&mut self, is_source: bool, id: u32, props: PropsExtracted) -> bool {
+    fn apply_node_props(&mut self, dir: AudioDirection, id: u32, props: PropsExtracted) -> bool {
         let (has_route_ch, has_route_vol, has_route_map, has_route_mute) = {
-            let map = if is_source {
-                &self.sources
-            } else {
-                &self.sinks
-            };
-            if let Some(rec) = map.get(&id)
+            if let Some(rec) = self.node_map(dir).get(&id)
                 && let Some(r) = self.find_route_for_node(rec)
             {
                 (
@@ -835,12 +798,7 @@ impl WorkerState {
                 (false, false, false, false)
             }
         };
-        let map = if is_source {
-            &mut self.sources
-        } else {
-            &mut self.sinks
-        };
-        let Some(rec) = map.get_mut(&id) else {
+        let Some(rec) = self.node_map_mut(dir).get_mut(&id) else {
             return false;
         };
         let mut updated = false;
@@ -940,84 +898,344 @@ impl WorkerState {
         )
     }
 
-    fn set_node_volume(&self, is_source: bool, level: f32) {
-        self.apply_node_param(
-            is_source,
-            |rec, route| {
-                let ch_vols = Self::target_channel_volumes_for_level(rec, Some(route), level);
-                build_route_volume_pod_channels(route.index, route.device, &ch_vols)
-            },
-            |rec| {
-                let ch_vols = Self::target_channel_volumes_for_level(rec, None, level);
-                build_volume_pod_channels(&ch_vols)
-            },
-        );
-    }
-
-    fn set_node_balance(&self, is_source: bool, balance: f32) {
-        self.apply_node_param(
-            is_source,
-            |rec, route| {
-                let ch_vols = Self::target_channel_volumes_for_balance(rec, Some(route), balance);
-                build_route_volume_pod_channels(route.index, route.device, &ch_vols)
-            },
-            |rec| {
-                let ch_vols = Self::target_channel_volumes_for_balance(rec, None, balance);
-                build_volume_pod_channels(&ch_vols)
-            },
-        );
-    }
-
-    fn set_node_channel_volumes(&self, is_source: bool, volumes: &[f32]) {
-        let Some(clean) = sanitize_linear_channels(volumes) else {
-            return;
-        };
-        self.apply_node_param(
-            is_source,
-            |_rec, route| build_route_volume_pod_channels(route.index, route.device, &clean),
-            |_rec| build_volume_pod_channels(&clean),
-        );
-    }
-
-    fn set_node_muted(&self, is_source: bool, muted: bool) {
-        self.apply_node_param(
-            is_source,
-            |_rec, route| build_route_mute_pod(route.index, route.device, muted),
-            |_rec| build_mute_pod(muted),
-        );
-    }
-
-    fn apply_node_param(
-        &self,
-        is_source: bool,
-        build_route: impl FnOnce(&AudioNodeRecord, &DeviceRouteRecord) -> Option<Vec<u8>>,
-        build_node: impl FnOnce(&AudioNodeRecord) -> Option<Vec<u8>>,
+    fn apply_node_channels(
+        &mut self,
+        dir: AudioDirection,
+        node_id: Option<u32>,
+        compute: impl FnOnce(&AudioNodeRecord, Option<&DeviceRouteRecord>) -> Option<Vec<f32>>,
     ) {
-        let Some(rec) = self.target_node(is_source) else {
+        let Some(rec) = self.resolve_node(dir, node_id) else {
             return;
         };
-        if let Some((device, route)) = self.resolve_route_for_node(rec)
-            && let Some(bytes) = build_route(rec, route)
+        let resolved_id = rec.id;
+        let route_key = self.find_route_key_for_node(rec);
+        let route = route_key.and_then(|k| self.device_routes.get(&k));
+        let Some(ch_vols) = compute(rec, route) else {
+            return;
+        };
+
+        if let Some(key) = route_key
+            && let Some(device) = self.devices.get(&key.0)
+            && let Some(route) = self.device_routes.get(&key)
+            && let Some(bytes) =
+                build_route_volume_pod_channels(route.index, route.device, &ch_vols)
             && let Some(pod) = Pod::from_bytes(&bytes)
         {
             device.set_param(ParamType::Route, 0, pod);
-            return;
-        }
-        if let Some(node) = self.nodes.get(&rec.id)
-            && let Some(bytes) = build_node(rec)
+        } else if let Some(node) = self.nodes.get(&resolved_id)
+            && let Some(bytes) = build_volume_pod_channels(&ch_vols)
             && let Some(pod) = Pod::from_bytes(&bytes)
         {
             node.set_param(ParamType::Props, 0, pod);
         }
+
+        // Optimistically update local cached volumes so rapid sequential AdjustVolume commands
+        // accumulate smoothly before PipeWire echoes the authoritative param update.
+        let raw_vols: Vec<f32> = ch_vols.iter().copied().map(linear_to_raw).collect();
+        let peak_raw = raw_vols.iter().copied().fold(0.0_f32, f32::max);
+        if let Some(key) = route_key
+            && let Some(route) = self.device_routes.get_mut(&key)
+        {
+            route.channels = Some(raw_vols.len());
+            route.volume = Some(peak_raw);
+            route.channel_volumes = Some(raw_vols.clone());
+        }
+        if let Some(rec) = self.node_map_mut(dir).get_mut(&resolved_id) {
+            let _ = rec.set_raw_channel_volumes(raw_vols);
+        }
     }
 
-    fn select_default_node(&self, is_source: bool, id: u32) {
-        let (map, meta_key) = if is_source {
-            (&self.sources, "default.configured.audio.source")
-        } else {
-            (&self.sinks, "default.configured.audio.sink")
+    fn apply_node_mute(
+        &mut self,
+        dir: AudioDirection,
+        node_id: Option<u32>,
+        explicit: Option<bool>,
+    ) {
+        let Some(rec) = self.resolve_node(dir, node_id) else {
+            return;
         };
-        if let Some(rec) = map.get(&id)
+        let resolved_id = rec.id;
+        let muted = explicit.unwrap_or(!rec.muted);
+        let route_key = self.find_route_key_for_node(rec);
+
+        if let Some(key) = route_key
+            && let Some(device) = self.devices.get(&key.0)
+            && let Some(route) = self.device_routes.get(&key)
+            && let Some(bytes) = build_route_mute_pod(route.index, route.device, muted)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+        {
+            device.set_param(ParamType::Route, 0, pod);
+        } else if let Some(node) = self.nodes.get(&resolved_id)
+            && let Some(bytes) = build_mute_pod(muted)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+        {
+            node.set_param(ParamType::Props, 0, pod);
+        }
+
+        if let Some(key) = route_key
+            && let Some(route) = self.device_routes.get_mut(&key)
+        {
+            route.muted = Some(muted);
+        }
+        if let Some(rec) = self.node_map_mut(dir).get_mut(&resolved_id) {
+            rec.muted = muted;
+        }
+    }
+
+    fn apply_stream_channels(
+        &mut self,
+        id: u32,
+        expected_dir: AudioDirection,
+        compute: impl FnOnce(&AudioStreamRecord) -> Option<Vec<f32>>,
+    ) {
+        let Some(rec) = self
+            .streams
+            .get(&id)
+            .filter(|r| r.direction == expected_dir)
+        else {
+            return;
+        };
+        let Some(vols) = compute(rec) else {
+            return;
+        };
+        if let Some(bytes) = build_volume_pod_channels(&vols)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+            && let Some(node) = self.nodes.get(&id)
+        {
+            node.set_param(ParamType::Props, 0, pod);
+        }
+        let raw_vols: Vec<f32> = vols.iter().copied().map(linear_to_raw).collect();
+        if let Some(rec) = self.streams.get_mut(&id) {
+            rec.set_raw_channel_volumes(raw_vols);
+        }
+    }
+
+    fn apply_stream_mute(&mut self, id: u32, expected_dir: AudioDirection, explicit: Option<bool>) {
+        let Some(rec) = self
+            .streams
+            .get(&id)
+            .filter(|r| r.direction == expected_dir)
+        else {
+            return;
+        };
+        let muted = explicit.unwrap_or(!rec.muted);
+        if let Some(bytes) = build_mute_pod(muted)
+            && let Some(pod) = Pod::from_bytes(&bytes)
+            && let Some(node) = self.nodes.get(&id)
+        {
+            node.set_param(ParamType::Props, 0, pod);
+        }
+        if let Some(rec) = self.streams.get_mut(&id) {
+            rec.muted = muted;
+        }
+    }
+
+    fn apply_target_volume(&mut self, target: AudioTarget, level: f32) {
+        match target {
+            AudioTarget::DefaultSink => {
+                self.apply_node_channels(AudioDirection::Output, None, |rec, route| {
+                    Some(Self::target_channel_volumes_for_level(rec, route, level))
+                })
+            }
+            AudioTarget::Sink(id) => {
+                self.apply_node_channels(AudioDirection::Output, Some(id), |rec, route| {
+                    Some(Self::target_channel_volumes_for_level(rec, route, level))
+                })
+            }
+            AudioTarget::DefaultSource => {
+                self.apply_node_channels(AudioDirection::Input, None, |rec, route| {
+                    Some(Self::target_channel_volumes_for_level(rec, route, level))
+                })
+            }
+            AudioTarget::Source(id) => {
+                self.apply_node_channels(AudioDirection::Input, Some(id), |rec, route| {
+                    Some(Self::target_channel_volumes_for_level(rec, route, level))
+                })
+            }
+            AudioTarget::PlaybackStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Output, |rec| {
+                    let cur = if rec.raw_channels.is_empty() {
+                        Vec::new()
+                    } else {
+                        rec.linear_channels()
+                    };
+                    Some(scale_linear_channels(
+                        &cur,
+                        &rec.nonzero_linear_template,
+                        rec.channels,
+                        level,
+                    ))
+                });
+            }
+            AudioTarget::CaptureStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Input, |rec| {
+                    let cur = if rec.raw_channels.is_empty() {
+                        Vec::new()
+                    } else {
+                        rec.linear_channels()
+                    };
+                    Some(scale_linear_channels(
+                        &cur,
+                        &rec.nonzero_linear_template,
+                        rec.channels,
+                        level,
+                    ))
+                });
+            }
+        }
+    }
+
+    fn apply_target_adjust_volume(&mut self, target: AudioTarget, delta: f32) {
+        let current_linear = match target {
+            AudioTarget::DefaultSink => self
+                .resolve_node(AudioDirection::Output, None)
+                .map(|r| raw_to_linear(r.raw_volume)),
+            AudioTarget::Sink(id) => self
+                .resolve_node(AudioDirection::Output, Some(id))
+                .map(|r| raw_to_linear(r.raw_volume)),
+            AudioTarget::DefaultSource => self
+                .resolve_node(AudioDirection::Input, None)
+                .map(|r| raw_to_linear(r.raw_volume)),
+            AudioTarget::Source(id) => self
+                .resolve_node(AudioDirection::Input, Some(id))
+                .map(|r| raw_to_linear(r.raw_volume)),
+            AudioTarget::PlaybackStream(id) => self
+                .streams
+                .get(&id)
+                .filter(|r| r.direction == AudioDirection::Output)
+                .map(|r| raw_to_linear(r.raw_volume)),
+            AudioTarget::CaptureStream(id) => self
+                .streams
+                .get(&id)
+                .filter(|r| r.direction == AudioDirection::Input)
+                .map(|r| raw_to_linear(r.raw_volume)),
+        };
+        if let Some(cur) = current_linear {
+            let next = (cur + delta).clamp(0.0, 1.5);
+            self.apply_target_volume(target, next);
+        }
+    }
+
+    fn apply_target_balance(&mut self, target: AudioTarget, balance: f32) {
+        match target {
+            AudioTarget::DefaultSink => {
+                self.apply_node_channels(AudioDirection::Output, None, |rec, route| {
+                    Some(Self::target_channel_volumes_for_balance(
+                        rec, route, balance,
+                    ))
+                })
+            }
+            AudioTarget::Sink(id) => {
+                self.apply_node_channels(AudioDirection::Output, Some(id), |rec, route| {
+                    Some(Self::target_channel_volumes_for_balance(
+                        rec, route, balance,
+                    ))
+                })
+            }
+            AudioTarget::DefaultSource => {
+                self.apply_node_channels(AudioDirection::Input, None, |rec, route| {
+                    Some(Self::target_channel_volumes_for_balance(
+                        rec, route, balance,
+                    ))
+                })
+            }
+            AudioTarget::Source(id) => {
+                self.apply_node_channels(AudioDirection::Input, Some(id), |rec, route| {
+                    Some(Self::target_channel_volumes_for_balance(
+                        rec, route, balance,
+                    ))
+                })
+            }
+            AudioTarget::PlaybackStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Output, |rec| {
+                    let cur = if rec.raw_channels.is_empty() {
+                        Vec::new()
+                    } else {
+                        rec.linear_channels()
+                    };
+                    Some(apply_linear_balance_with_map(
+                        &cur,
+                        &rec.channel_map,
+                        rec.channels,
+                        raw_to_linear(rec.raw_volume),
+                        balance,
+                    ))
+                });
+            }
+            AudioTarget::CaptureStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Input, |rec| {
+                    let cur = if rec.raw_channels.is_empty() {
+                        Vec::new()
+                    } else {
+                        rec.linear_channels()
+                    };
+                    Some(apply_linear_balance_with_map(
+                        &cur,
+                        &rec.channel_map,
+                        rec.channels,
+                        raw_to_linear(rec.raw_volume),
+                        balance,
+                    ))
+                });
+            }
+        }
+    }
+
+    fn apply_target_channel_volumes(&mut self, target: AudioTarget, volumes: &[f32]) {
+        let Some(clean) = sanitize_linear_channels(volumes) else {
+            return;
+        };
+        match target {
+            AudioTarget::DefaultSink => {
+                self.apply_node_channels(AudioDirection::Output, None, |_, _| Some(clean));
+            }
+            AudioTarget::Sink(id) => {
+                self.apply_node_channels(AudioDirection::Output, Some(id), |_, _| Some(clean));
+            }
+            AudioTarget::DefaultSource => {
+                self.apply_node_channels(AudioDirection::Input, None, |_, _| Some(clean));
+            }
+            AudioTarget::Source(id) => {
+                self.apply_node_channels(AudioDirection::Input, Some(id), |_, _| Some(clean));
+            }
+            AudioTarget::PlaybackStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Output, |_| Some(clean));
+            }
+            AudioTarget::CaptureStream(id) => {
+                self.apply_stream_channels(id, AudioDirection::Input, |_| Some(clean));
+            }
+        }
+    }
+
+    fn apply_target_mute(&mut self, target: AudioTarget, explicit: Option<bool>) {
+        match target {
+            AudioTarget::DefaultSink => {
+                self.apply_node_mute(AudioDirection::Output, None, explicit)
+            }
+            AudioTarget::Sink(id) => {
+                self.apply_node_mute(AudioDirection::Output, Some(id), explicit)
+            }
+            AudioTarget::DefaultSource => {
+                self.apply_node_mute(AudioDirection::Input, None, explicit)
+            }
+            AudioTarget::Source(id) => {
+                self.apply_node_mute(AudioDirection::Input, Some(id), explicit)
+            }
+            AudioTarget::PlaybackStream(id) => {
+                self.apply_stream_mute(id, AudioDirection::Output, explicit)
+            }
+            AudioTarget::CaptureStream(id) => {
+                self.apply_stream_mute(id, AudioDirection::Input, explicit)
+            }
+        }
+    }
+
+    fn select_default_node(&self, dir: AudioDirection, id: u32) {
+        let meta_key = match dir {
+            AudioDirection::Output => "default.configured.audio.sink",
+            AudioDirection::Input => "default.configured.audio.source",
+        };
+        if let Some(rec) = self.node_map(dir).get(&id)
             && let Some((_, meta)) = &self.default_metadata
         {
             let json = format!("{{\"name\":\"{}\"}}", escape_json(&rec.name));
@@ -1027,26 +1245,18 @@ impl WorkerState {
 
     fn resolve_port_selection(
         &self,
-        is_source: bool,
+        dir: AudioDirection,
         node_id: Option<u32>,
         port_name: &str,
     ) -> Option<(u32, i32, i32)> {
-        let rec = match node_id {
-            Some(id) => {
-                if is_source {
-                    self.sources.get(&id)?
-                } else {
-                    self.sinks.get(&id)?
-                }
-            }
-            None => self.target_node(is_source)?,
-        };
+        let rec = self.resolve_node(dir, node_id)?;
         let dev_id = rec.device_id?;
         let card = self.device_cards.get(&dev_id)?;
+        let spa_dir = rec.spa_direction();
         let er = card
             .enum_routes
             .values()
-            .filter(|er| er.direction == rec.direction && er.name == port_name)
+            .filter(|er| er.direction == spa_dir && er.name == port_name)
             .find(|er| {
                 rec.card_profile_device
                     .is_none_or(|cd| er.devices.is_empty() || er.devices.contains(&cd))
@@ -1054,7 +1264,7 @@ impl WorkerState {
             .or_else(|| {
                 card.enum_routes
                     .values()
-                    .find(|er| er.direction == rec.direction && er.name == port_name)
+                    .find(|er| er.direction == spa_dir && er.name == port_name)
             })?;
         let target_card_dev = rec
             .card_profile_device
@@ -1063,9 +1273,15 @@ impl WorkerState {
         Some((dev_id, er.index, target_card_dev))
     }
 
-    fn select_node_port(&self, is_source: bool, node_id: Option<u32>, port_name: &str) {
+    fn select_port(&self, target: AudioPortTarget, port_name: &str) {
+        let (dir, node_id) = match target {
+            AudioPortTarget::DefaultSink => (AudioDirection::Output, None),
+            AudioPortTarget::Sink(id) => (AudioDirection::Output, Some(id)),
+            AudioPortTarget::DefaultSource => (AudioDirection::Input, None),
+            AudioPortTarget::Source(id) => (AudioDirection::Input, Some(id)),
+        };
         let Some((dev_id, route_index, card_dev)) =
-            self.resolve_port_selection(is_source, node_id, port_name)
+            self.resolve_port_selection(dir, node_id, port_name)
         else {
             return;
         };
@@ -1101,98 +1317,30 @@ impl WorkerState {
         }
     }
 
-    /// Sends a Props update carrying either a volume or a mute value to a per-app stream node;
-    /// unknown stream IDs are no-ops.
-    fn set_stream_volume(&self, id: u32, level: f32) {
-        let Some(rec) = self.streams.get(&id) else {
-            return;
-        };
-        let cur = if rec.raw_channels.is_empty() {
-            Vec::new()
-        } else {
-            rec.linear_channels()
-        };
-        let vols = scale_linear_channels(&cur, &rec.nonzero_linear_template, rec.channels, level);
-        if let Some(bytes) = build_volume_pod_channels(&vols)
-            && let Some(pod) = Pod::from_bytes(&bytes)
-            && let Some(node) = self.nodes.get(&id)
-        {
-            node.set_param(ParamType::Props, 0, pod);
-        }
-    }
-
-    fn set_stream_balance(&self, id: u32, balance: f32) {
-        let Some(rec) = self.streams.get(&id) else {
-            return;
-        };
-        let cur = if rec.raw_channels.is_empty() {
-            Vec::new()
-        } else {
-            rec.linear_channels()
-        };
-        let vols = apply_linear_balance_with_map(
-            &cur,
-            &rec.channel_map,
-            rec.channels,
-            raw_to_linear(rec.raw_volume),
-            balance,
-        );
-        if let Some(bytes) = build_volume_pod_channels(&vols)
-            && let Some(pod) = Pod::from_bytes(&bytes)
-            && let Some(node) = self.nodes.get(&id)
-        {
-            node.set_param(ParamType::Props, 0, pod);
-        }
-    }
-
-    fn set_stream_channel_volumes(&self, id: u32, volumes: &[f32]) {
-        if !self.streams.contains_key(&id) {
-            return;
-        };
-        let Some(clean) = sanitize_linear_channels(volumes) else {
-            return;
-        };
-        if let Some(bytes) = build_volume_pod_channels(&clean)
-            && let Some(pod) = Pod::from_bytes(&bytes)
-            && let Some(node) = self.nodes.get(&id)
-        {
-            node.set_param(ParamType::Props, 0, pod);
-        }
-    }
-
-    fn set_stream_muted(&self, id: u32, muted: bool) {
-        if let Some(bytes) = build_mute_pod(muted)
-            && let Some(pod) = Pod::from_bytes(&bytes)
-            && let Some(node) = self.nodes.get(&id)
-            && self.streams.contains_key(&id)
-        {
-            node.set_param(ParamType::Props, 0, pod);
-        }
-    }
-
     fn insert_stream_record(
         &mut self,
         id: u32,
+        direction: AudioDirection,
         meta: StreamMetadata,
         target_id: Option<u32>,
-        playback: bool,
     ) {
         self.streams.insert(
             id,
             AudioStreamRecord {
                 id,
+                direction,
                 name: meta.name,
-                binary: meta.binary,
-                icon_name: meta.icon_name,
-                app_id: meta.app_id,
+                app_name: meta.app_name,
+                binary_name: meta.binary_name,
+                media_role: meta.media_role,
                 target_id,
+                corked: false,
                 channels: 2,
                 raw_volume: 1.0,
                 raw_channels: Vec::new(),
                 channel_map: Vec::new(),
                 nonzero_linear_template: Vec::new(),
                 muted: false,
-                playback,
             },
         );
     }
@@ -1212,8 +1360,6 @@ pub(crate) fn run_worker_loop(
         let rx = match first_rx.take() {
             Some(r) => r,
             None => {
-                // Reconnection cycle after disconnect; future commands need loop wakeup or new
-                // connection setup without rebinding stale channels.
                 let (new_tx, new_rx) = pw_channel::channel::<AudioCommand>();
                 if let Ok(mut guard) = sender_slot.lock() {
                     *guard = Some(new_tx);
@@ -1231,7 +1377,7 @@ pub(crate) fn run_worker_loop(
             && guard.connected
         {
             guard.connected = false;
-            guard.push_event(AudioEvent::Disconnected);
+            guard.push_event(AudioEvent::BackendDisconnected);
         }
 
         if result.is_ok() {
@@ -1242,7 +1388,7 @@ pub(crate) fn run_worker_loop(
 
         let mut slept = Duration::ZERO;
         while slept < backoff && !stop_flag.load(Ordering::Acquire) {
-            let chunk = Duration::from_millis(50).min(backoff - slept);
+            let chunk = Duration::from_millis(20).min(backoff - slept);
             thread::sleep(chunk);
             slept += chunk;
         }
@@ -1264,7 +1410,7 @@ fn run_single_pw_session(
         if let Ok(mut guard) = shared.lock() {
             guard.connected = true;
             if *ever_connected {
-                guard.push_event(AudioEvent::Reconnected);
+                guard.push_event(AudioEvent::BackendReconnected);
             }
             *ever_connected = true;
         }
@@ -1288,98 +1434,40 @@ fn run_single_pw_session(
     let state_cmd = Rc::clone(&state);
     let main_loop_cmd = main_loop.downgrade();
     let _cmd_rx = rx.attach(main_loop.loop_(), move |cmd| match cmd {
-        AudioCommand::SetVolumeLinear(level) => {
-            state_cmd.borrow().set_node_volume(false, level);
+        AudioCommand::SetVolume(target, level) => {
+            state_cmd.borrow_mut().apply_target_volume(target, level);
         }
-        AudioCommand::SetBalance(balance) => {
-            state_cmd.borrow().set_node_balance(false, balance);
-        }
-        AudioCommand::SetChannelVolumes(vols) => {
-            state_cmd.borrow().set_node_channel_volumes(false, &vols);
-        }
-        AudioCommand::SetMuted(muted) => {
-            state_cmd.borrow().set_node_muted(false, muted);
-        }
-        AudioCommand::ToggleMute => {
-            let st = state_cmd.borrow();
-            if let Some(sink) = st.target_node(false) {
-                st.set_node_muted(false, !sink.muted);
-            }
-        }
-        AudioCommand::SelectDevice(id) => {
-            state_cmd.borrow().select_default_node(false, id);
-        }
-        AudioCommand::SelectPort(sink_id, port_name) => {
+        AudioCommand::AdjustVolume(target, delta) => {
             state_cmd
-                .borrow()
-                .select_node_port(false, sink_id, &port_name);
+                .borrow_mut()
+                .apply_target_adjust_volume(target, delta);
         }
-        AudioCommand::SetSourceVolumeLinear(level) => {
-            state_cmd.borrow().set_node_volume(true, level);
+        AudioCommand::SetBalance(target, balance) => {
+            state_cmd.borrow_mut().apply_target_balance(target, balance);
         }
-        AudioCommand::SetSourceBalance(balance) => {
-            state_cmd.borrow().set_node_balance(true, balance);
-        }
-        AudioCommand::SetSourceChannelVolumes(vols) => {
-            state_cmd.borrow().set_node_channel_volumes(true, &vols);
-        }
-        AudioCommand::SetSourceMuted(muted) => {
-            state_cmd.borrow().set_node_muted(true, muted);
-        }
-        AudioCommand::ToggleSourceMute => {
-            let st = state_cmd.borrow();
-            if let Some(src) = st.target_node(true) {
-                st.set_node_muted(true, !src.muted);
-            }
-        }
-        AudioCommand::SelectSource(id) => {
-            state_cmd.borrow().select_default_node(true, id);
-        }
-        AudioCommand::SelectSourcePort(source_id, port_name) => {
+        AudioCommand::SetChannelVolumes(target, vols) => {
             state_cmd
-                .borrow()
-                .select_node_port(true, source_id, &port_name);
+                .borrow_mut()
+                .apply_target_channel_volumes(target, &vols);
         }
-        AudioCommand::SelectCardProfile(card_id, profile_name) => {
+        AudioCommand::SetMute(target, muted) => {
+            state_cmd
+                .borrow_mut()
+                .apply_target_mute(target, Some(muted));
+        }
+        AudioCommand::ToggleMute(target) => {
+            state_cmd.borrow_mut().apply_target_mute(target, None);
+        }
+        AudioCommand::SetDefaultDevice(dir, id) => {
+            state_cmd.borrow().select_default_node(dir, id);
+        }
+        AudioCommand::SetPort(target, port_name) => {
+            state_cmd.borrow().select_port(target, &port_name);
+        }
+        AudioCommand::SetCardProfile(card_id, profile_name) => {
             state_cmd
                 .borrow()
                 .select_card_profile(card_id, &profile_name);
-        }
-        AudioCommand::SetStreamVolumeLinear(id, level) => {
-            state_cmd.borrow().set_stream_volume(id, level);
-        }
-        AudioCommand::SetStreamBalance(id, balance) => {
-            state_cmd.borrow().set_stream_balance(id, balance);
-        }
-        AudioCommand::SetStreamChannelVolumes(id, vols) => {
-            state_cmd.borrow().set_stream_channel_volumes(id, &vols);
-        }
-        AudioCommand::SetStreamMuted(id, muted) => {
-            state_cmd.borrow().set_stream_muted(id, muted);
-        }
-        AudioCommand::ToggleStreamMute(id) => {
-            let st = state_cmd.borrow();
-            if let Some(rec) = st.streams.get(&id) {
-                st.set_stream_muted(id, !rec.muted);
-            }
-        }
-        AudioCommand::SetCaptureVolumeLinear(id, level) => {
-            state_cmd.borrow().set_stream_volume(id, level);
-        }
-        AudioCommand::SetCaptureBalance(id, balance) => {
-            state_cmd.borrow().set_stream_balance(id, balance);
-        }
-        AudioCommand::SetCaptureChannelVolumes(id, vols) => {
-            state_cmd.borrow().set_stream_channel_volumes(id, &vols);
-        }
-        AudioCommand::SetCaptureMuted(id, muted) => {
-            state_cmd.borrow().set_stream_muted(id, muted);
-        }
-        AudioCommand::ToggleCaptureMute(id) => {
-            let st = state_cmd.borrow();
-            if let Some(rec) = st.streams.get(&id) {
-                st.set_stream_muted(id, !rec.muted);
-            }
         }
         AudioCommand::Shutdown => {
             if let Some(ml) = main_loop_cmd.upgrade() {
@@ -1598,7 +1686,7 @@ fn run_single_pw_session(
                         .removed(move || {
                             if let Some(st_rc) = state_removed.upgrade() {
                                 let mut st = st_rc.borrow_mut();
-                                st.remove_device_state(id);
+                                let _ = st.remove_device_state(id);
                                 st.listeners.remove(&id);
                             }
                         })
@@ -1616,11 +1704,10 @@ fn run_single_pw_session(
                         Some("Audio/Sink" | "Audio/Source")
                     ) =>
                 {
-                    let is_source = props.get("media.class") == Some("Audio/Source");
-                    let direction = if is_source {
-                        spa_sys::SPA_DIRECTION_INPUT
+                    let direction = if props.get("media.class") == Some("Audio/Source") {
+                        AudioDirection::Input
                     } else {
-                        spa_sys::SPA_DIRECTION_OUTPUT
+                        AudioDirection::Output
                     };
                     let Ok(node): std::result::Result<Node, _> = registry.bind(obj) else {
                         return;
@@ -1650,17 +1737,7 @@ fn run_single_pw_session(
                         if let Some(route) = st.find_route_for_node(&rec).cloned() {
                             rec.apply_route(&route);
                         }
-                        let dev_event = (!is_source).then(|| st.build_audio_device(&rec));
-                        if is_source {
-                            st.sources.insert(id, rec);
-                        } else {
-                            st.sinks.insert(id, rec);
-                            if let Some(dev_ev) = dev_event
-                                && let Ok(mut guard) = shared_global.lock()
-                            {
-                                guard.push_event(AudioEvent::DeviceAdded(dev_ev));
-                            }
-                        }
+                        st.node_map_mut(direction).insert(id, rec);
                         st.publish_if_changed(&shared_global);
                     }
 
@@ -1685,12 +1762,7 @@ fn run_single_pw_session(
                             }
                             let mut st = state_info.borrow_mut();
                             let (eff_dev, eff_dir, eff_card) = {
-                                let map = if is_source {
-                                    &mut st.sources
-                                } else {
-                                    &mut st.sinks
-                                };
-                                let Some(rec) = map.get_mut(&id) else {
+                                let Some(rec) = st.node_map_mut(direction).get_mut(&id) else {
                                     return;
                                 };
                                 if dev_id.is_some() {
@@ -1699,18 +1771,12 @@ fn run_single_pw_session(
                                 if card_dev.is_some() {
                                     rec.card_profile_device = card_dev;
                                 }
-                                (rec.device_id, rec.direction, rec.card_profile_device)
+                                (rec.device_id, rec.spa_direction(), rec.card_profile_device)
                             };
                             if let Some(route) = st.find_route(eff_dev, eff_dir, eff_card).cloned()
+                                && let Some(rec) = st.node_map_mut(direction).get_mut(&id)
                             {
-                                let map = if is_source {
-                                    &mut st.sources
-                                } else {
-                                    &mut st.sinks
-                                };
-                                if let Some(rec) = map.get_mut(&id) {
-                                    let _ = rec.apply_route(&route);
-                                }
+                                let _ = rec.apply_route(&route);
                             }
                             st.publish_if_changed(&shared_info);
                         })
@@ -1723,9 +1789,8 @@ fn run_single_pw_session(
                             };
                             if let Some(props_parsed) = parse_props_pod(pod.as_bytes()) {
                                 let mut st = state_param.borrow_mut();
-                                if st.apply_node_props(is_source, id, props_parsed) {
-                                    st.publish_if_changed(&shared_param);
-                                }
+                                let _ = st.apply_node_props(direction, id, props_parsed);
+                                st.publish_if_changed(&shared_param);
                             }
                         })
                         .register();
@@ -1757,9 +1822,11 @@ fn run_single_pw_session(
                         .is_some()
                         && props.get("node.name") != Some("waywi-audio") =>
                 {
-                    let playback =
+                    let Some(direction) =
                         classify_media_class(props.get("media.class").unwrap_or_default())
-                            == Some(StreamClass::Playback);
+                    else {
+                        return;
+                    };
                     let Ok(node): std::result::Result<Node, _> = registry.bind(obj) else {
                         return;
                     };
@@ -1772,7 +1839,7 @@ fn run_single_pw_session(
 
                     {
                         let mut st = state_global.borrow_mut();
-                        st.insert_stream_record(id, meta, target_id, playback);
+                        st.insert_stream_record(id, direction, meta, target_id);
                         st.publish_if_changed(&shared_global);
                     }
 
@@ -1783,39 +1850,49 @@ fn run_single_pw_session(
                     let listener = node
                         .add_listener_local()
                         .info(move |info| {
-                            let Some(info_props) = info.props() else {
-                                return;
-                            };
-                            let next_meta =
-                                StreamMetadata::extract(info_props.get("node.name"), |k| {
-                                    info_props.get(k)
-                                });
-                            let next_target = parse_stream_target_id(info_props);
+                            let corked =
+                                matches!(info.state(), NodeState::Suspended | NodeState::Idle);
                             let mut st = state_info.borrow_mut();
                             let Some(rec) = st.streams.get_mut(&id) else {
                                 return;
                             };
                             let mut changed = false;
-                            if next_meta.name != "unknown" && rec.name != next_meta.name {
-                                rec.name = next_meta.name;
+                            if rec.corked != corked {
+                                rec.corked = corked;
                                 changed = true;
                             }
-                            if next_meta.binary.is_some() && rec.binary != next_meta.binary {
-                                rec.binary = next_meta.binary;
-                                changed = true;
-                            }
-                            if next_meta.icon_name.is_some() && rec.icon_name != next_meta.icon_name
-                            {
-                                rec.icon_name = next_meta.icon_name;
-                                changed = true;
-                            }
-                            if next_meta.app_id.is_some() && rec.app_id != next_meta.app_id {
-                                rec.app_id = next_meta.app_id;
-                                changed = true;
-                            }
-                            if next_target.is_some() && rec.target_id != next_target {
-                                rec.target_id = next_target;
-                                changed = true;
+                            if let Some(info_props) = info.props() {
+                                let next_meta =
+                                    StreamMetadata::extract(info_props.get("node.name"), |k| {
+                                        info_props.get(k)
+                                    });
+                                let next_target = parse_stream_target_id(info_props);
+                                if next_meta.name != "unknown" && rec.name != next_meta.name {
+                                    rec.name = next_meta.name;
+                                    changed = true;
+                                }
+                                if next_meta.app_name.is_some()
+                                    && rec.app_name != next_meta.app_name
+                                {
+                                    rec.app_name = next_meta.app_name;
+                                    changed = true;
+                                }
+                                if next_meta.binary_name.is_some()
+                                    && rec.binary_name != next_meta.binary_name
+                                {
+                                    rec.binary_name = next_meta.binary_name;
+                                    changed = true;
+                                }
+                                if next_meta.media_role.is_some()
+                                    && rec.media_role != next_meta.media_role
+                                {
+                                    rec.media_role = next_meta.media_role;
+                                    changed = true;
+                                }
+                                if next_target.is_some() && rec.target_id != next_target {
+                                    rec.target_id = next_target;
+                                    changed = true;
+                                }
                             }
                             if changed {
                                 st.publish_if_changed(&shared_info);
@@ -1876,14 +1953,9 @@ fn run_single_pw_session(
                 st.default_metadata = None;
             }
             st.nodes.remove(&id);
-            st.remove_device_state(id);
+            let removed_card = st.remove_device_state(id);
             st.listeners.remove(&id);
-            if removed_sink {
-                if let Ok(mut guard) = shared_remove.lock() {
-                    guard.push_event(AudioEvent::DeviceRemoved(id));
-                }
-                st.publish_if_changed(&shared_remove);
-            } else if removed_source || removed_stream {
+            if removed_sink || removed_source || removed_stream || removed_card {
                 st.publish_if_changed(&shared_remove);
             }
         })
@@ -1915,18 +1987,18 @@ fn parse_stream_target_id(props: &spa::utils::dict::DictRef) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamClass;
     use super::classify_media_class;
+    use crate::audio::types::AudioDirection;
 
     #[test]
-    fn classify_media_class_accepts_audio_playback_streams_only() {
+    fn classify_media_class_accepts_audio_streams_only() {
         assert_eq!(
             classify_media_class("Stream/Output/Audio"),
-            Some(StreamClass::Playback)
+            Some(AudioDirection::Output)
         );
         assert_eq!(
             classify_media_class("Stream/Input/Audio"),
-            Some(StreamClass::Capture)
+            Some(AudioDirection::Input)
         );
     }
 
@@ -1950,13 +2022,9 @@ mod tests {
         let out_dir = spa_sys::SPA_DIRECTION_OUTPUT;
         let in_dir = spa_sys::SPA_DIRECTION_INPUT;
 
-        // Video / non-routable device (no Route param): no enum_params needed.
         assert!(!st.on_device_route_params_info(49, None));
-
-        // Initial audio device info with READ|WRITE triggers initial enum_params.
         assert!(st.on_device_route_params_info(dev_id, Some(ParamInfoFlags::READWRITE)));
 
-        // First enum_params batch populates Line Out (index=3) and Rear Mic (index=1).
         assert!(st.record_device_route(
             dev_id,
             0x4000_000d,
@@ -1989,21 +2057,15 @@ mod tests {
         ));
         assert_eq!(st.device_routes[&(dev_id, out_dir, 5)].index, 3);
 
-        // Even if two server updates double-toggle SERIAL back to the same flags, we still
-        // request enum_params while keeping current routes until the fresh batch replaces them.
         assert!(st.on_device_route_params_info(dev_id, Some(ParamInfoFlags::READWRITE)));
         assert_eq!(st.device_routes[&(dev_id, out_dir, 5)].index, 3);
 
-        // Headphone plugged in -> PipeWire toggles SERIAL on Route -> stale Line Out is
-        // invalidated immediately before the fresh enum_params reply arrives.
         assert!(st.on_device_route_params_info(
             dev_id,
             Some(ParamInfoFlags::READWRITE | ParamInfoFlags::SERIAL),
         ));
         assert!(!st.device_routes.contains_key(&(dev_id, out_dir, 5)));
 
-        // Back-to-back batch handling: if an older batch arrives first and a newer batch follows,
-        // the newer seq atomically replaces all routes for dev_id.
         assert!(st.record_device_route(
             dev_id,
             0x4000_0010,
@@ -2037,7 +2099,6 @@ mod tests {
         assert!(!st.device_routes.contains_key(&(dev_id, out_dir, 9)));
         assert_eq!(st.device_routes[&(dev_id, out_dir, 5)].index, 4);
 
-        // Profile switched to Off (no READ): routes are cleared and stray replies are ignored.
         assert!(!st.on_device_route_params_info(dev_id, None));
         assert!(st.device_routes.is_empty());
         assert!(!st.record_device_route(
@@ -2062,7 +2123,7 @@ mod tests {
     fn route_resolution_isolation_mono_channels_and_props_precedence() {
         use super::super::pod::{ProfileParams, PropsExtracted, RouteParams, linear_to_raw};
         use super::{AudioNodeRecord, DeviceCardRecord, DeviceRouteRecord, WorkerState};
-        use crate::audio::types::AudioPortAvailability;
+        use crate::audio::types::{AudioDirection, AudioPortAvailability};
         use pipewire::spa::param::ParamInfoFlags;
         use pipewire::spa::sys as spa_sys;
 
@@ -2188,7 +2249,7 @@ mod tests {
             57,
             "analog".into(),
             "Analog".into(),
-            out_dir,
+            AudioDirection::Output,
             Some(45),
             Some(5),
         );
@@ -2199,7 +2260,7 @@ mod tests {
             59,
             "spdif".into(),
             "S/PDIF".into(),
-            out_dir,
+            AudioDirection::Output,
             Some(45),
             Some(6),
         );
@@ -2207,34 +2268,29 @@ mod tests {
             56,
             "webcam-mic".into(),
             "Webcam".into(),
-            in_dir,
+            AudioDirection::Input,
             Some(44),
             Some(1),
         );
 
-        // Explicit card_profile_device must NEVER hijack another sub-device's route.
         assert_eq!(
             st.find_route_for_node(&analog_sink).map(|r| r.index),
             Some(4)
         );
         assert!(st.find_route_for_node(&spdif_sink).is_none());
 
-        // Mono route channel count wins over placeholder node channel count (2 -> 1).
         let mic_route = st.find_route_for_node(&mono_mic).expect("mono route");
         assert_eq!(WorkerState::route_channel_count(&mono_mic, mic_route), 1);
 
-        // Volume scaling preserves stereo L/R balance ratio (0.8, 0.4 -> 0.6, 0.3).
         let scaled =
             WorkerState::target_channel_volumes_for_level(&analog_sink, Some(&route_45), 0.6);
         assert!((scaled[0] - 0.6).abs() < 1e-4);
         assert!((scaled[1] - 0.3).abs() < 1e-4);
 
-        // Node::Props must not clobber active hardware Route volume/mute, but still updates
-        // nodes without a resolved Route (like spdif_sink / virtual sinks).
         st.sinks.insert(57, analog_sink);
         st.sinks.insert(59, spdif_sink);
         assert!(!st.apply_node_props(
-            false,
+            AudioDirection::Output,
             57,
             PropsExtracted {
                 channels: Some(2),
@@ -2248,7 +2304,7 @@ mod tests {
         assert!(!st.sinks[&57].muted);
 
         assert!(st.apply_node_props(
-            false,
+            AudioDirection::Output,
             59,
             PropsExtracted {
                 channels: Some(2),
@@ -2261,23 +2317,23 @@ mod tests {
         assert_eq!(st.sinks[&59].raw_volume, 0.25);
         assert!(st.sinks[&59].muted);
 
-        // Port & profile resolution + snapshot assembly.
         assert_eq!(
-            st.resolve_port_selection(false, Some(57), "analog-output-lineout"),
+            st.resolve_port_selection(AudioDirection::Output, Some(57), "analog-output-lineout"),
             Some((45, 3, 5))
         );
         assert_eq!(
             st.resolve_profile_selection(45, "output:analog-stereo+input:analog-stereo"),
             Some(1)
         );
-        let snap = st.compute_snapshot().expect("snapshot");
+        let snap = st.compute_snapshot();
         assert_eq!(snap.cards.len(), 1);
         assert_eq!(
             snap.cards[0].active_profile.as_deref(),
             Some("output:analog-stereo+input:analog-stereo")
         );
-        let dev57 = snap.devices.iter().find(|d| d.id == 57).unwrap();
-        assert_eq!(dev57.card_id, Some(45));
+        let dev57 = snap.sinks.iter().find(|d| d.id == 57).unwrap();
+        assert!(dev57.is_default);
+        assert!((dev57.volume.linear - 0.8).abs() < 1e-4);
         assert_eq!(
             dev57.active_port.as_deref(),
             Some("analog-output-headphones")
@@ -2290,17 +2346,16 @@ mod tests {
     #[test]
     fn default_metadata_prefers_active_default_over_disconnected_configured_sink() {
         use super::{AudioNodeRecord, WorkerState};
-        use pipewire::spa::sys as spa_sys;
+        use crate::audio::types::AudioDirection;
 
         let mut st = WorkerState::default();
-        let out_dir = spa_sys::SPA_DIRECTION_OUTPUT;
         st.sinks.insert(
             55,
             AudioNodeRecord::new(
                 55,
                 "alsa_output.hdmi".into(),
                 "HDMI".into(),
-                out_dir,
+                AudioDirection::Output,
                 Some(42),
                 Some(15),
             ),
@@ -2311,7 +2366,7 @@ mod tests {
                 57,
                 "alsa_output.alc1220".into(),
                 "ALC1220".into(),
-                out_dir,
+                AudioDirection::Output,
                 Some(45),
                 Some(5),
             ),
@@ -2321,20 +2376,23 @@ mod tests {
             "default.audio.sink",
             Some(r#"{"name":"alsa_output.alc1220"}"#),
         ));
-        // Offline Bluetooth sink arrives later as default.configured.audio.sink: must NOT
-        // clobber the active default.audio.sink and fall back to HDMI (55).
         assert!(st.update_default_metadata(
             "default.configured.audio.sink",
             Some(r#"{"name":"bluez_output.offline"}"#),
         ));
-        assert_eq!(st.target_node(false).map(|n| n.id), Some(57));
+        assert_eq!(
+            st.target_node(AudioDirection::Output).map(|n| n.id),
+            Some(57)
+        );
 
-        // If default.audio.sink is cleared, fall back to configured sink if present.
         assert!(st.update_default_metadata("default.audio.sink", None));
         assert!(st.update_default_metadata(
             "default.configured.audio.sink",
             Some(r#"{"name":"alsa_output.alc1220"}"#),
         ));
-        assert_eq!(st.target_node(false).map(|n| n.id), Some(57));
+        assert_eq!(
+            st.target_node(AudioDirection::Output).map(|n| n.id),
+            Some(57)
+        );
     }
 }

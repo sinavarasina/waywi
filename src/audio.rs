@@ -21,10 +21,13 @@ pub mod types;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use client::AudioClient;
 pub use player::AudioPlayer;
-pub use sound::{SoundAsset, SoundData, SoundPreset, default_sound_dirs, resolve_sound_theme_path};
+pub use sound::{
+    SoundAsset, SoundData, SoundId, SoundPlay, SoundPreset, default_sound_dirs,
+    resolve_sound_theme_path,
+};
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use types::{
-    Audio, AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioEvent, AudioPort,
-    AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, compute_balance_with_map,
-    compute_stereo_balance,
+    Audio, AudioCard, AudioChannelPosition, AudioDevice, AudioDirection, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream, AudioTarget,
+    AudioVolume, compute_balance_with_map, compute_stereo_balance,
 };

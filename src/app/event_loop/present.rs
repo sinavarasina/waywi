@@ -5,12 +5,12 @@ use wayland_client::Connection;
 use crate::asset::AssetId;
 use crate::error::Result;
 use crate::geometry::BufferPx;
-use crate::reconcile::{ReconcileTargets, RetainedSurfaceKey};
-use crate::render::{FrameScene, RenderBackend, enter_memo_scope};
+use crate::reconcile::RetainedSurfaceKey;
+use crate::render::{FrameScene, RenderBackend};
 use crate::wayland::WaylandState;
 
 use super::super::runner::Application;
-use super::super::subscription_mgr::{SubscriptionClients, flatten_specs};
+use super::super::subscription_mgr::{SubscriptionClients, fanout_event, flatten_specs};
 use super::LoopRuntime;
 
 /// Orders `keys` so child `xdg_popup` surfaces are always destroyed before their parent surfaces,
@@ -56,73 +56,66 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
     state: &A::State,
 ) -> Result<()> {
     rt.needs_view_sync = false;
-    let _arena_guard = rt.arena.enter_scope();
     let now_sync = Instant::now();
 
-    {
-        let subs = A::subscriptions(state);
-        let mut flat = Vec::new();
-        flatten_specs(&subs, &mut flat);
-        rt.timers.reconcile(flat.iter().copied(), now_sync);
-        rt.system.reconcile(flat.iter().copied());
-        let had_kb_subs = !rt.sub_mgr.keyboard_layout_subs.is_empty();
-        rt.sub_mgr.sync(
-            &flat,
-            &rt.loop_handle,
-            &rt.inbox,
-            SubscriptionClients {
-                #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-                audio: &rt.audio_client,
-                #[cfg(feature = "hyprland-ipc")]
-                hyprland: rt.hyprland_client.as_ref(),
-                #[cfg(feature = "sway-ipc")]
-                sway: rt.sway_client.as_ref(),
-                #[cfg(feature = "dbus")]
-                dbus: &rt.dbus_client,
-                #[cfg(feature = "control-ipc")]
-                control_socket_override: rt.control_socket_override.as_deref(),
-                _marker: std::marker::PhantomData,
-            },
-        );
-        if !had_kb_subs
-            && !rt.sub_mgr.keyboard_layout_subs.is_empty()
-            && !wl.keyboard_layouts.is_empty()
-        {
-            let info = wl.keyboard_layout_info();
-            let mut guard = rt.inbox.borrow_mut();
-            for map in &rt.sub_mgr.keyboard_layout_subs {
-                guard.messages.push_back(map.call(info.clone()));
-            }
-        }
-        #[cfg(feature = "idle-notify")]
-        wl.sync_idle_watches(&rt.sub_mgr.idle_watches, &rt.qh);
-        #[cfg(feature = "clipboard")]
-        wl.set_clipboard_watching(!rt.sub_mgr.clipboard_subs.is_empty(), &rt.qh);
-    }
-
     let report = {
-        let _memo_guard = enter_memo_scope(&mut rt.memo_store);
-        let declared = A::view(state);
-        rt.reconciler.reconcile(
-            declared,
-            &ReconcileTargets {
-                outputs: &wl.outputs,
-                configured_sizes: &rt.configured_sizes,
-                surface_scales: &rt.surface_scales,
-            },
-            &mut rt.renderer,
-            &rt.assets,
-            now_sync,
-        )
+        let _arena_guard = rt.core.arena.enter_scope();
+        {
+            let subs = A::subscriptions(state);
+            let mut flat = Vec::new();
+            flatten_specs(&subs, &mut flat);
+            rt.core.timers.reconcile(flat.iter().copied(), now_sync);
+            rt.core
+                .system_samplers
+                .reconcile(flat.iter().copied(), &mut rt.core.system);
+            let had_kb_subs = !rt.sub_mgr.keyboard_layout_subs.is_empty();
+            rt.sub_mgr.sync(
+                &flat,
+                &rt.loop_handle,
+                &rt.inbox,
+                SubscriptionClients {
+                    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+                    audio: &rt.core.audio_client,
+                    #[cfg(feature = "hyprland-ipc")]
+                    hyprland: rt.core.hyprland_client.as_ref(),
+                    #[cfg(feature = "sway-ipc")]
+                    sway: rt.core.sway_client.as_ref(),
+                    #[cfg(feature = "dbus")]
+                    dbus: &rt.core.dbus_client,
+                    #[cfg(feature = "control-ipc")]
+                    control_socket_override: rt.control_socket_override.as_deref(),
+                    #[cfg(feature = "control-ipc")]
+                    app_name: rt.core.app_name.as_str(),
+                    _marker: std::marker::PhantomData,
+                },
+            );
+            if !had_kb_subs
+                && !rt.sub_mgr.keyboard_layout_subs.is_empty()
+                && !wl.keyboard_layouts.is_empty()
+            {
+                let info = wl.keyboard_layout_info();
+                fanout_event(
+                    info,
+                    &rt.sub_mgr.keyboard_layout_subs,
+                    &mut rt.inbox.borrow_mut().messages,
+                );
+            }
+            #[cfg(feature = "idle-notify")]
+            wl.sync_idle_watches(&rt.sub_mgr.idle_watches, &rt.qh);
+            #[cfg(feature = "clipboard")]
+            wl.set_clipboard_watching(!rt.sub_mgr.clipboard_subs.is_empty(), &rt.qh);
+        }
+
+        rt.core
+            .reconcile_view(&wl.outputs, now_sync, || A::view(state))
     };
-    rt.memo_store.prune_stale();
 
     // Destroy xdg_popup surfaces before parent surfaces per Wayland xdg_shell ordering rules.
     for rk in order_keys_children_first(wl, &report.removed_surfaces) {
         wl.destroy_surface(rk);
-        rt.renderer.drop_surface_target(rk);
-        rt.configured_sizes.remove(&rk);
-        rt.surface_scales.remove(&rk);
+        rt.core.renderer.drop_surface_target(rk);
+        rt.core.configured_sizes.remove(&rk);
+        rt.core.surface_scales.remove(&rk);
     }
     // Create parent surfaces before child xdg_popup surfaces (supporting nested popups).
     let mut pending_create: Vec<RetainedSurfaceKey> = report.created_surfaces.clone();
@@ -130,7 +123,7 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
         let mut deferred = Vec::new();
         let mut progressed = false;
         for rk in pending_create {
-            let Some(surf) = rt.reconciler.surfaces.get(&rk) else {
+            let Some(surf) = rt.core.reconciler.surfaces.get(&rk) else {
                 continue;
             };
             let waiting_on_parent = surf
@@ -147,7 +140,7 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
         }
         if !progressed {
             for rk in deferred {
-                if let Some(surf) = rt.reconciler.surfaces.get(&rk) {
+                if let Some(surf) = rt.core.reconciler.surfaces.get(&rk) {
                     wl.create_surface(&rt.qh, rk, &surf.spec)?;
                 }
             }
@@ -156,11 +149,11 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
         pending_create = deferred;
     }
     for rk in &report.updated_surfaces {
-        if let Some(surf) = rt.reconciler.surfaces.get(rk) {
+        if let Some(surf) = rt.core.reconciler.surfaces.get(rk) {
             wl.update_surface_spec(*rk, &surf.spec)?;
         }
     }
-    for (rk, surf) in &mut rt.reconciler.surfaces {
+    for (rk, surf) in &mut rt.core.reconciler.surfaces {
         if let Some(hv) = surf.hovered_node
             && report.retired_node_ids.contains(&hv)
         {
@@ -183,7 +176,7 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
         rt.a11y_dirty = false;
         rt.last_a11y_focused_surface = wl.focused_keyboard_surface;
         rt.a11y_bridge
-            .sync(&rt.reconciler.surfaces, wl.focused_keyboard_surface);
+            .sync(&rt.core.reconciler.surfaces, wl.focused_keyboard_surface);
     }
 
     Ok(())
@@ -194,13 +187,13 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
     rt: &mut LoopRuntime<M>,
     wl: &mut WaylandState,
 ) -> Result<()> {
-    let frame_seq = rt.reconciler.frame_seq;
-    let renderer = &mut rt.renderer;
-    let assets = &mut rt.assets;
+    let frame_seq = rt.core.reconciler.frame_seq;
+    let renderer = &mut rt.core.renderer;
+    let assets = &mut rt.core.assets;
     let conn = &rt.conn;
     let mut reclaim_candidates: Vec<AssetId> = Vec::new();
 
-    for (&rk, surf) in &mut rt.reconciler.surfaces {
+    for (&rk, surf) in &mut rt.core.reconciler.surfaces {
         let ws = wl.surfaces.get(&rk);
         let pending = ws.is_some_and(|w| w.pending_redraw);
         if !surf.needs_redraw && !pending {
@@ -236,13 +229,13 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
                 logical_size,
                 scale,
                 |pixels, bw, bh, _stride, damage| {
-                    let _ = renderer.render_argb8888(
+                    renderer.render_argb8888(
                         pixels,
                         BufferPx(bw as i32),
                         BufferPx(bh as i32),
                         damage,
                         scene,
-                    );
+                    )
                 },
             )?
         };
@@ -268,13 +261,8 @@ pub(crate) fn compute_wakeup_timeout<M: Clone + 'static>(
         return Some(Duration::ZERO);
     }
     let now_sleep = Instant::now();
-    let next_timer = rt.timers.next_deadline();
-    let next_sys = rt.system.next_deadline(now_sleep);
-    let next_anim = rt.reconciler.next_animation_deadline();
-    [next_timer, next_sys, next_anim]
-        .into_iter()
-        .flatten()
-        .min()
+    rt.core
+        .next_core_deadline(now_sleep)
         .map(|dl| dl.saturating_duration_since(now_sleep))
 }
 
@@ -289,5 +277,6 @@ pub(crate) fn shutdown_surfaces<M: Clone + 'static>(
         wl.destroy_surface(rk);
     }
     rt.sub_mgr.cleanup(&rt.loop_handle);
+    rt.core.system.stop_idle_workers();
     let _ = conn.flush();
 }

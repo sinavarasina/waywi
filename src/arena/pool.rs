@@ -5,8 +5,9 @@ use std::rc::Rc;
 
 use bumpalo::Bump;
 
-/// Default slab reservation (64 KiB) for steady-state frame allocations.
-const DEFAULT_SLAB_BYTES: usize = 64 * 1024;
+/// Default slab reservation (32 KiB) and retain cap (256 KiB) for steady-state frames.
+const DEFAULT_SLAB_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_RETAIN_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FrameArenaStats {
@@ -21,9 +22,9 @@ pub(crate) struct FrameSlab {
 }
 
 impl FrameSlab {
-    fn new() -> Self {
+    fn new(initial_bytes: usize) -> Self {
         Self {
-            bump: UnsafeCell::new(Bump::with_capacity(DEFAULT_SLAB_BYTES)),
+            bump: UnsafeCell::new(Bump::with_capacity(initial_bytes)),
             arena_allocs: Cell::new(0),
         }
     }
@@ -53,35 +54,69 @@ pub(crate) struct FrameArenaPool {
     slabs: [Rc<FrameSlab>; 2],
     next_index: usize,
     heap_fallbacks: usize,
+    initial_bytes: usize,
+    max_retain_bytes: usize,
 }
 
 impl FrameArenaPool {
     pub(crate) fn new() -> Self {
+        Self::with_limits(DEFAULT_SLAB_BYTES, DEFAULT_MAX_RETAIN_BYTES)
+    }
+
+    pub(crate) fn with_limits(initial_bytes: usize, max_retain_bytes: usize) -> Self {
+        let initial_bytes = initial_bytes.max(4096);
+        let max_retain_bytes = max_retain_bytes.max(initial_bytes);
         Self {
-            slabs: [Rc::new(FrameSlab::new()), Rc::new(FrameSlab::new())],
+            slabs: [
+                Rc::new(FrameSlab::new(initial_bytes)),
+                Rc::new(FrameSlab::new(initial_bytes)),
+            ],
             next_index: 0,
             heap_fallbacks: 0,
+            initial_bytes,
+            max_retain_bytes,
         }
     }
 
     /// Enters a scoped frame pass, resetting the next free slab in $O(1)$ if unshared.
+    ///
+    /// Slabs that grew past `max_retain_bytes` during a transient spike frame are replaced with
+    /// fresh `initial_bytes` slabs to avoid permanent RSS growth.
     pub(crate) fn enter_scope(&mut self) -> FrameScopeGuard {
         let idx = self.next_index;
         self.next_index = 1 - self.next_index;
 
         if let Some(slab_mut) = Rc::get_mut(&mut self.slabs[idx]) {
-            slab_mut.bump.get_mut().reset();
+            if slab_mut.allocated_bytes() > self.max_retain_bytes {
+                *slab_mut.bump.get_mut() = Bump::with_capacity(self.initial_bytes);
+            } else {
+                slab_mut.bump.get_mut().reset();
+            }
             slab_mut.arena_allocs.set(0);
         } else {
             // Soundness fallback: if a caller retained a `Surface` or `Element` outside the
             // view pass across frames, allocate a fresh slab rather than causing use-after-free.
-            self.slabs[idx] = Rc::new(FrameSlab::new());
+            self.slabs[idx] = Rc::new(FrameSlab::new(self.initial_bytes));
             self.heap_fallbacks += 1;
         }
 
         let slab = Rc::clone(&self.slabs[idx]);
         let previous = ACTIVE_SLAB.with(|slot| slot.borrow_mut().replace(slab));
         FrameScopeGuard { previous }
+    }
+
+    /// Shrinks both unshared slabs back down to `initial_bytes` immediately.
+    pub(crate) fn trim(&mut self) {
+        for slab in &mut self.slabs {
+            if let Some(slab_mut) = Rc::get_mut(slab) {
+                if slab_mut.allocated_bytes() > self.initial_bytes {
+                    *slab_mut.bump.get_mut() = Bump::with_capacity(self.initial_bytes);
+                } else {
+                    slab_mut.bump.get_mut().reset();
+                }
+                slab_mut.arena_allocs.set(0);
+            }
+        }
     }
 
     pub(crate) fn last_stats(&self) -> FrameArenaStats {
@@ -136,12 +171,10 @@ mod tests {
             assert_eq!(v.len(), 64);
 
             let zst = FrameSharedFn::new(|x: i32| x + 1);
-            assert!(!zst.is_arena_backed());
             assert_eq!(zst.call(41), 42);
 
             let captured = 100i32;
             let closure = FrameSharedFn::new(move |x: i32| x + captured);
-            assert!(closure.is_arena_backed());
             let cloned = closure.clone();
             assert_eq!(cloned.call(5), 105);
         }

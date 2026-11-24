@@ -12,10 +12,12 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{DbusActionLane, DbusClient, LaneActionSpec};
 use super::types::{Dbus, DbusBus};
+use super::worker::DbusWorkerHandle;
+use super::zvariant_helpers::unwrap_value;
 
 const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
@@ -96,8 +98,8 @@ impl NotificationCapabilities {
     }
 }
 
-/// Shared lock-free capability state and live connection slot shared between [`DbusClient`] and
-/// [`NotificationServerWorker`].
+/// Shared lock-free capability state and live connection slot shared between [`NotificationsClient`]
+/// and [`NotificationServerWorker`].
 pub(crate) struct NotificationServerState {
     conn: Mutex<Option<zbus::Connection>>,
     capabilities: AtomicU16,
@@ -250,7 +252,6 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusNotifications {
-                key: "dbus:org.freedesktop.Notifications".into_subscription_key(),
                 capabilities: None,
                 map: FrameSharedFn::new(map),
             },
@@ -265,7 +266,6 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusNotifications {
-                key: "dbus:org.freedesktop.Notifications".into_subscription_key(),
                 capabilities: Some(capabilities),
                 map: FrameSharedFn::new(map),
             },
@@ -273,23 +273,28 @@ impl Dbus {
     }
 }
 
-impl DbusClient {
-    /// Updates the XDG v1.2 [`NotificationCapabilities`] returned by
-    /// `org.freedesktop.Notifications.GetCapabilities` without restarting the server.
-    pub fn set_notification_capabilities(&self, capabilities: NotificationCapabilities) {
-        self.notifications_state.set_capabilities(capabilities);
-    }
+/// Zero-cost domain handle for XDG Desktop Notifications server controls.
+#[derive(Clone, Copy)]
+pub struct NotificationsClient<'a>(pub(super) &'a DbusClient);
 
+impl NotificationsClient<'_> {
     /// Returns the currently configured [`NotificationCapabilities`] advertised by the
     /// notification server.
     #[must_use]
-    pub fn notification_capabilities(&self) -> NotificationCapabilities {
-        self.notifications_state.capabilities()
+    pub fn capabilities(&self) -> NotificationCapabilities {
+        self.0.notifications_state.capabilities()
     }
+
+    /// Updates the XDG v1.2 [`NotificationCapabilities`] returned by
+    /// `org.freedesktop.Notifications.GetCapabilities` without restarting the server.
+    pub fn set_capabilities(&self, capabilities: NotificationCapabilities) {
+        self.0.notifications_state.set_capabilities(capabilities);
+    }
+
     /// Emits `org.freedesktop.Notifications.NotificationClosed(id, reason)` from the active server.
-    pub fn close_notification(&self, id: u32, reason: NotificationCloseReason) -> Result<()> {
+    pub fn close(&self, id: u32, reason: NotificationCloseReason) -> Result<()> {
         let conn = self.active_notifications_conn()?;
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::Session,
@@ -310,10 +315,10 @@ impl DbusClient {
     }
 
     /// Emits `org.freedesktop.Notifications.ActionInvoked(id, action_key)` from the active server.
-    pub fn invoke_notification_action(&self, id: u32, action_key: &str) -> Result<()> {
+    pub fn invoke_action(&self, id: u32, action_key: &str) -> Result<()> {
         let conn = self.active_notifications_conn()?;
         let key = action_key.to_owned();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::Session,
@@ -334,16 +339,15 @@ impl DbusClient {
     }
 
     fn active_notifications_conn(&self) -> Result<zbus::Connection> {
-        self.notifications_state.connection().ok_or_else(|| {
+        self.0.notifications_state.connection().ok_or_else(|| {
             WaywiError::DbusError("org.freedesktop.Notifications server is not running".into())
         })
     }
 }
 
 pub(crate) struct NotificationServerWorker {
-    stop: super::worker::AsyncStopSignal,
     state: Arc<NotificationServerState>,
-    join: Option<std::thread::JoinHandle<()>>,
+    handle: DbusWorkerHandle,
 }
 
 impl NotificationServerWorker {
@@ -351,53 +355,44 @@ impl NotificationServerWorker {
         sender: calloop::channel::Sender<NotificationEvent>,
         state: Arc<NotificationServerState>,
     ) -> Self {
-        let stop = super::worker::AsyncStopSignal::new();
-        let stop_flag = stop.clone();
         let state_for_thread = Arc::clone(&state);
+        let handle = DbusWorkerHandle::spawn("waywi-dbus-notify", move |stop_flag| {
+            let iface = NotificationsIface {
+                next_id: AtomicU32::new(1),
+                sender: sender.clone(),
+                state: Arc::clone(&state_for_thread),
+            };
+            let conn_res = futures_lite::future::block_on(async move {
+                let builder = zbus::connection::Builder::session()?
+                    .name(NOTIFICATIONS_BUS_NAME)?
+                    .serve_at(NOTIFICATIONS_OBJECT_PATH, iface)?;
+                builder.build().await
+            });
+            let Ok(conn) = conn_res else {
+                if let Err(err) = conn_res {
+                    let _ = sender.send(NotificationEvent::ServerError(format!(
+                        "failed to claim {NOTIFICATIONS_BUS_NAME}: {err}"
+                    )));
+                }
+                return;
+            };
 
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-notify".to_owned())
-            .spawn(move || {
-                let iface = NotificationsIface {
-                    next_id: AtomicU32::new(1),
-                    sender: sender.clone(),
-                    state: Arc::clone(&state_for_thread),
-                };
-                let conn_res = futures_lite::future::block_on(async move {
-                    let builder = zbus::connection::Builder::session()?
-                        .name(NOTIFICATIONS_BUS_NAME)?
-                        .serve_at(NOTIFICATIONS_OBJECT_PATH, iface)?;
-                    builder.build().await
-                });
-                let Ok(conn) = conn_res else {
-                    if let Err(err) = conn_res {
-                        let _ = sender.send(NotificationEvent::ServerError(format!(
-                            "failed to claim {NOTIFICATIONS_BUS_NAME}: {err}"
-                        )));
-                    }
-                    return;
-                };
+            state_for_thread.set_connection(Some(conn.clone()));
 
-                state_for_thread.set_connection(Some(conn.clone()));
+            futures_lite::future::block_on(stop_flag.wait_stopped());
 
-                futures_lite::future::block_on(stop_flag.wait_stopped());
+            state_for_thread.set_connection(None);
+            drop(conn);
+        });
 
-                state_for_thread.set_connection(None);
-                drop(conn);
-            })
-            .ok();
-
-        Self { stop, state, join }
+        Self { state, handle }
     }
 }
 
 impl Drop for NotificationServerWorker {
     fn drop(&mut self) {
-        self.stop.trigger();
+        self.handle.trigger_stop();
         self.state.set_connection(None);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
     }
 }
 
@@ -501,13 +496,6 @@ impl NotificationsIface {
         id: u32,
         action_key: &str,
     ) -> zbus::Result<()>;
-}
-
-fn unwrap_value<'a>(mut val: &'a Value<'a>) -> &'a Value<'a> {
-    while let Value::Value(inner) = val {
-        val = inner.as_ref();
-    }
-    val
 }
 
 fn hint_string(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
@@ -726,10 +714,10 @@ mod tests {
 
         let client = DbusClient::new();
         assert_eq!(
-            client.notification_capabilities(),
+            client.notifications().capabilities(),
             NotificationCapabilities::default()
         );
-        client.set_notification_capabilities(full);
-        assert_eq!(client.notification_capabilities(), full);
+        client.notifications().set_capabilities(full);
+        assert_eq!(client.notifications().capabilities(), full);
     }
 }

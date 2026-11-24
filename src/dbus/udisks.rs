@@ -5,26 +5,28 @@
 //! Privileged disk operations are authorized by the system's `udisks2` daemon through the active
 //! desktop session's Polkit authentication agent (`org.freedesktop.PolicyKit1`). `waywi` does not
 //! bundle a Polkit agent inside the disk module; instead, actions accept standard UDisks2 option
-//! flags (including `auth.no_user_interaction`) and execute asynchronously on background D-Bus
-//! lanes so interactive Polkit prompts or slow device flushes never block the UI thread.
+//! flags (including interactive Polkit authorization control) and execute asynchronously on
+//! background D-Bus lanes so interactive Polkit prompts or slow device flushes never block the UI
+//! thread.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
-    DBUS_SLOW_TIMEOUT, DbusActionLane, DbusActionPayload, DbusClient, DbusSharedBus,
-    LaneActionSpec, validate_object_path,
+    DBUS_SLOW_TIMEOUT, DbusActionLane, DbusActionReply, DbusClient, DbusSharedBus, LaneActionSpec,
+    validate_object_path,
 };
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
 use super::zvariant_helpers::{
     ManagedObjects, dict_bool, dict_bytes, dict_object_path, dict_str, dict_u64,
-    get_managed_objects_async, get_managed_objects_blocking,
+    get_managed_objects, unwrap_value,
 };
 
 const UDISKS_DEST: &str = "org.freedesktop.UDisks2";
@@ -35,6 +37,50 @@ const UDISKS_FS_IFACE: &str = "org.freedesktop.UDisks2.Filesystem";
 const UDISKS_ENCRYPTED_IFACE: &str = "org.freedesktop.UDisks2.Encrypted";
 const UDISKS_PARTITION_IFACE: &str = "org.freedesktop.UDisks2.Partition";
 const UDISKS_PARTITION_TABLE_IFACE: &str = "org.freedesktop.UDisks2.PartitionTable";
+
+/// Options for [`UDisksClient::mount`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UDisksMountOptions {
+    pub fs_type: Option<String>,
+    pub options: Option<String>,
+    /// Whether Polkit may prompt interactively if authorization is required (defaults to `true`).
+    pub interactive: bool,
+}
+
+impl Default for UDisksMountOptions {
+    fn default() -> Self {
+        Self {
+            fs_type: None,
+            options: None,
+            interactive: true,
+        }
+    }
+}
+
+impl UDisksMountOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn fs_type(mut self, fs_type: impl Into<String>) -> Self {
+        self.fs_type = Some(fs_type.into());
+        self
+    }
+
+    #[must_use]
+    pub fn options(mut self, options: impl Into<String>) -> Self {
+        self.options = Some(options.into());
+        self
+    }
+
+    #[must_use]
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+}
 
 /// Physical storage drive descriptor exposed by `org.freedesktop.UDisks2.Drive`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -223,54 +269,55 @@ impl Dbus {
     pub fn udisks<M: 'static>(map: impl Fn(UDisksSnapshot) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusUDisks {
-                key: "dbus:udisks".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Reads the current [`UDisksSnapshot`] from the subscription cache (0 ms) or queries
-    /// `org.freedesktop.UDisks2`.
-    pub fn udisks_snapshot(&self) -> Result<UDisksSnapshot> {
-        if let Ok(guard) = self.cache.udisks.read()
-            && let Some(ref snap) = *guard
-        {
-            return Ok(snap.clone());
-        }
-        let conn = self.connection(DbusBus::System)?;
-        let objs = get_managed_objects_blocking(&conn, UDISKS_DEST, UDISKS_PATH)?;
-        Ok(parse_udisks_objects(&objs))
+/// Zero-cost domain handle for UDisks2 storage drives, filesystems, and LUKS encryption.
+#[derive(Clone, Copy)]
+pub struct UDisksClient<'a>(pub(super) &'a DbusClient);
+
+impl UDisksClient<'_> {
+    /// Returns the latest cached [`UDisksSnapshot`] from an active [`Dbus::udisks`] subscription
+    /// without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshot(&self) -> Option<UDisksSnapshot> {
+        self.0.cache.udisks.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Queries `org.freedesktop.UDisks2` synchronously on the system bus.
+    pub fn snapshot_blocking(&self) -> Result<UDisksSnapshot> {
+        let conn = self.0.async_connection(DbusBus::System)?;
+        futures_lite::future::block_on(async move {
+            let objs = get_managed_objects(&conn, UDISKS_DEST, UDISKS_PATH).await?;
+            Ok(parse_udisks_objects(&objs))
+        })
     }
 
     /// Enqueues a non-blocking `org.freedesktop.UDisks2.Filesystem.Mount` action on `block_path`.
     ///
-    /// On completion, [`super::client::DbusActionResult::reply_object_path`] (and
-    /// [`super::client::DbusActionResult::reply`]) contains the mounted directory path returned by
-    /// UDisks2.
-    pub fn udisks_mount(&self, block_path: &str) -> Result<()> {
-        self.udisks_mount_with_options(block_path, None, &[], false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Filesystem.Mount` action with optional
-    /// filesystem type, mount option flags, and Polkit `auth.no_user_interaction` control.
-    pub fn udisks_mount_with_options(
-        &self,
-        block_path: &str,
-        fs_type: Option<&str>,
-        mount_options: &[&str],
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    /// On completion, [`super::client::DbusActionResult::reply`] carries
+    /// [`DbusActionReply::MountPath`].
+    pub fn mount(&self, block_path: &str, options: &UDisksMountOptions) -> Result<()> {
         let path = validate_object_path(block_path, "UDisks2 block object path")?;
-        let fstype_owned = fs_type
+        let fstype_owned = options
+            .fs_type
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
-        let opts_joined = (!mount_options.is_empty()).then(|| mount_options.join(","));
+        let opts_owned = options
+            .options
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let interactive = options.interactive;
         let target = path.clone();
 
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -280,12 +327,12 @@ impl DbusClient {
             .with_dedup(format!("udisks:mount:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let mut options = build_auth_options(no_user_interaction);
+                let mut map = build_auth_options(interactive);
                 if let Some(ref ft) = fstype_owned {
-                    options.insert("fstype", Value::from(ft.as_str()));
+                    map.insert("fstype", Value::from(ft.as_str()));
                 }
-                if let Some(ref mo) = opts_joined {
-                    options.insert("options", Value::from(mo.as_str()));
+                if let Some(ref mo) = opts_owned {
+                    map.insert("options", Value::from(mo.as_str()));
                 }
                 let reply = conn
                     .call_method(
@@ -293,7 +340,7 @@ impl DbusClient {
                         path.as_str(),
                         Some(UDISKS_FS_IFACE),
                         "Mount",
-                        &(options,),
+                        &(map,),
                     )
                     .await
                     .map_err(|e| WaywiError::DbusError(format!("Filesystem.Mount failed: {e}")))?;
@@ -301,32 +348,16 @@ impl DbusClient {
                     .body()
                     .deserialize()
                     .map_err(|e| WaywiError::DbusError(format!("Filesystem.Mount reply: {e}")))?;
-                Ok(DbusActionPayload {
-                    reply_object_path: Some(mount_dir.clone()),
-                    count: None,
-                    reply: vec![super::types::DbusValue::String(mount_dir)],
-                })
+                Ok(DbusActionReply::MountPath(PathBuf::from(mount_dir)))
             },
         )
     }
 
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Filesystem.Unmount` action on
-    /// `block_path`.
-    pub fn udisks_unmount(&self, block_path: &str, force: bool) -> Result<()> {
-        self.udisks_unmount_with_options(block_path, force, false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Filesystem.Unmount` action with explicit
-    /// `force` and Polkit `auth.no_user_interaction` flags.
-    pub fn udisks_unmount_with_options(
-        &self,
-        block_path: &str,
-        force: bool,
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Filesystem.Unmount` action on `block_path`.
+    pub fn unmount(&self, block_path: &str, force: bool, interactive: bool) -> Result<()> {
         let path = validate_object_path(block_path, "UDisks2 block object path")?;
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -336,7 +367,7 @@ impl DbusClient {
             .with_dedup(format!("udisks:unmount:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let mut options = build_auth_options(no_user_interaction);
+                let mut options = build_auth_options(interactive);
                 if force {
                     options.insert("force", Value::from(true));
                 }
@@ -355,20 +386,10 @@ impl DbusClient {
     }
 
     /// Enqueues a non-blocking `org.freedesktop.UDisks2.Drive.Eject` action on `drive_path`.
-    pub fn udisks_eject_drive(&self, drive_path: &str) -> Result<()> {
-        self.udisks_eject_drive_with_options(drive_path, false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Drive.Eject` action with explicit Polkit
-    /// `auth.no_user_interaction` control.
-    pub fn udisks_eject_drive_with_options(
-        &self,
-        drive_path: &str,
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    pub fn eject(&self, drive_path: &str, interactive: bool) -> Result<()> {
         let path = validate_object_path(drive_path, "UDisks2 drive object path")?;
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -378,7 +399,7 @@ impl DbusClient {
             .with_dedup(format!("udisks:eject:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let options = build_auth_options(no_user_interaction);
+                let options = build_auth_options(interactive);
                 conn.call_method(
                     Some(UDISKS_DEST),
                     path.as_str(),
@@ -395,20 +416,10 @@ impl DbusClient {
 
     /// Enqueues a non-blocking `org.freedesktop.UDisks2.Drive.PowerOff` action on `drive_path`
     /// (safely powering down a removable USB drive after its filesystems have been unmounted).
-    pub fn udisks_power_off_drive(&self, drive_path: &str) -> Result<()> {
-        self.udisks_power_off_drive_with_options(drive_path, false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Drive.PowerOff` action with explicit
-    /// Polkit `auth.no_user_interaction` control.
-    pub fn udisks_power_off_drive_with_options(
-        &self,
-        drive_path: &str,
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    pub fn power_off(&self, drive_path: &str, interactive: bool) -> Result<()> {
         let path = validate_object_path(drive_path, "UDisks2 drive object path")?;
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -418,7 +429,7 @@ impl DbusClient {
             .with_dedup(format!("udisks:poweroff:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let options = build_auth_options(no_user_interaction);
+                let options = build_auth_options(interactive);
                 conn.call_method(
                     Some(UDISKS_DEST),
                     path.as_str(),
@@ -436,24 +447,13 @@ impl DbusClient {
     /// Enqueues a non-blocking `org.freedesktop.UDisks2.Encrypted.Unlock` action on a LUKS
     /// encrypted `block_path`.
     ///
-    /// On completion, [`super::client::DbusActionResult::reply_object_path`] contains the unlocked
-    /// cleartext block device object path (e.g. `"/org/freedesktop/UDisks2/block_devices/dm_2d0"`).
-    pub fn udisks_unlock_encrypted(&self, block_path: &str, passphrase: &str) -> Result<()> {
-        self.udisks_unlock_encrypted_with_options(block_path, passphrase, false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Encrypted.Unlock` action with explicit
-    /// Polkit `auth.no_user_interaction` control.
-    pub fn udisks_unlock_encrypted_with_options(
-        &self,
-        block_path: &str,
-        passphrase: &str,
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    /// On completion, [`super::client::DbusActionResult::reply`] carries
+    /// [`DbusActionReply::ObjectPath`] containing the unlocked cleartext block device object path.
+    pub fn unlock(&self, block_path: &str, passphrase: &str, interactive: bool) -> Result<()> {
         let path = validate_object_path(block_path, "UDisks2 encrypted block object path")?;
         let secret = passphrase.to_owned();
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -463,7 +463,7 @@ impl DbusClient {
             .with_dedup(format!("udisks:unlock:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let options = build_auth_options(no_user_interaction);
+                let options = build_auth_options(interactive);
                 let reply = conn
                     .call_method(
                         Some(UDISKS_DEST),
@@ -478,32 +478,17 @@ impl DbusClient {
                     .body()
                     .deserialize()
                     .map_err(|e| WaywiError::DbusError(format!("Encrypted.Unlock reply: {e}")))?;
-                let cleartext_str = cleartext.to_string();
-                Ok(DbusActionPayload {
-                    reply_object_path: Some(cleartext_str.clone()),
-                    count: None,
-                    reply: vec![super::types::DbusValue::ObjectPath(cleartext_str)],
-                })
+                Ok(DbusActionReply::ObjectPath(cleartext.to_string()))
             },
         )
     }
 
     /// Enqueues a non-blocking `org.freedesktop.UDisks2.Encrypted.Lock` action on a LUKS
     /// encrypted `block_path`.
-    pub fn udisks_lock_encrypted(&self, block_path: &str) -> Result<()> {
-        self.udisks_lock_encrypted_with_options(block_path, false)
-    }
-
-    /// Enqueues a non-blocking `org.freedesktop.UDisks2.Encrypted.Lock` action with explicit
-    /// Polkit `auth.no_user_interaction` control.
-    pub fn udisks_lock_encrypted_with_options(
-        &self,
-        block_path: &str,
-        no_user_interaction: bool,
-    ) -> Result<()> {
+    pub fn lock(&self, block_path: &str, interactive: bool) -> Result<()> {
         let path = validate_object_path(block_path, "UDisks2 encrypted block object path")?;
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::System,
@@ -513,7 +498,7 @@ impl DbusClient {
             .with_dedup(format!("udisks:lock:{path}"))
             .with_timeout(DBUS_SLOW_TIMEOUT),
             move |conn| async move {
-                let options = build_auth_options(no_user_interaction);
+                let options = build_auth_options(interactive);
                 conn.call_method(
                     Some(UDISKS_DEST),
                     path.as_str(),
@@ -529,9 +514,9 @@ impl DbusClient {
     }
 }
 
-fn build_auth_options(no_user_interaction: bool) -> HashMap<&'static str, Value<'static>> {
+fn build_auth_options(interactive: bool) -> HashMap<&'static str, Value<'static>> {
     let mut map = HashMap::new();
-    if no_user_interaction {
+    if !interactive {
         map.insert("auth.no_user_interaction", Value::from(true));
     }
     map
@@ -549,7 +534,9 @@ pub(crate) fn spawn_udisks_worker(
         sender,
         shared,
         |conn| async move {
-            let objs = get_managed_objects_async(&conn, UDISKS_DEST, UDISKS_PATH).await?;
+            let objs = get_managed_objects(&conn, UDISKS_DEST, UDISKS_PATH)
+                .await
+                .ok()?;
             Some(parse_udisks_objects(&objs))
         },
     )
@@ -644,17 +631,17 @@ fn dict_c_bytestring_vec(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<
     if let Ok(raw_list) = Vec::<Vec<u8>>::try_from(val.clone()) {
         return raw_list.iter().filter_map(|b| decode_c_bytes(b)).collect();
     }
-    let Value::Array(arr) = &**val else {
+    let Value::Array(arr) = unwrap_value(val) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for item in arr.iter() {
-        match item {
+        match unwrap_value(item) {
             Value::Str(s) if !s.is_empty() => out.push(s.to_string()),
             Value::Array(inner) => {
                 let bytes: Vec<u8> = inner
                     .iter()
-                    .filter_map(|v| match v {
+                    .filter_map(|v| match unwrap_value(v) {
                         Value::U8(b) => Some(*b),
                         _ => None,
                     })
@@ -681,6 +668,25 @@ fn decode_c_bytes(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_options_and_auth_polarity() {
+        let def = UDisksMountOptions::default();
+        assert!(def.interactive);
+        assert!(build_auth_options(true).is_empty());
+        assert_eq!(
+            build_auth_options(false).get("auth.no_user_interaction"),
+            Some(&Value::from(true))
+        );
+
+        let custom = UDisksMountOptions::new()
+            .fs_type("exfat")
+            .options("ro,noexec")
+            .interactive(false);
+        assert_eq!(custom.fs_type.as_deref(), Some("exfat"));
+        assert_eq!(custom.options.as_deref(), Some("ro,noexec"));
+        assert!(!custom.interactive);
+    }
 
     #[test]
     fn parses_udisks2_drives_filesystems_byte_arrays_and_luks_volumes() {

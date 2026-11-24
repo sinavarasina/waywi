@@ -11,6 +11,9 @@ use crate::render::software::fast_path::{BlitSource, PixelTarget, fast_fill_rect
 use crate::render::software::path::{build_clip_mask, build_rounded_rect_path};
 use crate::render::software::{CachedCanvasPixmap, SoftwareRenderer};
 
+#[cfg(feature = "text")]
+use crate::text::TextEngine;
+
 pub(super) struct TileTarget<'a> {
     pub(super) pixels: PixelTarget<'a>,
     pub(super) origin_x: i32,
@@ -21,6 +24,7 @@ impl SoftwareRenderer {
     pub(super) fn render_command_into_tile(
         &mut self,
         tile: &mut TileTarget<'_>,
+        #[cfg(feature = "text")] text_engine: &mut TextEngine,
         scale: ScaleFactor,
         cmd: &DrawCommand,
         assets: &AssetCache,
@@ -140,7 +144,7 @@ impl SoftwareRenderer {
                         wrap_to_width: *wrap_to_width,
                         scale,
                     };
-                    self.text_engine.draw_text_premultiplied_rgba(
+                    text_engine.draw_text_premultiplied_rgba(
                         &mut text_target,
                         (ox, oy),
                         params,
@@ -193,38 +197,69 @@ impl SoftwareRenderer {
                     &mut self.scratch_sprite_cell,
                 );
             }
-            PaintPayload::Sprite {
-                sheet,
-                frame_index,
-                filter,
-                ..
-            } => {
-                let Some(decoded) = assets.get(sheet.asset.id) else {
-                    return;
-                };
-                draw_bitmap_region(
-                    tile,
-                    scale_f,
-                    cmd,
-                    &BlitSource {
-                        pixels: &decoded.pixels,
-                        full_w: decoded.width,
-                        full_h: decoded.height,
-                        src_rect: sheet.frame_source_rect(*frame_index),
-                    },
-                    ImageFit::Fill,
-                    *filter,
-                    &mut self.scratch_sprite_cell,
-                );
-            }
-            PaintPayload::Canvas { render_key, draw } => {
+            PaintPayload::Canvas { cache_key, draw } => {
                 let px_w = cmd.local_rect.width.to_buffer_ceil(scale).as_u32().max(1);
                 let px_h = cmd.local_rect.height.to_buffer_ceil(scale).as_u32().max(1);
+                let needed = (px_w as usize) * (px_h as usize) * 4;
+
+                let Some(cache_key) = *cache_key else {
+                    let mut scratch = std::mem::take(&mut self.scratch_canvas);
+                    scratch.resize(needed, 0);
+                    scratch[..needed].fill(0);
+                    {
+                        let mut painter = Painter::new_pixels(
+                            LogicalSize::new(cmd.local_rect.width, cmd.local_rect.height),
+                            scale_f,
+                            &mut scratch[..needed],
+                            px_w,
+                            px_h,
+                        );
+                        let ptr: *mut Painter<'_> = &mut painter;
+                        // SAFETY: `painter` lives exclusively on this stack frame for `draw.func`.
+                        draw.func.call(ptr.cast::<Painter<'static>>());
+                    }
+                    draw_bitmap_region(
+                        tile,
+                        scale_f,
+                        cmd,
+                        &BlitSource {
+                            pixels: &scratch[..needed],
+                            full_w: px_w,
+                            full_h: px_h,
+                            src_rect: (0, 0, px_w, px_h),
+                        },
+                        ImageFit::Fill,
+                        ImageFilter::Bilinear,
+                        &mut self.scratch_sprite_cell,
+                    );
+                    self.scratch_canvas = scratch;
+                    return;
+                };
+
                 let cache_hit = self.canvas_cache.get(&cmd.node_id).is_some_and(|c| {
-                    c.render_key == *render_key && c.width_px == px_w && c.height_px == px_h
+                    c.cache_key == cache_key && c.width_px == px_w && c.height_px == px_h
                 });
                 if !cache_hit {
-                    let mut buf = vec![0u8; (px_w as usize) * (px_h as usize) * 4];
+                    if let Some(prev) = self.canvas_cache.remove(&cmd.node_id) {
+                        self.canvas_bytes =
+                            self.canvas_bytes.saturating_sub(prev.rgba_pixels.len());
+                    }
+                    while self.canvas_bytes.saturating_add(needed) > self.canvas_max_bytes {
+                        let Some(oldest) = self
+                            .canvas_cache
+                            .iter()
+                            .min_by_key(|(_, v)| v.last_used_frame)
+                            .map(|(&k, _)| k)
+                        else {
+                            break;
+                        };
+                        if let Some(old) = self.canvas_cache.remove(&oldest) {
+                            self.canvas_bytes =
+                                self.canvas_bytes.saturating_sub(old.rgba_pixels.len());
+                        }
+                    }
+
+                    let mut buf = vec![0u8; needed];
                     let mut painter = Painter::new_pixels(
                         LogicalSize::new(cmd.local_rect.width, cmd.local_rect.height),
                         scale_f,
@@ -238,18 +273,21 @@ impl SoftwareRenderer {
                     let ptr_static: *mut Painter<'static> = ptr.cast();
                     draw.func.call(ptr_static);
 
+                    self.canvas_bytes = self.canvas_bytes.saturating_add(buf.len());
                     self.canvas_cache.insert(
                         cmd.node_id,
                         CachedCanvasPixmap {
-                            render_key: *render_key,
+                            cache_key,
                             width_px: px_w,
                             height_px: px_h,
+                            last_used_frame: frame_seq,
                             rgba_pixels: buf,
                         },
                     );
                 }
 
-                if let Some(cached) = self.canvas_cache.get(&cmd.node_id) {
+                if let Some(cached) = self.canvas_cache.get_mut(&cmd.node_id) {
+                    cached.last_used_frame = frame_seq;
                     draw_bitmap_region(
                         tile,
                         scale_f,

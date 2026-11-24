@@ -351,4 +351,9 @@ impl GpuContext {
     pub(crate) fn drop_surface(&mut self, key: RetainedSurfaceKey) {
         self.surfaces.remove(&key);
     }
+
+    pub(crate) fn trim_offscreen(&mut self) {
+        self.offscreen_tex = None;
+        self.staging_buf = None;
+    }
 }

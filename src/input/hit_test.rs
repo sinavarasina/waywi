@@ -1,4 +1,4 @@
-use crate::geometry::{Affine2D, Point, Rect};
+use crate::geometry::{Affine2D, Bounds, Point};
 
 use super::events::EventHandlers;
 use super::keys::NodeId;
@@ -8,12 +8,12 @@ pub(crate) struct HitTestNode<M> {
     pub(crate) node_id: NodeId,
     /// Un-transformed local layout bounds `[0..w, 0..h]` in element space (actually surface-space
     /// origin + size before local transform).
-    pub(crate) local_rect: Rect,
+    pub(crate) local_rect: Bounds,
     /// Forward transform from surface-local space -> world affine maps surface-local layout rect to
     /// transformed surface-local coordinates.
     pub(crate) affine: Affine2D,
     pub(crate) inverse_affine: Option<Affine2D>,
-    pub(crate) clip_rect: Option<Rect>,
+    pub(crate) clip_rect: Option<Bounds>,
     pub(crate) z_index: i32,
     pub(crate) paint_order: usize,
     pub(crate) visible: bool,
@@ -24,10 +24,10 @@ pub(crate) struct HitTestNode<M> {
 impl<M: 'static> HitTestNode<M> {
     /// Returns the world-space bounding box used for selective `wl_region` input regions.
     #[must_use]
-    pub(crate) fn world_bounds(&self) -> Rect {
+    pub(crate) fn world_bounds(&self) -> Bounds {
         let transformed = self.affine.transform_rect(self.local_rect);
         match self.clip_rect {
-            Some(clip) => transformed.intersect(clip).unwrap_or(Rect::ZERO),
+            Some(clip) => transformed.intersect(clip).unwrap_or(Bounds::ZERO),
             None => transformed,
         }
     }

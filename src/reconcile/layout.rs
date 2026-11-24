@@ -1,5 +1,5 @@
 use crate::asset::AssetCache;
-use crate::geometry::{Edges, Length, LogicalPx, LogicalSize, Rect as GeoRect, Size};
+use crate::geometry::{Bounds, Edges, Length, LogicalPx, LogicalSize, ScaleFactor, Size};
 use crate::input::HitTestNode;
 use crate::render::{Element, ElementKind, RenderBackend};
 
@@ -60,14 +60,19 @@ pub(crate) fn resolve_surface_size(size: Size, output: LogicalSize, margin: Edge
     LogicalSize::new(w, h)
 }
 
-pub(crate) fn resolve_surface_size_with_children<M: 'static>(
+pub(crate) struct MeasureCtx<'a, R> {
+    pub(crate) scale: ScaleFactor,
+    pub(crate) renderer: &'a mut R,
+    pub(crate) assets: &'a AssetCache,
+    pub(crate) frame_seq: u64,
+}
+
+pub(crate) fn resolve_surface_size_with_children<M: 'static, R: RenderBackend>(
     size: Size,
     children: &[Element<M>],
     output: LogicalSize,
     margin: Edges,
-    renderer: &mut impl RenderBackend,
-    assets: &AssetCache,
-    frame_seq: u64,
+    mctx: &mut MeasureCtx<'_, R>,
 ) -> LogicalSize {
     let base = resolve_surface_size(size, output, margin);
     if !matches!(size.width, Length::Auto) && !matches!(size.height, Length::Auto) {
@@ -75,11 +80,18 @@ pub(crate) fn resolve_surface_size_with_children<M: 'static>(
     }
     let avail_w = (output.width - margin.left - margin.right).max(LogicalPx(1.0));
     let avail_h = (output.height - margin.top - margin.bottom).max(LogicalPx(1.0));
-    let parent_rect = GeoRect::new(LogicalPx::ZERO, LogicalPx::ZERO, avail_w, avail_h);
+    let parent_rect = Bounds::new(LogicalPx::ZERO, LogicalPx::ZERO, avail_w, avail_h);
     let mut max_w = LogicalPx::ZERO;
     let mut max_h = LogicalPx::ZERO;
     for ch in children {
-        let s = measure_element_intrinsic(ch, parent_rect, renderer, assets, frame_seq);
+        let s = measure_element_intrinsic(
+            ch,
+            parent_rect,
+            mctx.scale,
+            mctx.renderer,
+            mctx.assets,
+            mctx.frame_seq,
+        );
         if let Some(c) = ch.common() {
             let cw = match c.size.width {
                 Length::Px(px) => px.max(LogicalPx::ZERO),
@@ -114,7 +126,8 @@ pub(crate) fn resolve_surface_size_with_children<M: 'static>(
 
 pub(crate) fn measure_element_intrinsic<M: 'static>(
     el: &Element<M>,
-    parent_rect: GeoRect,
+    parent_rect: Bounds,
+    scale: ScaleFactor,
     renderer: &mut impl RenderBackend,
     assets: &AssetCache,
     frame_seq: u64,
@@ -137,6 +150,7 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
                     align: t.align,
                     bounds_mode: t.bounds_mode,
                 },
+                scale,
                 frame_seq,
             )
         }
@@ -168,7 +182,8 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
             let mut max_w = LogicalPx::ZERO;
             let mut max_h = LogicalPx::ZERO;
             for ch in g.children.iter() {
-                let s = measure_element_intrinsic(ch, parent_rect, renderer, assets, frame_seq);
+                let s =
+                    measure_element_intrinsic(ch, parent_rect, scale, renderer, assets, frame_seq);
                 if let Some(c) = ch.common() {
                     let cw = resolve_intrinsic_child(c.size.width, s.width);
                     let ch_h = resolve_intrinsic_child(c.size.height, s.height);
@@ -183,7 +198,8 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
             let mut max_h = LogicalPx::ZERO;
             let mut count = 0usize;
             for ch in r.children.iter() {
-                let s = measure_element_intrinsic(ch, parent_rect, renderer, assets, frame_seq);
+                let s =
+                    measure_element_intrinsic(ch, parent_rect, scale, renderer, assets, frame_seq);
                 if let Some(c) = ch.common() {
                     let cw = resolve_intrinsic_child(c.size.width, s.width);
                     let ch_h = resolve_intrinsic_child(c.size.height, s.height);
@@ -205,7 +221,8 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
             let mut sum_h = LogicalPx::ZERO;
             let mut count = 0usize;
             for ch in c.children.iter() {
-                let s = measure_element_intrinsic(ch, parent_rect, renderer, assets, frame_seq);
+                let s =
+                    measure_element_intrinsic(ch, parent_rect, scale, renderer, assets, frame_seq);
                 if let Some(cm) = ch.common() {
                     let cw = resolve_intrinsic_child(cm.size.width, s.width);
                     let ch_h = resolve_intrinsic_child(cm.size.height, s.height);
@@ -223,7 +240,7 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
             )
         }
         ElementKind::Clip(c) => c.child.first().map_or(LogicalSize::ZERO, |ch| {
-            measure_element_intrinsic(ch, parent_rect, renderer, assets, frame_seq)
+            measure_element_intrinsic(ch, parent_rect, scale, renderer, assets, frame_seq)
         }),
         ElementKind::MemoHit { .. } => LogicalSize::ZERO,
     }
@@ -231,7 +248,7 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
 
 pub(crate) fn compute_selective_input_rects<M: 'static>(
     hit_nodes: &[HitTestNode<M>],
-) -> Vec<GeoRect> {
+) -> Vec<Bounds> {
     hit_nodes
         .iter()
         .filter(|n| n.visible && n.input_enabled && n.handlers.has_pointer_handlers())

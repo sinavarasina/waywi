@@ -21,11 +21,15 @@ impl Application for A11yTestApp {
     type State = A11yState;
     type Message = A11yMsg;
 
-    fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         Ok(A11yState::default())
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, _ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        _ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             A11yMsg::Increment => state.count += 1,
         }
@@ -35,14 +39,14 @@ impl Application for A11yTestApp {
     fn view(state: &Self::State) -> Surfaces<Self::Message> {
         let mut s = Surfaces::new();
         let surf = Surface::panel("a11y-panel", Output::Primary)
-            .size(Size::px(300.logical_px(), 48.logical_px()))
+            .size((300.logical_px(), 48.logical_px()))
             .title("Accessibility Test Panel")
             .accessible_description("Top status bar")
             .child(
                 Row::new()
                     .child(
                         Rect::new()
-                            .size(Size::px(120.logical_px(), 32.logical_px()))
+                            .size((120.logical_px(), 32.logical_px()))
                             .fill(Color::rgb(40, 80, 120))
                             .accessible_role(AccessibleRole::Button)
                             .accessible_label(format!("Increment ({})", state.count))

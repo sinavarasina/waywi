@@ -16,7 +16,7 @@ pub struct MemoryPsi {
 /// System RAM and swap snapshot.
 ///
 /// Used memory is defined consistently with Linux `free`: `used = total.saturating_sub(available)`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct MemorySnapshot {
     pub total: ByteSize,
     pub available: ByteSize,

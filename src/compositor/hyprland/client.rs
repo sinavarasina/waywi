@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::compositor::WorkspaceTarget;
 use crate::error::{Result, WaywiError};
 
 use super::types::{
     ClientInfo, CursorPos, HyprlandDevices, HyprlandEvent, HyprlandLayout, HyprlandOption,
-    HyprlandSockets, HyprlandVersion, MonitorInfo, WorkspaceId, WorkspaceInfo, WorkspaceRuleInfo,
-    WorkspaceType,
+    HyprlandSockets, HyprlandVersion, KeyboardLayoutSwitch, MonitorInfo, WorkspaceId,
+    WorkspaceInfo, WorkspaceRuleInfo, WorkspaceType,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -233,63 +234,59 @@ impl HyprlandClient {
         })
     }
 
-    /// Switches to typed workspace ID without spawning a shell.
-    pub fn switch_workspace(&self, id: WorkspaceId) -> Result<()> {
-        self.dispatch_with_lua_fallback(
-            "workspace",
-            &id.0.to_string(),
-            &format!("dispatch hl.dsp.focus({{ workspace = {} }})", id.0),
-        )
-    }
-
-    /// Switches to a named workspace (`name:<name>` or `special:<name>`) without spawning a shell,
-    /// supporting both Hyprlang and HyprLua v0.55+ dispatch syntax.
-    pub fn switch_workspace_name(&self, name: &str) -> Result<()> {
-        validate_arg(name)?;
-        if name.is_empty() {
-            return Err(WaywiError::IpcError(
-                "Hyprland workspace name must not be empty".to_owned(),
-            ));
+    /// Switches workspace without spawning a shell, supporting numeric IDs, named/special
+    /// workspaces, relative steps, and `"previous"` across both Hyprlang and HyprLua v0.55+.
+    pub fn switch_workspace<'a>(&self, target: impl Into<WorkspaceTarget<'a>>) -> Result<()> {
+        match target.into() {
+            WorkspaceTarget::Id(id) => self.dispatch_with_lua_fallback(
+                "workspace",
+                &id.to_string(),
+                &format!("dispatch hl.dsp.focus({{ workspace = {id} }})"),
+            ),
+            WorkspaceTarget::Name(name) => {
+                validate_arg(name)?;
+                if name.is_empty() {
+                    return Err(WaywiError::IpcError(
+                        "Hyprland workspace name must not be empty".to_owned(),
+                    ));
+                }
+                let spec = if name.starts_with("special:") || name.starts_with("name:") {
+                    name.to_owned()
+                } else {
+                    format!("name:{name}")
+                };
+                let escaped = escape_lua_string(&spec);
+                self.dispatch_with_lua_fallback(
+                    "workspace",
+                    &spec,
+                    &format!("dispatch hl.dsp.focus({{ workspace = \"{escaped}\" }})"),
+                )
+            }
+            WorkspaceTarget::Relative {
+                delta,
+                existing_only,
+            } => {
+                if delta == 0 {
+                    return Ok(());
+                }
+                let prefix = if existing_only { "e" } else { "" };
+                let spec = if delta > 0 {
+                    format!("{prefix}+{delta}")
+                } else {
+                    format!("{prefix}{delta}")
+                };
+                self.dispatch_with_lua_fallback(
+                    "workspace",
+                    &spec,
+                    &format!("dispatch hl.dsp.focus({{ workspace = \"{spec}\" }})"),
+                )
+            }
+            WorkspaceTarget::Previous => self.dispatch_with_lua_fallback(
+                "workspace",
+                "previous",
+                "dispatch hl.dsp.focus({ workspace = \"previous\" })",
+            ),
         }
-        let target = if name.starts_with("special:") || name.starts_with("name:") {
-            name.to_owned()
-        } else {
-            format!("name:{name}")
-        };
-        let escaped = escape_lua_string(&target);
-        self.dispatch_with_lua_fallback(
-            "workspace",
-            &target,
-            &format!("dispatch hl.dsp.focus({{ workspace = \"{escaped}\" }})"),
-        )
-    }
-
-    /// Switches workspace relative to the current one (e.g. `delta = 1, existing_only = true`
-    /// dispatches `"e+1"`; `delta = -1, existing_only = false` dispatches `"-1"`).
-    pub fn switch_workspace_relative(&self, delta: i32, existing_only: bool) -> Result<()> {
-        if delta == 0 {
-            return Ok(());
-        }
-        let prefix = if existing_only { "e" } else { "" };
-        let spec = if delta > 0 {
-            format!("{prefix}+{delta}")
-        } else {
-            format!("{prefix}{delta}")
-        };
-        self.dispatch_with_lua_fallback(
-            "workspace",
-            &spec,
-            &format!("dispatch hl.dsp.focus({{ workspace = \"{spec}\" }})"),
-        )
-    }
-
-    /// Switches back to the previously active workspace (`"previous"`).
-    pub fn switch_workspace_previous(&self) -> Result<()> {
-        self.dispatch_with_lua_fallback(
-            "workspace",
-            "previous",
-            "dispatch hl.dsp.focus({ workspace = \"previous\" })",
-        )
     }
 
     /// Moves `workspace` (e.g. `"2"`, `"name:code"`, `"special:magic"`) to `monitor` (e.g.
@@ -551,19 +548,26 @@ impl HyprlandClient {
 
     /// Switches all keyboards to the next XKB layout (`switchxkblayout all next`).
     pub fn next_keyboard_layout(&self) -> Result<()> {
-        self.switch_keyboard_layout_cmd("all", "next")
+        self.switch_keyboard_layout_for("all", KeyboardLayoutSwitch::Next)
     }
 
     /// Switches all keyboards to a specific zero-based XKB layout index (`switchxkblayout all <index>`).
     pub fn switch_keyboard_layout(&self, index: u32) -> Result<()> {
-        self.switch_keyboard_layout_cmd("all", &index.to_string())
+        self.switch_keyboard_layout_for("all", KeyboardLayoutSwitch::Index(index))
     }
 
-    /// Sends a `switchxkblayout <device> <action>` command directly over `.socket.sock`.
-    pub fn switch_keyboard_layout_cmd(&self, device: &str, action: &str) -> Result<()> {
+    /// Sends a typed `switchxkblayout <device> <action>` command directly over `.socket.sock`.
+    pub fn switch_keyboard_layout_for(
+        &self,
+        device: &str,
+        action: KeyboardLayoutSwitch,
+    ) -> Result<()> {
         validate_token("device", device)?;
-        validate_token("layout", action)?;
-        let cmd = format!("switchxkblayout {device} {action}");
+        let cmd = match action {
+            KeyboardLayoutSwitch::Next => format!("switchxkblayout {device} next"),
+            KeyboardLayoutSwitch::Prev => format!("switchxkblayout {device} prev"),
+            KeyboardLayoutSwitch::Index(index) => format!("switchxkblayout {device} {index}"),
+        };
         self.send_ok_command(&cmd, "switchxkblayout")
     }
 
@@ -1273,7 +1277,7 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for _ in 0..12 {
+            for _ in 0..16 {
                 let (mut conn, _) = listener.accept().unwrap();
                 let mut req = [0u8; 512];
                 let n = conn.read(&mut req).unwrap();
@@ -1295,6 +1299,10 @@ mod tests {
                     "dispatch hl.dsp.layout(\"swapwithmaster\")" => "ok",
                     "dispatch hl.dsp.focus({ workspace = \"e+1\" })" => "ok",
                     "dispatch hl.dsp.focus({ workspace = \"previous\" })" => "ok",
+                    "dispatch hl.dsp.focus({ workspace = \"special:magic\" })" => "ok",
+                    "dispatch hl.dsp.focus({ workspace = \"name:dev\" })" => "ok",
+                    "switchxkblayout all next" => "ok",
+                    "switchxkblayout main-kb prev" => "ok",
                     "dispatch hl.dsp.workspace.move({ workspace = 5, monitor = \"HDMI-A-1\" })" => {
                         "ok"
                     }
@@ -1337,15 +1345,26 @@ mod tests {
             .unwrap();
         assert!(client.set_default_layout(&HyprlandLayout::Unknown).is_err());
         client.layout_message("swapwithmaster").unwrap();
-        client.switch_workspace_relative(1, true).unwrap();
-        client.switch_workspace_previous().unwrap();
+        client
+            .switch_workspace(WorkspaceTarget::Relative {
+                delta: 1,
+                existing_only: true,
+            })
+            .unwrap();
+        client.switch_workspace(WorkspaceTarget::Previous).unwrap();
+        client.switch_workspace(&wss[2]).unwrap();
+        client.switch_workspace("dev").unwrap();
+        client.next_keyboard_layout().unwrap();
+        client
+            .switch_keyboard_layout_for("main-kb", KeyboardLayoutSwitch::Prev)
+            .unwrap();
         client.move_workspace_to_monitor("5", "HDMI-A-1").unwrap();
         client.move_workspace_to_monitor("5", "+1").unwrap();
         client.rename_workspace(WorkspaceId(5), "code").unwrap();
         client.rename_workspace(WorkspaceId(5), "").unwrap();
 
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 12);
+        assert_eq!(seen.len(), 16);
 
         // Multiple Hyprland v0.57+ special workspaces share WorkspaceId(0) without colliding.
         assert!(apply_workspace_event(

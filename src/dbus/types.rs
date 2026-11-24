@@ -1,7 +1,10 @@
+use std::any::TypeId;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::arena::FrameSharedFn;
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionKey, SubscriptionSpec};
 
 /// Target D-Bus bus selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -159,7 +162,7 @@ pub struct DbusSignalEvent {
     pub args: Vec<DbusValue>,
 }
 
-/// D-Bus signal subscription builder.
+/// D-Bus subscription builder namespace.
 pub struct Dbus;
 
 impl Dbus {
@@ -173,7 +176,13 @@ impl Dbus {
     ) -> Subscription<M> {
         let iface = interface.into();
         let mem = member.into();
-        let key = (bus, iface.clone(), mem.clone(), path.clone()).into_subscription_key();
+        let mut hasher = DefaultHasher::new();
+        TypeId::of::<(DbusBus, String, String, Option<String>)>().hash(&mut hasher);
+        bus.hash(&mut hasher);
+        iface.hash(&mut hasher);
+        mem.hash(&mut hasher);
+        path.hash(&mut hasher);
+        let key = SubscriptionKey(hasher.finish());
         Subscription {
             spec: SubscriptionSpec::DbusSignal {
                 key,

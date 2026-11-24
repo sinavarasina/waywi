@@ -6,17 +6,15 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
     DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec, connect_shared_bus,
     owned_value_to_dbus, validate_bus_name,
 };
 use super::types::{Dbus, DbusBus, DbusValue};
-use super::worker::AsyncStopSignal;
-use super::zvariant_helpers::{
-    dict_bool, dict_f64, dict_i64, dict_str, get_all_async, get_all_blocking,
-};
+use super::worker::{AsyncStopSignal, DbusWorkerHandle};
+use super::zvariant_helpers::{dict_bool, dict_f64, dict_i64, dict_str, get_all};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_OBJECT: &str = "/org/mpris/MediaPlayer2";
@@ -129,119 +127,114 @@ impl Dbus {
     pub fn mpris<M: 'static>(map: impl Fn(MprisEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusMpris {
-                key: "dbus:mpris".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Lists active MPRIS media player bus names (`org.mpris.MediaPlayer2.*`), returning the
-    /// cached subscription list (0 ms) when available or querying the session bus.
-    pub fn list_mpris_players(&self) -> Result<Vec<String>> {
-        if let Ok(guard) = self.cache.mpris.read()
-            && let Some(ref list) = *guard
-        {
-            return Ok(list.iter().map(|s| s.service_name.clone()).collect());
-        }
-        let conn = self.connection(DbusBus::Session)?;
-        list_mpris_names_blocking(&conn)
+/// Zero-cost domain handle for MPRIS media player inspection and playback control.
+#[derive(Clone, Copy)]
+pub struct MprisClient<'a>(pub(super) &'a DbusClient);
+
+impl MprisClient<'_> {
+    /// Returns the latest cached MPRIS player list from an active [`Dbus::mpris`] subscription
+    /// without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshots(&self) -> Option<Vec<MprisSnapshot>> {
+        self.0.cache.mpris.read().ok().and_then(|g| g.clone())
     }
 
-    /// Reads snapshots for all active MPRIS media players on the session bus, returning the
-    /// cached subscription list (0 ms) when available or querying the session bus.
-    pub fn mpris_snapshots(&self) -> Result<Vec<MprisSnapshot>> {
-        if let Ok(guard) = self.cache.mpris.read()
-            && let Some(ref list) = *guard
-        {
-            return Ok(list.clone());
-        }
-        let conn = self.connection(DbusBus::Session)?;
-        let names = list_mpris_names_blocking(&conn)?;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            if let Ok(snap) = read_mpris_snapshot_blocking(&conn, &name) {
-                out.push(snap);
+    /// Queries the session bus synchronously for snapshots of all active MPRIS players, sorted by
+    /// priority (`Playing` first).
+    pub fn snapshots_blocking(&self) -> Result<Vec<MprisSnapshot>> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(async move {
+            let names = list_mpris_names(&conn).await?;
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                if let Ok(snap) = read_mpris_snapshot(&conn, &name).await {
+                    out.push(snap);
+                }
             }
-        }
-        sort_mpris_snapshots(&mut out);
-        Ok(out)
+            sort_mpris_snapshots(&mut out);
+            Ok(out)
+        })
     }
 
-    /// Reads a typed [`MprisSnapshot`] from `service_name` (e.g. `"org.mpris.MediaPlayer2.spotify"`),
-    /// returning the cached subscription entry (0 ms) when available.
-    pub fn mpris_snapshot(&self, service_name: &str) -> Result<MprisSnapshot> {
-        if let Ok(guard) = self.cache.mpris.read()
-            && let Some(ref list) = *guard
-            && let Some(found) = list.iter().find(|s| s.service_name == service_name)
-        {
-            return Ok(found.clone());
-        }
-        let conn = self.connection(DbusBus::Session)?;
-        read_mpris_snapshot_blocking(&conn, service_name)
+    /// Queries the session bus synchronously for active MPRIS player bus names
+    /// (`org.mpris.MediaPlayer2.*`).
+    pub fn list_players_blocking(&self) -> Result<Vec<String>> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(list_mpris_names(&conn))
     }
 
-    /// Invokes `org.mpris.MediaPlayer2.Player.PlayPause` on `service_name`.
-    pub fn mpris_play_pause(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
+    /// Invokes `org.mpris.MediaPlayer2.Player.Play` on `destination`.
+    pub fn play(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
             DbusBus::Session,
-            service_name,
-            MPRIS_OBJECT,
-            MPRIS_PLAYER_IFACE,
-            "PlayPause",
-        )
-    }
-
-    /// Invokes `org.mpris.MediaPlayer2.Player.Play` on `service_name`.
-    pub fn mpris_play(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
-            DbusBus::Session,
-            service_name,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Play",
         )
     }
 
-    /// Invokes `org.mpris.MediaPlayer2.Player.Pause` on `service_name`.
-    pub fn mpris_pause(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
+    /// Invokes `org.mpris.MediaPlayer2.Player.Pause` on `destination`.
+    pub fn pause(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
             DbusBus::Session,
-            service_name,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Pause",
         )
     }
 
-    /// Invokes `org.mpris.MediaPlayer2.Player.Stop` on `service_name`.
-    pub fn mpris_stop(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
+    /// Invokes `org.mpris.MediaPlayer2.Player.PlayPause` on `destination`.
+    pub fn play_pause(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
             DbusBus::Session,
-            service_name,
+            destination,
+            MPRIS_OBJECT,
+            MPRIS_PLAYER_IFACE,
+            "PlayPause",
+        )
+    }
+
+    /// Invokes `org.mpris.MediaPlayer2.Player.Stop` on `destination`.
+    pub fn stop(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
+            DbusBus::Session,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Stop",
         )
     }
 
-    /// Invokes `org.mpris.MediaPlayer2.Player.Next` on `service_name`.
-    pub fn mpris_next(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
+    /// Invokes `org.mpris.MediaPlayer2.Player.Next` on `destination`.
+    pub fn next(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
             DbusBus::Session,
-            service_name,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Next",
         )
     }
 
-    /// Invokes `org.mpris.MediaPlayer2.Player.Previous` on `service_name`.
-    pub fn mpris_previous(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
+    /// Invokes `org.mpris.MediaPlayer2.Player.Previous` on `destination`.
+    pub fn previous(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
             DbusBus::Session,
-            service_name,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Previous",
@@ -250,10 +243,10 @@ impl DbusClient {
 
     /// Seeks relative to the current playback position by `offset_us` microseconds
     /// (`org.mpris.MediaPlayer2.Player.Seek`) on the MPRIS lane.
-    pub fn mpris_seek(&self, service_name: &str, offset_us: i64) -> Result<()> {
-        let svc = validate_bus_name(service_name, "MPRIS service_name")?;
+    pub fn seek(&self, destination: &str, offset_us: i64) -> Result<()> {
+        let svc = validate_bus_name(destination, "MPRIS destination")?;
         let target = svc.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Mpris,
                 DbusBus::Session,
@@ -277,18 +270,13 @@ impl DbusClient {
 
     /// Sets the absolute playback position in microseconds for `track_id`
     /// (`org.mpris.MediaPlayer2.Player.SetPosition`) on the MPRIS lane.
-    pub fn mpris_set_position(
-        &self,
-        service_name: &str,
-        track_id: &str,
-        position_us: i64,
-    ) -> Result<()> {
-        let svc = validate_bus_name(service_name, "MPRIS service_name")?;
+    pub fn set_position(&self, destination: &str, track_id: &str, position_us: i64) -> Result<()> {
+        let svc = validate_bus_name(destination, "MPRIS destination")?;
         let target = svc.clone();
         let obj = OwnedObjectPath::try_from(track_id.to_owned()).map_err(|e| {
             WaywiError::DbusError(format!("invalid MPRIS track_id `{track_id}`: {e}"))
         })?;
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Mpris,
                 DbusBus::Session,
@@ -312,10 +300,10 @@ impl DbusClient {
 
     /// Sets the player volume (`0.0..=1.0`, or higher if supported) via
     /// `org.mpris.MediaPlayer2.Player.Volume`.
-    pub fn mpris_set_volume(&self, service_name: &str, volume: f64) -> Result<()> {
-        self.set_property(
+    pub fn set_volume(&self, destination: &str, volume: f64) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::Session,
-            service_name,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Volume",
@@ -323,62 +311,38 @@ impl DbusClient {
         )
     }
 
-    /// Sets the `Shuffle` flag on `service_name` (`org.mpris.MediaPlayer2.Player.Shuffle`).
-    pub fn mpris_set_shuffle(&self, service_name: &str, shuffle: bool) -> Result<()> {
-        self.set_property(
+    /// Sets the repeat / loop mode on `destination` (`org.mpris.MediaPlayer2.Player.LoopStatus`).
+    pub fn set_loop_status(&self, destination: &str, status: MprisLoopStatus) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::Session,
-            service_name,
+            destination,
+            MPRIS_OBJECT,
+            MPRIS_PLAYER_IFACE,
+            "LoopStatus",
+            Value::from(status.as_str()),
+        )
+    }
+
+    /// Sets the `Shuffle` flag on `destination` (`org.mpris.MediaPlayer2.Player.Shuffle`).
+    pub fn set_shuffle(&self, destination: &str, shuffle: bool) -> Result<()> {
+        self.0.set_property_zvariant(
+            DbusBus::Session,
+            destination,
             MPRIS_OBJECT,
             MPRIS_PLAYER_IFACE,
             "Shuffle",
             Value::from(shuffle),
         )
     }
-
-    /// Sets the repeat / loop mode on `service_name` (`org.mpris.MediaPlayer2.Player.LoopStatus`).
-    pub fn mpris_set_loop_status(
-        &self,
-        service_name: &str,
-        loop_status: MprisLoopStatus,
-    ) -> Result<()> {
-        self.set_property(
-            DbusBus::Session,
-            service_name,
-            MPRIS_OBJECT,
-            MPRIS_PLAYER_IFACE,
-            "LoopStatus",
-            Value::from(loop_status.as_str()),
-        )
-    }
-
-    /// Raises/focuses the media player window (`org.mpris.MediaPlayer2.Raise`).
-    pub fn mpris_raise(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
-            DbusBus::Session,
-            service_name,
-            MPRIS_OBJECT,
-            MPRIS_ROOT_IFACE,
-            "Raise",
-        )
-    }
-
-    /// Requests the media player to quit (`org.mpris.MediaPlayer2.Quit`).
-    pub fn mpris_quit(&self, service_name: &str) -> Result<()> {
-        self.call_method_unit(
-            DbusBus::Session,
-            service_name,
-            MPRIS_OBJECT,
-            MPRIS_ROOT_IFACE,
-            "Quit",
-        )
-    }
 }
 
-fn list_mpris_names_blocking(conn: &zbus::blocking::Connection) -> Result<Vec<String>> {
-    let dbus = zbus::blocking::fdo::DBusProxy::new(conn)
+async fn list_mpris_names(conn: &zbus::Connection) -> Result<Vec<String>> {
+    let dbus = zbus::fdo::DBusProxy::new(conn)
+        .await
         .map_err(|e| WaywiError::DbusError(e.to_string()))?;
     let names = dbus
         .list_names()
+        .await
         .map_err(|e| WaywiError::DbusError(e.to_string()))?;
     let mut out: Vec<String> = names
         .into_iter()
@@ -389,45 +353,12 @@ fn list_mpris_names_blocking(conn: &zbus::blocking::Connection) -> Result<Vec<St
     Ok(out)
 }
 
-async fn list_mpris_names_async(conn: &zbus::Connection) -> Vec<String> {
-    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else {
-        return Vec::new();
-    };
-    let Ok(names) = dbus.list_names().await else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = names
-        .into_iter()
-        .map(|n| n.to_string())
-        .filter(|n| n.starts_with(MPRIS_PREFIX))
-        .collect();
-    out.sort();
-    out
-}
-
-fn read_mpris_snapshot_blocking(
-    conn: &zbus::blocking::Connection,
-    service_name: &str,
-) -> Result<MprisSnapshot> {
-    let player_props = get_all_blocking(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE)?;
-    let root_props =
-        get_all_blocking(conn, service_name, MPRIS_OBJECT, MPRIS_ROOT_IFACE).unwrap_or_default();
-    Ok(parse_mpris_snapshot(
-        service_name,
-        &root_props,
-        &player_props,
-    ))
-}
-
-async fn read_mpris_snapshot_async(
-    conn: &zbus::Connection,
-    service_name: &str,
-) -> Option<MprisSnapshot> {
-    let player_props = get_all_async(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE).await?;
-    let root_props = get_all_async(conn, service_name, MPRIS_OBJECT, MPRIS_ROOT_IFACE)
+async fn read_mpris_snapshot(conn: &zbus::Connection, service_name: &str) -> Result<MprisSnapshot> {
+    let player_props = get_all(conn, service_name, MPRIS_OBJECT, MPRIS_PLAYER_IFACE).await?;
+    let root_props = get_all(conn, service_name, MPRIS_OBJECT, MPRIS_ROOT_IFACE)
         .await
         .unwrap_or_default();
-    Some(parse_mpris_snapshot(
+    Ok(parse_mpris_snapshot(
         service_name,
         &root_props,
         &player_props,
@@ -556,37 +487,22 @@ pub(crate) fn sort_mpris_snapshots(snaps: &mut [MprisSnapshot]) {
     });
 }
 
-pub(crate) struct MprisWorker {
-    stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
-}
+pub(crate) struct MprisWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl MprisWorker {
     pub(crate) fn spawn(
         sender: calloop::channel::Sender<MprisEvent>,
         shared: DbusSharedBus,
     ) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-mpris".to_owned())
-            .spawn(move || {
+        Self(DbusWorkerHandle::spawn(
+            "waywi-dbus-mpris",
+            move |stop_sig| {
                 let Ok(conn) = connect_shared_bus(DbusBus::Session, &shared) else {
                     return;
                 };
                 futures_lite::future::block_on(run_mpris_worker(conn, sender, stop_sig));
-            })
-            .ok();
-        Self { stop, join }
-    }
-}
-
-impl Drop for MprisWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+            },
+        ))
     }
 }
 
@@ -612,11 +528,11 @@ async fn run_mpris_worker(
     let mut owners: HashMap<String, String> = HashMap::new();
     let mut snapshots: HashMap<String, MprisSnapshot> = HashMap::new();
 
-    for service_name in list_mpris_names_async(&conn).await {
+    for service_name in list_mpris_names(&conn).await.unwrap_or_default() {
         if let Some(owner) = resolve_name_owner_async(&conn, &service_name).await {
             owners.insert(service_name.clone(), owner);
         }
-        if let Some(snap) = read_mpris_snapshot_async(&conn, &service_name).await {
+        if let Ok(snap) = read_mpris_snapshot(&conn, &service_name).await {
             snapshots.insert(service_name, snap);
         }
     }
@@ -690,7 +606,7 @@ async fn run_mpris_worker(
                     }
                 } else {
                     owners.insert(name.clone(), new_owner);
-                    if let Some(snap) = read_mpris_snapshot_async(&conn, &name).await {
+                    if let Ok(snap) = read_mpris_snapshot(&conn, &name).await {
                         let is_new = !snapshots.contains_key(&name);
                         snapshots.insert(name.clone(), snap.clone());
                         if is_new {
@@ -717,7 +633,7 @@ async fn run_mpris_worker(
                 let matched_services = match_mpris_sender(&owners, msg_sender);
                 let mut any_updated = false;
                 for svc in matched_services {
-                    if let Some(snap) = read_mpris_snapshot_async(&conn, &svc).await {
+                    if let Ok(snap) = read_mpris_snapshot(&conn, &svc).await {
                         let is_new = !snapshots.contains_key(&svc);
                         if is_new || snapshots.get(&svc) != Some(&snap) {
                             snapshots.insert(svc.clone(), snap.clone());

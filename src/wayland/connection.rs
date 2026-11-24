@@ -22,7 +22,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
 use crate::error::{Result, WaywiError};
-use crate::geometry::{BufferRect, GeoRect, LogicalSize, ScaleFactor};
+use crate::geometry::{Bounds, BufferRect, LogicalSize, ScaleFactor};
 use crate::input::Modifiers;
 use crate::reconcile::{RetainedSurfaceKey, SurfaceSpec};
 use crate::surface::{InputMode, SurfaceKey, SurfaceKind};
@@ -204,18 +204,6 @@ impl WaylandState {
         self.clipboard.set_watching(watching, seat.as_ref(), qh);
     }
 
-    #[cfg(feature = "clipboard")]
-    pub(crate) fn set_clipboard_selection(
-        &mut self,
-        selection: crate::clipboard::ClipboardSelection,
-        entries: Vec<(String, Vec<u8>)>,
-        qh: &QueueHandle<Self>,
-    ) -> Result<()> {
-        let seat = self.seat_state.seats().next();
-        self.clipboard
-            .set_selection(seat.as_ref(), selection, entries, qh)
-    }
-
     pub(crate) fn capabilities(&self) -> Capabilities {
         let mut caps = Capabilities::from_compile_features();
         caps.set(Capability::Wayland, true);
@@ -232,7 +220,10 @@ impl WaylandState {
         }
         caps.set(Capability::PointerInput, self.has_pointer);
         caps.set(Capability::KeyboardInput, self.has_keyboard);
-        caps.set(Capability::KeyboardLayout, self.has_keyboard);
+        caps.set(
+            Capability::KeyboardLayout,
+            self.has_keyboard && !self.keyboard_layouts.is_empty(),
+        );
         caps.set(Capability::TouchInput, self.has_touch);
         #[cfg(feature = "idle-notify")]
         caps.set(Capability::IdleNotify, self.idle.is_supported());
@@ -285,9 +276,16 @@ impl WaylandState {
         );
         caps.set(
             Capability::Dbus,
-            cfg!(feature = "dbus") && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+            cfg!(feature = "dbus") && dbus_socket_available(),
         );
         caps
+    }
+
+    /// Returns only the Wayland-protocol/seat capability bits for live `OutputsChanged` refresh
+    /// without clobbering runtime-probed IPC, GPU, audio, or accessibility flags.
+    pub(crate) fn refresh_wayland_capabilities(&self, target: &mut Capabilities) {
+        let live = self.capabilities();
+        target.refresh_wayland_from(&live);
     }
 
     /// Requests a Wayland `xdg_activation_v1` focus-handoff token asynchronously.
@@ -552,7 +550,7 @@ impl WaylandState {
         &self,
         key: RetainedSurfaceKey,
         mode: InputMode,
-        rects: &[GeoRect],
+        rects: &[Bounds],
     ) {
         let Some(surf) = self.surfaces.get(&key) else {
             return;
@@ -624,6 +622,19 @@ impl WaylandState {
         }
     }
 
+    pub(crate) fn trim_idle_shm_pools(&mut self) {
+        for surf in self.surfaces.values_mut() {
+            if surf.spec.buffer_retention == crate::surface::BufferRetention::ReleaseAfterCommit
+                && !surf.pending_redraw
+                && surf.pool.all_idle()
+            {
+                surf.pool.shrink_and_unmap();
+            } else {
+                surf.pool.trim_idle_slots();
+            }
+        }
+    }
+
     pub(crate) fn present_surface_with<F>(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -633,7 +644,7 @@ impl WaylandState {
         render_fn: F,
     ) -> Result<bool>
     where
-        F: FnOnce(&mut [u8], u32, u32, u32, &[BufferRect]),
+        F: FnOnce(&mut [u8], u32, u32, u32, &[BufferRect]) -> Result<()>,
     {
         let Ok(wl_shm) = self.shm.bound_global() else {
             return Err(WaywiError::WaylandConnection(
@@ -668,7 +679,7 @@ impl WaylandState {
                 stride,
                 damage,
             } => {
-                render_fn(pixels, buf_w.as_u32(), buf_h.as_u32(), stride, &damage);
+                render_fn(pixels, buf_w.as_u32(), buf_h.as_u32(), stride, &damage)?;
 
                 for rect in &damage {
                     wl_surface.damage_buffer(rect.x, rect.y, rect.width.max(1), rect.height.max(1));
@@ -719,4 +730,19 @@ impl WaylandState {
             Ok(false)
         }
     }
+}
+
+fn dbus_socket_available() -> bool {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+        || std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_some()
+        || std::path::Path::new("/run/dbus/system_bus_socket").exists()
+    {
+        return true;
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
+        && std::path::Path::new(&runtime_dir).join("bus").exists()
+    {
+        return true;
+    }
+    false
 }

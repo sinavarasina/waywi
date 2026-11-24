@@ -8,7 +8,7 @@ use super::font::{Font, FontStyle, TextAlign, TextBoundsMode};
 #[cfg(feature = "text")]
 use super::shared_str::SharedStr;
 #[cfg(feature = "text")]
-use crate::geometry::{LogicalPx, LogicalSize};
+use crate::geometry::{LogicalPx, LogicalSize, ScaleFactor};
 #[cfg(feature = "text")]
 use crate::render::Color;
 
@@ -36,6 +36,8 @@ pub(crate) struct TextEngine {
     font_system: cosmic_text::FontSystem,
     swash_cache: cosmic_text::SwashCache,
     buffer_cache: HashMap<TextShapeKey, CachedTextBuffer>,
+    max_cached_buffers: usize,
+    stale_frame_age: u64,
 }
 
 #[cfg(feature = "text")]
@@ -74,9 +76,23 @@ fn shared_system_font_db() -> fontdb::Database {
 
 #[cfg(feature = "text")]
 impl TextEngine {
-    /// Initializes a `FontSystem` from the process-cached system Fontconfig database.
+    /// Initializes a `FontSystem` from the process-cached system Fontconfig database with default limits.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        let db = shared_system_font_db();
+        Self::with_config(256, 60, true)
+    }
+
+    /// Initializes a `FontSystem` with explicit shaping-cache limits and Fontconfig loading policy.
+    pub(crate) fn with_config(
+        max_cached_buffers: usize,
+        stale_frame_age: u64,
+        load_system_fonts: bool,
+    ) -> Self {
+        let db = if load_system_fonts {
+            shared_system_font_db()
+        } else {
+            fontdb::Database::new()
+        };
         let locale = std::env::var("LANG")
             .unwrap_or_else(|_| "en-US".to_owned())
             .split('.')
@@ -89,20 +105,29 @@ impl TextEngine {
             font_system,
             swash_cache: cosmic_text::SwashCache::new(),
             buffer_cache: HashMap::new(),
+            max_cached_buffers: max_cached_buffers.max(8),
+            stale_frame_age: stale_frame_age.max(1),
         }
+    }
+
+    pub(crate) fn trim(&mut self) {
+        self.buffer_cache.clear();
+        self.buffer_cache.shrink_to_fit();
+        self.swash_cache = cosmic_text::SwashCache::new();
     }
 
     pub(crate) fn measure_text(
         &mut self,
         content: &SharedStr,
         style: super::TextMeasureStyle<'_>,
+        scale: ScaleFactor,
         frame_seq: u64,
     ) -> LogicalSize {
         let params = TextDrawParams {
             content,
             style,
             wrap_to_width: style.max_width.is_some(),
-            scale: crate::geometry::ScaleFactor::ONE,
+            scale,
         };
         let key = Self::make_key(params);
         self.ensure_shaped(key, params, frame_seq).logical_size
@@ -188,11 +213,18 @@ impl TextEngine {
 
     fn make_key(params: TextDrawParams<'_>) -> TextShapeKey {
         let s = params.style;
+        // Unwrapped left-aligned text has identical layout regardless of container width, so
+        // normalizing `max_width_milli` shares shaped buffers between auto layout and draw passes.
+        let max_width_milli = if params.wrap_to_width || s.align != TextAlign::Left {
+            s.max_width.map(|w| (w.0.max(0.0) * 1000.0).round() as u32)
+        } else {
+            None
+        };
         TextShapeKey {
             text: params.content.clone(),
             font_size_milli: (s.font_size.0.max(1.0) * 1000.0).round() as u32,
             line_height_milli: (s.line_height_multiplier.max(0.5) * 1000.0).round() as u32,
-            max_width_milli: s.max_width.map(|w| (w.0.max(0.0) * 1000.0).round() as u32),
+            max_width_milli,
             wrap_to_width: params.wrap_to_width,
             scale_120: params.scale.as_120ths(),
             font: s.font.clone(),
@@ -208,9 +240,29 @@ impl TextEngine {
         frame_seq: u64,
     ) -> &mut CachedTextBuffer {
         let s = params.style;
-        if self.buffer_cache.len() >= 1024 && !self.buffer_cache.contains_key(&key) {
+        let stale_age = self.stale_frame_age;
+        if (frame_seq.is_multiple_of(32) || self.buffer_cache.len() >= self.max_cached_buffers)
+            && !self.buffer_cache.contains_key(&key)
+        {
             self.buffer_cache
-                .retain(|_, v| frame_seq.saturating_sub(v.last_used_frame) < 120);
+                .retain(|_, v| frame_seq.saturating_sub(v.last_used_frame) < stale_age);
+            while self.buffer_cache.len() >= self.max_cached_buffers {
+                let Some(oldest) = self
+                    .buffer_cache
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_used_frame)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.buffer_cache.remove(&oldest);
+            }
+            if self.buffer_cache.capacity()
+                > (self.buffer_cache.len().saturating_mul(4)).max(self.max_cached_buffers)
+            {
+                self.buffer_cache
+                    .shrink_to((self.buffer_cache.len().saturating_mul(2)).max(32));
+            }
         }
 
         let font_system = &mut self.font_system;
@@ -346,6 +398,7 @@ impl TextEngine {
             font_system,
             swash_cache,
             buffer_cache,
+            ..
         } = self;
         let cached = buffer_cache.get_mut(&key).expect("shaped buffer cached");
         let base_alpha = (f32::from(color.a) * opacity.clamp(0.0, 1.0)).round() as u8;
@@ -434,6 +487,7 @@ mod tests {
                     align: TextAlign::Left,
                     bounds_mode: TextBoundsMode::Typographic,
                 },
+                ScaleFactor::ONE,
                 1,
             );
             // Draw with wrap_to_width = false against exact measured width at both 1.0x and 1.25x.
@@ -530,8 +584,8 @@ mod tests {
             ..typo_style
         };
 
-        let typo_size = engine.measure_text(&content, typo_style, 1);
-        let opt_size = engine.measure_text(&content, optical_style, 1);
+        let typo_size = engine.measure_text(&content, typo_style, ScaleFactor::ONE, 1);
+        let opt_size = engine.measure_text(&content, optical_style, ScaleFactor::ONE, 1);
         assert!(opt_size.width.0 > 0.0 && opt_size.height.0 > 0.0);
         // Tight optical ink height must be strictly smaller than generous 1.4x typographic line height.
         assert!(opt_size.height.0 < typo_size.height.0);

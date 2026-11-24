@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::asset::ImageAsset;
-use crate::geometry::LogicalPx;
 use crate::image::SourceRect;
 use crate::text::SharedStr;
 
@@ -349,13 +348,21 @@ impl SpriteSheet {
         Some(list[frame_index % list.len()])
     }
 
-    /// Sets the logical/pixel size of each sprite frame cell (switches to uniform grid slicing).
+    /// Sets the pixel size of each sprite frame cell (switches to uniform grid slicing).
     #[must_use]
-    pub fn frame_size(mut self, width: LogicalPx, height: LogicalPx) -> Self {
-        self.frame_width = width.ceil_u32().max(1);
-        self.frame_height = height.ceil_u32().max(1);
+    pub fn frame_size(mut self, width: u32, height: u32) -> Self {
+        self.frame_width = width.max(1);
+        self.frame_height = height.max(1);
         self.regions = None;
         self
+    }
+
+    /// Creates a grid-sliced sprite sheet directly from `(cols, rows)` counts.
+    #[must_use]
+    pub fn grid(asset: ImageAsset, cols: u32, rows: u32) -> Self {
+        let fw = (asset.width / cols.max(1)).max(1);
+        let fh = (asset.height / rows.max(1)).max(1);
+        Self::new(asset).frame_size(fw, fh)
     }
 
     /// Registers a looping named animation clip (`name`, `frames`, `fps`).
@@ -523,7 +530,7 @@ mod tests {
             width: 128,
             height: 128,
         };
-        let mut sheet = SpriteSheet::new(asset).frame_size(LogicalPx(32.0), LogicalPx(32.0));
+        let mut sheet = SpriteSheet::new(asset).frame_size(32, 32);
         for i in 0..32 {
             sheet = sheet.animation(format!("clip_{i}"), Frames::range(0..4), 12.fps());
         }

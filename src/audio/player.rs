@@ -1,18 +1,32 @@
 //! Lazy background audio playback engine supporting both `rodio` (`audio-playback`) and
 //! dependency-light native PipeWire / PulseAudio / ALSA PCM output.
 
-use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+#[cfg(any(
+    feature = "audio-playback",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
 use std::thread::{self, JoinHandle};
 
 use crate::asset::decode::hash_bytes;
 use crate::error::{Result, WaywiError};
 
 use super::sound::{
-    MIXER_SAMPLE_RATE, SoundAsset, SoundAssetStore, SoundData, SoundPreset,
-    resolve_sound_theme_path,
+    DEFAULT_SOUND_CACHE_BYTES, MAX_SOUND_FILE_BYTES, SoundAsset, SoundAssetStore, SoundCacheKey,
+    SoundData, SoundPlay, SoundPreset, resolve_sound_theme_path,
 };
+
+#[cfg(any(
+    feature = "audio-playback",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
+use super::sound::MIXER_SAMPLE_RATE;
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use super::sound::PolyphonicMixer;
@@ -38,7 +52,6 @@ pub struct AudioPlayer {
 
 struct AudioPlayerInner {
     store: Mutex<SoundAssetStore>,
-    path_hashes: Mutex<HashMap<String, u64>>,
     driver: Mutex<Option<Box<dyn PlaybackDriver>>>,
 }
 
@@ -65,53 +78,63 @@ impl std::fmt::Debug for AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Creates an idle audio player that opens a playback stream lazily on first play.
+    /// Creates an idle audio player with the default 8 MiB decoded PCM cache budget that opens a
+    /// playback stream lazily on first play.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_cache_limit(DEFAULT_SOUND_CACHE_BYTES)
+    }
+
+    /// Creates an idle audio player with an explicit decoded PCM cache byte limit.
+    #[must_use]
+    pub(crate) fn with_cache_limit(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(AudioPlayerInner {
-                store: Mutex::new(SoundAssetStore::default()),
-                path_hashes: Mutex::new(HashMap::new()),
+                store: Mutex::new(SoundAssetStore::with_cache_limit(max_bytes)),
                 driver: Mutex::new(None),
             }),
         }
     }
 
-    /// Loads and caches a sound file from disk (bounded to 16 MiB).
+    /// Canonicalizes, reads, hashes file bytes for content deduplication, decodes, and caches a
+    /// sound file from disk (bounded to 16 MiB).
     pub fn load_file(&self, path: impl AsRef<Path>) -> Result<SoundAsset> {
-        let p = path.as_ref();
-        let key = p.to_string_lossy().into_owned();
-        if let Ok(ph) = self.inner.path_hashes.lock()
-            && let Some(&hash) = ph.get(&key)
+        let canonical = fs::canonicalize(path.as_ref())?;
+        let meta = fs::metadata(&canonical)?;
+        if meta.len() > MAX_SOUND_FILE_BYTES {
+            return Err(WaywiError::AudioError(format!(
+                "sound {} exceeds max size ({} > {MAX_SOUND_FILE_BYTES} bytes)",
+                canonical.display(),
+                meta.len()
+            )));
+        }
+        let bytes = fs::read(&canonical)?;
+        let key = SoundCacheKey::ContentHash(hash_bytes(&bytes));
         {
-            let store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = store.get_by_hash(hash) {
+            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = store.get_by_key(key) {
                 return Ok(existing);
             }
         }
-        let data = SoundData::from_file(p)?;
-        let raw_len = data.samples.len() as u64;
-        let hash = hash_bytes(key.as_bytes()) ^ raw_len;
-        if let Ok(mut ph) = self.inner.path_hashes.lock() {
-            ph.insert(key, hash);
-        }
+        let hint = canonical.extension().and_then(|e| e.to_str());
+        let data = SoundData::from_vec_with_hint(bytes, hint)?;
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(store.insert_sound_data(hash, &data))
+        Ok(store.insert_sound_data(key, &data))
     }
 
     /// Decodes and caches an in-memory audio buffer (`WAV` always; `OGG`/`MP3`/`FLAC` with
-    /// `audio-playback`).
+    /// `audio-playback`), deduplicating by content hash.
     pub fn load_bytes(&self, bytes: &[u8]) -> Result<SoundAsset> {
-        let hash = hash_bytes(bytes);
+        let key = SoundCacheKey::ContentHash(hash_bytes(bytes));
         {
-            let store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = store.get_by_hash(hash) {
+            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = store.get_by_key(key) {
                 return Ok(existing);
             }
         }
         let data = SoundData::from_bytes(bytes)?;
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(store.insert_sound_data(hash, &data))
+        Ok(store.insert_sound_data(key, &data))
     }
 
     /// Resolves and caches a freedesktop XDG Sound Theme event sound (e.g. `"message-new-instant"`).
@@ -127,38 +150,51 @@ impl AudioPlayer {
     /// Caches and returns a procedural sound preset without external files.
     #[must_use]
     pub fn load_preset(&self, preset: SoundPreset) -> SoundAsset {
-        let tag = match preset {
-            SoundPreset::Click => 1u64,
-            SoundPreset::DragTick => 2,
-            SoundPreset::Hover => 3,
-            SoundPreset::Notification => 4,
-            SoundPreset::Warning => 5,
-        };
-        let hash = 0x5741_5957_0000_0000 | tag;
+        let key = SoundCacheKey::Preset(preset);
         {
-            let store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = store.get_by_hash(hash) {
+            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = store.get_by_key(key) {
                 return existing;
             }
         }
         let data = SoundData::from_preset(preset);
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        store.insert_sound_data(hash, &data)
+        store.insert_sound_data(key, &data)
+    }
+
+    /// Removes a cached [`SoundAsset`] from memory, returning `true` if it was present.
+    pub fn unload(&self, sound: SoundAsset) -> bool {
+        let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.remove(sound.id)
+    }
+
+    /// Frees all cached decoded PCM buffers.
+    pub fn clear_cache(&self) {
+        let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.clear();
     }
 
     /// Plays a cached [`SoundAsset`] at full volume (`1.0`).
     pub fn play(&self, sound: SoundAsset) {
-        self.play_with_volume(sound, 1.0);
+        self.play_at(sound, 1.0);
     }
 
     /// Plays a cached [`SoundAsset`] scaled by `volume` (`0.0..=2.0`).
-    pub fn play_with_volume(&self, sound: SoundAsset, volume: f32) {
+    pub fn play_at(&self, sound: SoundAsset, volume: f32) {
         let stereo = {
-            let store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
             store.get_stereo(sound.id)
         };
         if let Some(buf) = stereo {
             self.enqueue_play(buf, volume);
+        }
+    }
+
+    /// Plays a [`SoundPlay`] trigger (either a cached [`SoundAsset`] or a [`SoundPreset`]).
+    pub fn play_trigger(&self, play: SoundPlay) {
+        match play {
+            SoundPlay::Asset { asset, volume } => self.play_at(asset, volume),
+            SoundPlay::Preset { preset, volume } => self.play_preset(preset, volume),
         }
     }
 
@@ -171,13 +207,13 @@ impl AudioPlayer {
     /// Synthesizes (and caches) a [`SoundPreset`] and plays it immediately.
     pub fn play_preset(&self, preset: SoundPreset, volume: f32) {
         let asset = self.load_preset(preset);
-        self.play_with_volume(asset, volume);
+        self.play_at(asset, volume);
     }
 
     /// Resolves and plays a freedesktop XDG Sound Theme sound if found on the system.
     pub fn play_system_sound(&self, name: &str, volume: f32) -> Result<()> {
         let asset = self.load_system_sound(name)?;
-        self.play_with_volume(asset, volume);
+        self.play_at(asset, volume);
         Ok(())
     }
 
@@ -190,15 +226,15 @@ impl AudioPlayer {
         }
     }
 
-    /// Queries the decoded buffer for `id` (used for diagnostics/testing).
+    /// Queries the decoded buffer sample count for `id` (used for diagnostics/testing).
     #[cfg(test)]
-    pub(crate) fn cached_sample_count(&self, id: crate::asset::AssetId) -> Option<usize> {
-        let store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+    pub(crate) fn cached_sample_count(&self, id: super::sound::SoundId) -> Option<usize> {
+        let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
         store.get_stereo(id).map(|b| b.len())
     }
 
     fn enqueue_play(&self, stereo_48k: Arc<[f32]>, volume: f32) {
-        if stereo_48k.is_empty() || volume <= 0.0 {
+        if stereo_48k.is_empty() || !volume.is_finite() || volume <= 0.0 {
             return;
         }
         let mut guard = self.inner.driver.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,6 +257,84 @@ fn start_playback_driver() -> Option<Box<dyn PlaybackDriver>> {
         return Some(Box::new(drv));
     }
     None
+}
+
+/// Zero-clone `rodio::Source` streaming directly out of a shared `Arc<[f32]>` PCM buffer.
+#[cfg(feature = "audio-playback")]
+struct ArcSliceSource {
+    data: Arc<[f32]>,
+    pos: usize,
+    channels: rodio::ChannelCount,
+    sample_rate: rodio::SampleRate,
+    duration: std::time::Duration,
+}
+
+#[cfg(feature = "audio-playback")]
+impl ArcSliceSource {
+    fn new(
+        channels: rodio::ChannelCount,
+        sample_rate: rodio::SampleRate,
+        data: Arc<[f32]>,
+    ) -> Self {
+        let frames = data.len() / usize::from(channels.get());
+        let duration =
+            std::time::Duration::from_secs_f64(frames as f64 / f64::from(sample_rate.get()));
+        Self {
+            data,
+            pos: 0,
+            channels,
+            sample_rate,
+            duration,
+        }
+    }
+}
+
+#[cfg(feature = "audio-playback")]
+impl Iterator for ArcSliceSource {
+    type Item = rodio::Sample;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(sample)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.data.len().saturating_sub(self.pos);
+        (remaining, Some(remaining))
+    }
+}
+
+#[cfg(feature = "audio-playback")]
+impl ExactSizeIterator for ArcSliceSource {}
+
+#[cfg(feature = "audio-playback")]
+impl rodio::Source for ArcSliceSource {
+    #[inline]
+    fn current_span_len(&self) -> Option<usize> {
+        if self.pos >= self.data.len() {
+            Some(0)
+        } else {
+            Some(self.data.len())
+        }
+    }
+
+    #[inline]
+    fn channels(&self) -> rodio::ChannelCount {
+        self.channels
+    }
+
+    #[inline]
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.sample_rate
+    }
+
+    #[inline]
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        Some(self.duration)
+    }
 }
 
 #[cfg(feature = "audio-playback")]
@@ -249,11 +363,7 @@ impl RodioDriver {
                     match cmd {
                         PlayerCommand::Play { stereo_48k, volume } => {
                             active_players.retain(|p| !p.empty());
-                            let src = rodio::buffer::SamplesBuffer::new(
-                                channels,
-                                rate,
-                                stereo_48k.to_vec(),
-                            );
+                            let src = ArcSliceSource::new(channels, rate, stereo_48k);
                             let player = rodio::Player::connect_new(sink.mixer());
                             player.set_volume(volume);
                             player.append(src);
@@ -309,6 +419,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// PipeWire stream so short tactile clicks never clip at the tail while idle sinks can suspend.
 #[cfg(feature = "pipewire")]
 const IDLE_CORK_FRAMES: usize = (MIXER_SAMPLE_RATE / 4) as usize;
+
+/// Maximum time to wait for PulseAudio server latency drain before corking an idle stream.
+#[cfg(feature = "pulseaudio")]
+const PULSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(350);
+
+/// Idle timeout after which an open ALSA hardware PCM device is drained and closed until needed.
+#[cfg(feature = "alsa")]
+const ALSA_IDLE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(feature = "pipewire")]
 enum PwPlaySignal {
@@ -489,7 +607,7 @@ impl PlaybackDriver for NativeDriver {
     }
 }
 
-#[cfg(any(feature = "pulseaudio", feature = "alsa"))]
+#[cfg(feature = "pulseaudio")]
 fn mix_next_chunk(mixer: &SharedMixer, stop: &AtomicBool, out: &mut [f32]) -> bool {
     let mut g = mixer.0.lock().unwrap_or_else(|e| e.into_inner());
     g = mixer
@@ -681,7 +799,7 @@ fn run_pulse_playback(
     use pa::mainloop::threaded::Mainloop;
     use pa::proplist::Proplist;
     use pa::sample::{Format, Spec};
-    use pa::stream::{FlagSet as StreamFlags, SeekMode, Stream};
+    use pa::stream::{FlagSet as StreamFlags, SeekMode, State as StreamState, Stream};
 
     let Some(mut ml) = Mainloop::new() else {
         let _ = init_tx.send(false);
@@ -759,10 +877,61 @@ fn run_pulse_playback(
     while !stop.load(Ordering::Acquire) {
         let empty = mixer.0.lock().map(|g| g.is_empty()).unwrap_or(true);
         if empty && !is_corked {
+            // Drain server playback latency briefly before corking so tail audio is never clipped.
+            let drain_done = Arc::new(AtomicBool::new(false));
+            let drain_done_cb = Arc::clone(&drain_done);
+            let mixer_cb = Arc::clone(&mixer);
             ml.lock();
-            let _ = stream.cork(None);
+            let drain_op = if stream.get_state() == StreamState::Ready {
+                Some(stream.drain(Some(Box::new(move |_| {
+                    drain_done_cb.store(true, Ordering::Release);
+                    if let Ok(_g) = mixer_cb.0.lock() {
+                        mixer_cb.1.notify_one();
+                    }
+                }))))
+            } else {
+                None
+            };
             ml.unlock();
-            is_corked = true;
+
+            let still_empty = if drain_op.is_some() {
+                let deadline = std::time::Instant::now() + PULSE_DRAIN_TIMEOUT;
+                let mut g = mixer.0.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if stop.load(Ordering::Acquire)
+                        || !g.is_empty()
+                        || drain_done.load(Ordering::Acquire)
+                    {
+                        break g.is_empty();
+                    }
+                    let Some(rem) = deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        break g.is_empty();
+                    };
+                    let (next_g, _) = mixer
+                        .1
+                        .wait_timeout(g, rem)
+                        .unwrap_or_else(|e| e.into_inner());
+                    g = next_g;
+                }
+            } else {
+                true
+            };
+
+            ml.lock();
+            if let Some(mut op) = drain_op
+                && op.get_state() == pa::operation::State::Running
+            {
+                op.cancel();
+            }
+            if still_empty
+                && !stop.load(Ordering::Acquire)
+                && stream.get_state() == StreamState::Ready
+            {
+                let _ = stream.cork(None);
+                is_corked = true;
+            }
+            ml.unlock();
         }
         if !mix_next_chunk(&mixer, &stop, &mut fbuf) {
             continue;
@@ -771,14 +940,41 @@ fn run_pulse_playback(
             *dst = s.to_le_bytes();
         }
         ml.lock();
-        if is_corked {
-            let _ = stream.uncork(None);
-            is_corked = false;
+        if stream.get_state() == StreamState::Ready {
+            if is_corked {
+                let _ = stream.uncork(None);
+                is_corked = false;
+            }
+            let _ = stream.write_copy(&bbuf, 0, SeekMode::Relative);
         }
-        let _ = stream.write_copy(&bbuf, 0, SeekMode::Relative);
         ml.unlock();
     }
+    ml.lock();
+    if stream.get_state() != StreamState::Unconnected {
+        let _ = stream.disconnect();
+    }
+    ctx.disconnect();
+    ml.unlock();
     ml.stop();
+}
+
+#[cfg(feature = "alsa")]
+fn open_alsa_pcm() -> Option<alsa::pcm::PCM> {
+    use alsa::pcm::{Access, Format, HwParams, PCM};
+    use alsa::{Direction, ValueOr};
+
+    let pcm = PCM::new("default", Direction::Playback, false).ok()?;
+    {
+        let hwp = HwParams::any(&pcm).ok()?;
+        hwp.set_access(Access::RWInterleaved).ok()?;
+        hwp.set_format(Format::s16()).ok()?;
+        hwp.set_channels(2).ok()?;
+        hwp.set_rate(MIXER_SAMPLE_RATE, ValueOr::Nearest).ok()?;
+        pcm.hw_params(&hwp).ok()?;
+    }
+    // Verify i16 I/O is supported on the configured device before returning.
+    pcm.io_i16().ok()?;
+    Some(pcm)
 }
 
 #[cfg(feature = "alsa")]
@@ -787,45 +983,69 @@ fn run_alsa_playback(
     stop: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
-    use alsa::pcm::{Access, Format, HwParams, PCM};
-    use alsa::{Direction, ValueOr};
-
-    let Ok(pcm) = PCM::new("default", Direction::Playback, false) else {
-        let _ = init_tx.send(false);
-        return;
-    };
-    {
-        let Ok(hwp) = HwParams::any(&pcm) else {
-            let _ = init_tx.send(false);
-            return;
-        };
-        if hwp.set_access(Access::RWInterleaved).is_err()
-            || hwp.set_format(Format::s16()).is_err()
-            || hwp.set_channels(2).is_err()
-            || hwp.set_rate(MIXER_SAMPLE_RATE, ValueOr::Nearest).is_err()
-            || pcm.hw_params(&hwp).is_err()
-        {
-            let _ = init_tx.send(false);
-            return;
-        }
-    }
-    let Ok(io) = pcm.io_i16() else {
+    let Some(initial_pcm) = open_alsa_pcm() else {
         let _ = init_tx.send(false);
         return;
     };
     let _ = init_tx.send(true);
+
+    let mut pcm = Some(initial_pcm);
     let mut fbuf = [0.0f32; 512];
     let mut ibuf = [0i16; 512];
     while !stop.load(Ordering::Acquire) {
-        if !mix_next_chunk(&mixer, &stop, &mut fbuf) {
+        let has_chunk = {
+            let mut g = mixer.0.lock().unwrap_or_else(|e| e.into_inner());
+            if pcm.is_some() {
+                let (next_g, _) = mixer
+                    .1
+                    .wait_timeout_while(g, ALSA_IDLE_CLOSE_TIMEOUT, |m| {
+                        m.is_empty() && !stop.load(Ordering::Acquire)
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                g = next_g;
+            } else {
+                g = mixer
+                    .1
+                    .wait_while(g, |m| m.is_empty() && !stop.load(Ordering::Acquire))
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            if g.is_empty() {
+                false
+            } else {
+                g.mix_f32(&mut fbuf)
+            }
+        };
+
+        if !has_chunk {
+            // Release hardware PCM handle after idle timeout so other apps/power management can
+            // use or suspend the ALSA device.
+            if let Some(handle) = pcm.take() {
+                let _ = handle.drain();
+                drop(handle);
+            }
             continue;
         }
+
+        if pcm.is_none() {
+            pcm = open_alsa_pcm();
+        }
+        let Some(ref handle) = pcm else {
+            continue;
+        };
         for (dst, &src) in ibuf.iter_mut().zip(&fbuf) {
             *dst = (src * 32767.0).clamp(-32768.0, 32767.0) as i16;
         }
-        if let Err(err) = io.writei(&ibuf) {
-            let _ = pcm.try_recover(err, true);
+        if let Ok(io) = handle.io_i16()
+            && let Err(err) = io.writei(&ibuf)
+        {
+            let _ = handle.try_recover(err, true);
         }
+    }
+    if let Some(handle) = pcm.take() {
+        let _ = handle.drain();
     }
 }
 
@@ -833,13 +1053,91 @@ fn run_alsa_playback(
 mod tests {
     use super::*;
 
+    fn build_wav_16bit(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let data_bytes = (samples.len() * 2) as u32;
+        let byte_rate = sample_rate * 2;
+        let riff_len = 36 + data_bytes;
+        let mut out = Vec::with_capacity((riff_len + 8) as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&riff_len.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_bytes.to_le_bytes());
+        for s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
     #[test]
-    fn caches_presets_without_recomputing() {
+    fn caches_presets_and_supports_unload_and_clear() {
         let engine = AudioPlayer::new();
         let a = engine.load_preset(SoundPreset::Click);
         let b = engine.load_preset(SoundPreset::Click);
         assert_eq!(a.id, b.id);
         assert!(engine.cached_sample_count(a.id).unwrap_or(0) > 0);
         let _ = a.id.get();
+
+        assert!(engine.unload(a));
+        assert!(!engine.unload(a));
+        assert!(engine.cached_sample_count(a.id).is_none());
+
+        let c = engine.load_preset(SoundPreset::Hover);
+        assert_ne!(c.id, a.id);
+        engine.clear_cache();
+        assert!(engine.cached_sample_count(c.id).is_none());
+    }
+
+    #[test]
+    fn load_file_deduplicates_by_content_bytes_and_propagates_io_errors() {
+        let engine = AudioPlayer::new();
+        let dir = std::env::temp_dir().join(format!("waywi-player-dedup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wav = build_wav_16bit(48_000, &[1000, -1000, 500, -500]);
+        let path_a = dir.join("a.wav");
+        let path_b = dir.join("b.wav");
+        fs::write(&path_a, &wav).unwrap();
+        fs::write(&path_b, &wav).unwrap();
+
+        let asset_a = engine.load_file(&path_a).expect("load a.wav");
+        let asset_b = engine.load_file(&path_b).expect("load b.wav");
+        let asset_mem = engine.load_bytes(&wav).expect("load wav bytes");
+        assert_eq!(asset_a.id, asset_b.id);
+        assert_eq!(asset_a.id, asset_mem.id);
+
+        let missing_err = engine
+            .load_file(dir.join("missing.wav"))
+            .expect_err("missing file must error");
+        assert!(matches!(
+            missing_err,
+            WaywiError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_cache_limit_evicts_oldest_sound() {
+        let wav_a = build_wav_16bit(48_000, &[100; 32]);
+        let wav_b = build_wav_16bit(48_000, &[200; 32]);
+        let wav_c = build_wav_16bit(48_000, &[300; 32]);
+        // Each 32-frame mono 48kHz WAV resamples to 64 stereo f32 samples = 256 bytes.
+        let engine = AudioPlayer::with_cache_limit(512);
+        let a = engine.load_bytes(&wav_a).unwrap();
+        let b = engine.load_bytes(&wav_b).unwrap();
+        let c = engine.load_bytes(&wav_c).unwrap();
+        assert!(engine.cached_sample_count(a.id).is_none());
+        assert!(engine.cached_sample_count(b.id).is_some());
+        assert!(engine.cached_sample_count(c.id).is_some());
     }
 }

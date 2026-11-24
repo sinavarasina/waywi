@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -12,23 +11,20 @@ use crate::asset::{
 use crate::error::{Result, WaywiError};
 use crate::image::ImageAsset;
 
-pub(crate) type BoxedMsgFactory = Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>;
-pub(crate) type BoxedAssetCallback =
-    Box<dyn FnOnce(Result<ImageAsset>) -> Box<dyn Any + Send> + Send>;
-pub(crate) type BoxedActivationCallback =
-    Box<dyn FnOnce(Result<String>) -> Box<dyn Any + Send> + Send>;
+pub(crate) type AssetCallback<M> = Box<dyn FnOnce(Result<ImageAsset>) -> M>;
+pub(crate) type ActivationCallback<M> = Box<dyn FnOnce(Result<String>) -> M>;
 
 pub(crate) struct AsyncAssetCompletion {
+    pub(crate) job_id: u64,
     pub(crate) path: PathBuf,
     pub(crate) format: Option<ImageFormat>,
     pub(crate) content_hash: u64,
     pub(crate) decoded: Result<DecodedImage>,
-    pub(crate) map: BoxedAssetCallback,
 }
 
 struct AsyncAssetJob {
+    job_id: u64,
     path: PathBuf,
-    map: BoxedAssetCallback,
 }
 
 struct WorkerShared {
@@ -151,11 +147,11 @@ impl AsyncAssetWorker {
                     });
 
                     let _ = tx.send(AsyncAssetCompletion {
+                        job_id: job.job_id,
                         path: canonical,
                         format,
                         content_hash: hash,
                         decoded,
-                        map: job.map,
                     });
                     notify_wakeup(&wakeup);
                 }
@@ -166,7 +162,7 @@ impl AsyncAssetWorker {
         }
     }
 
-    pub(crate) fn submit(&self, path: PathBuf, map: BoxedAssetCallback) {
+    pub(crate) fn submit(&self, job_id: u64, path: PathBuf) {
         self.ensure_started();
         let (lock, cvar) = &*self.shared;
         if let Ok(mut guard) = lock.lock() {
@@ -174,18 +170,18 @@ impl AsyncAssetWorker {
                 let dropped = guard.queue.pop_front();
                 if let Some(d) = dropped {
                     let _ = self.tx_done.send(AsyncAssetCompletion {
+                        job_id: d.job_id,
                         path: d.path,
                         format: None,
                         content_hash: 0,
                         decoded: Err(WaywiError::AssetDecode(
                             "async asset decode queue capacity reached".to_owned(),
                         )),
-                        map: d.map,
                     });
                     notify_wakeup(&self.wakeup);
                 }
             }
-            guard.queue.push_back(AsyncAssetJob { path, map });
+            guard.queue.push_back(AsyncAssetJob { job_id, path });
             cvar.notify_one();
         }
     }

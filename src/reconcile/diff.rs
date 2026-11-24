@@ -3,14 +3,18 @@ use std::time::Instant;
 
 use crate::asset::AssetCache;
 use crate::display::{Output, OutputInfo, resolve_outputs};
-use crate::geometry::{Affine2D, Length, LogicalPx, LogicalSize, Rect as GeoRect, ScaleFactor};
+use crate::geometry::{Affine2D, Bounds, Length, LogicalPx, LogicalSize, ScaleFactor};
+use crate::image::SourceRect;
 use crate::input::NodeId;
 use crate::render::retained::PaintPayload;
 use crate::render::{RenderBackend, RetainedNode, collect_draw_and_hit};
-use crate::surface::{InputMode, SurfaceKind, Surfaces};
+use crate::surface::{BufferRetention, InputMode, SurfaceKind, Surfaces};
+use crate::text::SharedStr;
 
 use super::animation::{tick_node_animations, update_asset_rev_in_tree};
-use super::layout::{compute_selective_input_rects, resolve_surface_size_with_children};
+use super::layout::{
+    MeasureCtx, compute_selective_input_rects, resolve_surface_size_with_children,
+};
 use super::node_id::NodeIdAllocator;
 use super::surface::{ReconcileReport, RetainedSurface, RetainedSurfaceKey, SurfaceSpec};
 
@@ -19,6 +23,8 @@ pub(crate) struct ReconcileTargets<'a> {
     pub(crate) outputs: &'a [OutputInfo],
     pub(crate) configured_sizes: &'a HashMap<RetainedSurfaceKey, LogicalSize>,
     pub(crate) surface_scales: &'a HashMap<RetainedSurfaceKey, ScaleFactor>,
+    pub(crate) default_buffer_retention: BufferRetention,
+    pub(crate) app_name: &'a SharedStr,
 }
 
 struct SurfacePass<'a, R> {
@@ -196,9 +202,12 @@ impl<M: Clone + 'static> Reconciler<M> {
             &surf.children,
             output_size,
             surf.margin,
-            pass.renderer,
-            pass.assets,
-            self.frame_seq,
+            &mut MeasureCtx {
+                scale,
+                renderer: pass.renderer,
+                assets: pass.assets,
+                frame_seq: self.frame_seq,
+            },
         );
         let configured =
             pass.targets
@@ -229,6 +238,17 @@ impl<M: Clone + 'static> Reconciler<M> {
             p
         });
 
+        let title = if surf.title.is_empty() {
+            pass.targets.app_name.clone()
+        } else {
+            surf.title
+        };
+        let namespace = if surf.namespace.is_empty() {
+            pass.targets.app_name.clone()
+        } else {
+            surf.namespace
+        };
+
         let spec = SurfaceSpec {
             kind: surf.kind,
             output_id,
@@ -239,11 +259,13 @@ impl<M: Clone + 'static> Reconciler<M> {
             exclusive_zone: surf.exclusive_zone,
             keyboard_interactivity: surf.keyboard_interactivity,
             input_mode: surf.input_mode,
-            buffer_retention: surf.buffer_retention,
+            buffer_retention: surf
+                .buffer_retention
+                .unwrap_or(pass.targets.default_buffer_retention),
             popup,
             background: surf.background,
-            title: surf.title,
-            namespace: surf.namespace,
+            title,
+            namespace,
             a11y: surf.a11y,
             ime: surf.ime,
         };
@@ -290,6 +312,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             assets: pass.assets,
             now: pass.now,
             frame_seq: self.frame_seq,
+            scale,
             surface_size: target_size,
             dirty_rects: &mut dirty_rects,
             skipped_memo: &mut pass.report.skipped_memo_elements,
@@ -300,7 +323,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             surf.children,
             prev_roots,
             super::tree::ParentScope::new(
-                GeoRect::new(
+                Bounds::new(
                     LogicalPx::ZERO,
                     LogicalPx::ZERO,
                     target_size.width,
@@ -388,7 +411,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             if surface.next_animation_deadline.is_none() {
                 continue;
             }
-            let mut changed_frames: Vec<(NodeId, usize)> = Vec::new();
+            let mut changed_frames: Vec<(NodeId, SourceRect)> = Vec::new();
             let mut surf_deadline: Option<Instant> = None;
             let mut surf_dirty_rects = Vec::new();
 
@@ -410,14 +433,14 @@ impl<M: Clone + 'static> Reconciler<M> {
 
             if !changed_frames.is_empty() {
                 for cmd in &mut surface.commands {
-                    if let PaintPayload::Sprite {
-                        ref mut frame_index,
+                    if let PaintPayload::Image {
+                        ref mut source_rect,
                         ..
                     } = cmd.payload
-                        && let Some(&(_, next_frame)) =
+                        && let Some(&(_, next_rect)) =
                             changed_frames.iter().find(|&&(nid, _)| nid == cmd.node_id)
                     {
-                        *frame_index = next_frame;
+                        *source_rect = Some(next_rect);
                     }
                 }
                 surface.dirty_logical_rects.extend(surf_dirty_rects);

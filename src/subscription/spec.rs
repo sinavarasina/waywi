@@ -1,6 +1,8 @@
 use std::ops::Deref;
 #[cfg(feature = "control-ipc")]
 use std::path::PathBuf;
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::arena::{FrameSharedFn, FrameVec};
@@ -55,12 +57,12 @@ pub(crate) enum SubscriptionSpec<M> {
     SystemBattery {
         key: SubscriptionKey,
         interval: Duration,
-        map: FrameSharedFn<Vec<crate::system::BatteryInfo>, M>,
+        map: FrameSharedFn<crate::system::BatterySnapshot, M>,
     },
     SystemSensors {
         key: SubscriptionKey,
         interval: Duration,
-        map: FrameSharedFn<Vec<crate::system::ThermalSensor>, M>,
+        map: FrameSharedFn<crate::system::ThermalSnapshot, M>,
     },
     SystemUptime {
         key: SubscriptionKey,
@@ -78,7 +80,6 @@ pub(crate) enum SubscriptionSpec<M> {
         map: FrameSharedFn<crate::system::PrivacySnapshot, M>,
     },
     KeyboardLayout {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::input::KeyboardLayoutInfo, M>,
     },
     #[cfg(feature = "idle-notify")]
@@ -96,23 +97,23 @@ pub(crate) enum SubscriptionSpec<M> {
     },
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     AudioSnapshot {
-        key: SubscriptionKey,
-        map: FrameSharedFn<crate::audio::AudioSnapshot, M>,
+        map: FrameSharedFn<Arc<crate::audio::AudioSnapshot>, M>,
     },
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     AudioEvent {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::audio::AudioEvent, M>,
     },
     #[cfg(feature = "hyprland-ipc")]
     HyprlandEvent {
-        key: SubscriptionKey,
-        map: FrameSharedFn<crate::hyprland::HyprlandEvent, M>,
+        map: FrameSharedFn<crate::compositor::hyprland::HyprlandEvent, M>,
     },
     #[cfg(feature = "sway-ipc")]
     SwayEvent {
-        key: SubscriptionKey,
-        map: FrameSharedFn<crate::sway::SwayEvent, M>,
+        map: FrameSharedFn<crate::compositor::sway::SwayEvent, M>,
+    },
+    #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
+    CompositorEvent {
+        map: FrameSharedFn<crate::compositor::CompositorEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusSignal {
@@ -125,78 +126,63 @@ pub(crate) enum SubscriptionSpec<M> {
     },
     #[cfg(feature = "dbus")]
     DbusNotifications {
-        key: SubscriptionKey,
         capabilities: Option<crate::dbus::NotificationCapabilities>,
         map: FrameSharedFn<crate::dbus::NotificationEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusTray {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::TrayEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusPowerProfiles {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::PowerProfileSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusNetworkManager {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::NetworkManagerSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusUPower {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::UPowerSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusUDisks {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::UDisksSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusLogind {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::LogindEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusBluetooth {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::BluetoothSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusBluetoothAgent {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::BluetoothAgentEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusModem {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::ModemSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusScreenSaver {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::ScreenSaverSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusGeoClue {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::GeoClueSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusPortalSettings {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::PortalSettingsSnapshot, M>,
     },
     #[cfg(feature = "dbus")]
     DbusMpris {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::MprisEvent, M>,
     },
     #[cfg(feature = "dbus")]
     DbusActionResults {
-        key: SubscriptionKey,
         map: FrameSharedFn<crate::dbus::DbusActionResult, M>,
     },
     #[cfg(feature = "global-shortcuts")]
@@ -215,14 +201,8 @@ pub(crate) enum SubscriptionSpec<M> {
     #[cfg(feature = "control-ipc")]
     ControlSocket {
         key: SubscriptionKey,
-        socket_path: PathBuf,
-        map: FrameSharedFn<String, Option<M>>,
-    },
-    #[cfg(feature = "control-ipc")]
-    ControlSocketRequest {
-        key: SubscriptionKey,
-        socket_path: PathBuf,
-        map: FrameSharedFn<crate::control::ControlRequest, Option<M>>,
+        path: PathBuf,
+        map: FrameSharedFn<crate::control::ControlRequest, M>,
     },
 }
 
@@ -274,7 +254,7 @@ impl<M: 'static> Subscription<M> {
         }
 
         macro_rules! map_specs {
-            ($($(#[$meta:meta])* $variant:ident { $($field:ident),+ }),* $(,)?) => {
+            ($($(#[$meta:meta])* $variant:ident { $($field:ident),* }),* $(,)?) => {
                 match self.spec {
                     SubscriptionSpec::None => SubscriptionSpec::None,
                     SubscriptionSpec::Batch(items) => {
@@ -306,36 +286,10 @@ impl<M: 'static> Subscription<M> {
                             msg: mapper.call(msg),
                         }
                     }
-                    #[cfg(feature = "control-ipc")]
-                    SubscriptionSpec::ControlSocket {
-                        key,
-                        socket_path,
-                        map,
-                    } => {
-                        let m = mapper.clone();
-                        SubscriptionSpec::ControlSocket {
-                            key,
-                            socket_path,
-                            map: FrameSharedFn::new(move |cmd| map.call(cmd).map(|msg| m.call(msg))),
-                        }
-                    }
-                    #[cfg(feature = "control-ipc")]
-                    SubscriptionSpec::ControlSocketRequest {
-                        key,
-                        socket_path,
-                        map,
-                    } => {
-                        let m = mapper.clone();
-                        SubscriptionSpec::ControlSocketRequest {
-                            key,
-                            socket_path,
-                            map: FrameSharedFn::new(move |req| map.call(req).map(|msg| m.call(msg))),
-                        }
-                    }
                     $(
                         $(#[$meta])*
-                        SubscriptionSpec::$variant { $($field,)+ map } => SubscriptionSpec::$variant {
-                            $($field,)+
+                        SubscriptionSpec::$variant { $($field,)* map } => SubscriptionSpec::$variant {
+                            $($field,)*
                             map: compose(mapper, map),
                         },
                     )*
@@ -355,53 +309,57 @@ impl<M: 'static> Subscription<M> {
             SystemUptime { key, interval },
             SystemBrightness { key, interval },
             SystemPrivacy { key, interval },
-            KeyboardLayout { key },
+            KeyboardLayout {},
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-            AudioSnapshot { key },
+            AudioSnapshot {},
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-            AudioEvent { key },
+            AudioEvent {},
             #[cfg(feature = "hyprland-ipc")]
-            HyprlandEvent { key },
+            HyprlandEvent {},
             #[cfg(feature = "sway-ipc")]
-            SwayEvent { key },
+            SwayEvent {},
+            #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
+            CompositorEvent {},
             #[cfg(feature = "dbus")]
             DbusSignal { key, bus, interface, member, path },
             #[cfg(feature = "dbus")]
-            DbusNotifications { key, capabilities },
+            DbusNotifications { capabilities },
             #[cfg(feature = "dbus")]
-            DbusTray { key },
+            DbusTray {},
             #[cfg(feature = "dbus")]
-            DbusPowerProfiles { key },
+            DbusPowerProfiles {},
             #[cfg(feature = "dbus")]
-            DbusNetworkManager { key },
+            DbusNetworkManager {},
             #[cfg(feature = "dbus")]
-            DbusUPower { key },
+            DbusUPower {},
             #[cfg(feature = "dbus")]
-            DbusUDisks { key },
+            DbusUDisks {},
             #[cfg(feature = "dbus")]
-            DbusLogind { key },
+            DbusLogind {},
             #[cfg(feature = "dbus")]
-            DbusBluetooth { key },
+            DbusBluetooth {},
             #[cfg(feature = "dbus")]
-            DbusBluetoothAgent { key },
+            DbusBluetoothAgent {},
             #[cfg(feature = "dbus")]
-            DbusModem { key },
+            DbusModem {},
             #[cfg(feature = "dbus")]
-            DbusScreenSaver { key },
+            DbusScreenSaver {},
             #[cfg(feature = "dbus")]
-            DbusGeoClue { key },
+            DbusGeoClue {},
             #[cfg(feature = "dbus")]
-            DbusPortalSettings { key },
+            DbusPortalSettings {},
             #[cfg(feature = "dbus")]
-            DbusMpris { key },
+            DbusMpris {},
             #[cfg(feature = "dbus")]
-            DbusActionResults { key },
+            DbusActionResults {},
             #[cfg(feature = "idle-notify")]
             IdleNotify { key, timeout, input_only },
             #[cfg(feature = "clipboard")]
             Clipboard { key, selection },
             #[cfg(feature = "global-shortcuts")]
             GlobalShortcuts { key, app_id, shortcuts },
+            #[cfg(feature = "control-ipc")]
+            ControlSocket { key, path },
         };
         Subscription { spec }
     }

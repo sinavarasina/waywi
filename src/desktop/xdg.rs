@@ -109,6 +109,33 @@ impl XdgBaseDirs {
         out
     }
 
+    /// Returns XDG application directories (`<data>/applications`) ordered from highest to lowest
+    /// priority.
+    #[must_use]
+    pub fn application_dirs(&self) -> Vec<PathBuf> {
+        self.data_subdirs("applications")
+    }
+
+    /// Returns XDG icon directories (`<data>/icons`) ordered from highest to lowest priority.
+    #[must_use]
+    pub fn icon_dirs(&self) -> Vec<PathBuf> {
+        self.data_subdirs("icons")
+    }
+
+    /// Returns XDG sound theme directories (`<data>/sounds`) ordered from highest to lowest
+    /// priority.
+    #[must_use]
+    pub fn sound_dirs(&self) -> Vec<PathBuf> {
+        self.data_subdirs("sounds")
+    }
+
+    fn data_subdirs(&self, subdir: &str) -> Vec<PathBuf> {
+        self.all_data_dirs()
+            .into_iter()
+            .map(|d| d.join(subdir))
+            .collect()
+    }
+
     /// Searches config directories in priority order for an existing relative path `rel`.
     #[must_use]
     pub fn find_config_file(&self, rel: impl AsRef<Path>) -> Option<PathBuf> {
@@ -148,7 +175,7 @@ impl XdgUserDirs {
     /// the file does not exist or cannot be read.
     #[must_use]
     pub fn load() -> Self {
-        let Some(cfg) = xdg_config_home() else {
+        let Some(cfg) = XdgBaseDirs::from_env().config_home else {
             return Self::default();
         };
         let Ok(contents) = fs::read_to_string(cfg.join("user-dirs.dirs")) else {
@@ -240,58 +267,6 @@ fn unescape_double_quoted(s: &str) -> String {
     out
 }
 
-/// Returns `$XDG_CONFIG_HOME` (if absolute) or `$HOME/.config`.
-#[must_use]
-pub fn xdg_config_home() -> Option<PathBuf> {
-    XdgBaseDirs::from_env().config_home
-}
-
-/// Returns `$XDG_CONFIG_DIRS` (absolute entries) or `["/etc/xdg"]`.
-#[must_use]
-pub fn xdg_config_dirs() -> Vec<PathBuf> {
-    XdgBaseDirs::from_env().config_dirs
-}
-
-/// Returns `$XDG_DATA_HOME` (if absolute) or `$HOME/.local/share`.
-#[must_use]
-pub fn xdg_data_home() -> Option<PathBuf> {
-    XdgBaseDirs::from_env().data_home
-}
-
-/// Returns `$XDG_DATA_DIRS` (absolute entries) or `["/usr/local/share", "/usr/share"]`.
-#[must_use]
-pub fn xdg_data_dirs() -> Vec<PathBuf> {
-    XdgBaseDirs::from_env().data_dirs
-}
-
-/// Returns `$XDG_CACHE_HOME` (if absolute) or `$HOME/.cache`.
-#[must_use]
-pub fn xdg_cache_home() -> Option<PathBuf> {
-    XdgBaseDirs::from_env().cache_home
-}
-
-/// Returns `$XDG_STATE_HOME` (if absolute) or `$HOME/.local/state`.
-#[must_use]
-pub fn xdg_state_home() -> Option<PathBuf> {
-    XdgBaseDirs::from_env().state_home
-}
-
-/// Returns `$XDG_RUNTIME_DIR` if set to an absolute path.
-#[must_use]
-pub fn xdg_runtime_dir() -> Option<PathBuf> {
-    XdgBaseDirs::from_env().runtime_dir
-}
-
-/// Returns `$XDG_DATA_HOME/<subdir>` (falling back to `$HOME/.local/share/<subdir>`) followed by
-/// each `$XDG_DATA_DIRS/<subdir>` entry ordered from highest to lowest priority.
-pub(crate) fn xdg_data_dirs_for(subdir: &str) -> Vec<PathBuf> {
-    XdgBaseDirs::from_env()
-        .all_data_dirs()
-        .into_iter()
-        .map(|d| d.join(subdir))
-        .collect()
-}
-
 /// Extracts the first matching `key = value` entry from INI-formatted text.
 pub(crate) fn ini_key(text: &str, key_name: &str) -> Option<String> {
     for line in text.lines() {
@@ -310,7 +285,7 @@ pub(crate) fn ini_key(text: &str, key_name: &str) -> Option<String> {
 
 /// Looks up a configuration key across GTK 4 and GTK 3 `settings.ini` files.
 pub(crate) fn read_gtk_setting(key_name: &str) -> Option<String> {
-    let cfg = xdg_config_home()?;
+    let cfg = XdgBaseDirs::from_env().config_home?;
     for file in ["gtk-4.0/settings.ini", "gtk-3.0/settings.ini"] {
         if let Ok(text) = fs::read_to_string(cfg.join(file))
             && let Some(val) = ini_key(&text, key_name)
@@ -403,6 +378,30 @@ mod tests {
             vec![
                 PathBuf::from("/home/alice/.config"),
                 PathBuf::from("/etc/xdg")
+            ]
+        );
+        assert_eq!(
+            dirs.application_dirs(),
+            vec![
+                PathBuf::from("/home/alice/.local/share/applications"),
+                PathBuf::from("/opt/share/applications"),
+                PathBuf::from("/usr/share/applications"),
+            ]
+        );
+        assert_eq!(
+            dirs.icon_dirs(),
+            vec![
+                PathBuf::from("/home/alice/.local/share/icons"),
+                PathBuf::from("/opt/share/icons"),
+                PathBuf::from("/usr/share/icons"),
+            ]
+        );
+        assert_eq!(
+            dirs.sound_dirs(),
+            vec![
+                PathBuf::from("/home/alice/.local/share/sounds"),
+                PathBuf::from("/opt/share/sounds"),
+                PathBuf::from("/usr/share/sounds"),
             ]
         );
     }

@@ -18,9 +18,7 @@ const MAX_ASSET_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 
 pub(crate) fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
-    let meta = std::fs::metadata(path).map_err(|e| {
-        WaywiError::AssetDecode(format!("failed to stat asset {}: {e}", path.display()))
-    })?;
+    let meta = std::fs::metadata(path)?;
     if meta.len() > MAX_ASSET_FILE_BYTES {
         return Err(WaywiError::AssetDecode(format!(
             "asset {} exceeds max size ({} > {} bytes)",
@@ -29,9 +27,7 @@ pub(crate) fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
             MAX_ASSET_FILE_BYTES
         )));
     }
-    std::fs::read(path).map_err(|e| {
-        WaywiError::AssetDecode(format!("failed to read asset {}: {e}", path.display()))
-    })
+    Ok(std::fs::read(path)?)
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {

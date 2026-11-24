@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::hash::{Hash, Hasher};
 
 use crate::arena::FrameSharedFn;
-use crate::geometry::{LogicalPx, LogicalSize, Rect as GeoRect, Size};
+use crate::geometry::{Bounds, LogicalPx, LogicalSize, Size};
 use crate::input::CommonProps;
 #[cfg(feature = "renderer-software")]
 use crate::render::software::path::{build_rounded_rect_path, to_tiny_skia_path};
@@ -76,9 +76,9 @@ impl PathBuilder {
 #[derive(Debug, Clone)]
 pub(crate) enum CanvasOp {
     Clear(Color),
-    FillRect(GeoRect, Color),
-    FillRoundedRect(GeoRect, CornerRadius, Color),
-    StrokeRect(GeoRect, LogicalPx, Color),
+    FillRect(Bounds, Color),
+    FillRoundedRect(Bounds, CornerRadius, Color),
+    StrokeRect(Bounds, LogicalPx, Color),
     FillCircle(LogicalPx, LogicalPx, LogicalPx, Color),
     StrokeLine(LogicalPx, LogicalPx, LogicalPx, LogicalPx, LogicalPx, Color),
     FillPath(Vec<PathOp>, Color),
@@ -155,7 +155,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    pub fn fill_rect(&mut self, rect: GeoRect, color: Color) {
+    pub fn fill_rect(&mut self, rect: Bounds, color: Color) {
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
             ops.push(CanvasOp::FillRect(rect, color));
@@ -185,7 +185,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    pub fn fill_rounded_rect(&mut self, rect: GeoRect, radius: CornerRadius, color: Color) {
+    pub fn fill_rounded_rect(&mut self, rect: Bounds, radius: CornerRadius, color: Color) {
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
             ops.push(CanvasOp::FillRoundedRect(rect, radius, color));
@@ -216,7 +216,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    pub fn stroke_rect(&mut self, rect: GeoRect, width: LogicalPx, color: Color) {
+    pub fn stroke_rect(&mut self, rect: Bounds, width: LogicalPx, color: Color) {
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
             ops.push(CanvasOp::StrokeRect(rect, width, color));
@@ -378,31 +378,28 @@ impl<'a> Painter<'a> {
     }
 }
 
-/// Keyed procedural drawing boundary isolating imperative 2D commands from `view`.
+/// Procedural drawing boundary isolating imperative 2D commands from `view`.
 #[must_use]
 #[derive(Clone)]
 pub struct Canvas<M = ()> {
     pub(crate) common: CommonProps<M>,
-    pub(crate) render_key: u64,
+    pub(crate) cache_key: Option<u64>,
     pub(crate) draw: FrameSharedFn<*mut Painter<'static>, ()>,
 }
 
 impl<M: 'static> Canvas<M> {
-    /// Creates a procedural `Canvas` element with explicit `size`, cache `render_key`, and draw
-    /// closure. The draw closure is only re-executed when `render_key`, size, or scale changes.
-    pub fn new<K, F>(size: impl Into<Size>, render_key: K, draw: F) -> Self
+    /// Creates an uncached procedural `Canvas` element with explicit `size` and draw closure.
+    ///
+    /// Use [`Self::cache_key`] for static or dependency-keyed drawings whose rasterized pixmap /
+    /// vector commands should be cached across frames.
+    pub fn new<F>(size: impl Into<Size>, draw: F) -> Self
     where
-        K: Hash + 'static,
         F: Fn(&mut Painter<'_>) + 'static,
     {
         let common = CommonProps {
             size: size.into(),
             ..Default::default()
         };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        TypeId::of::<K>().hash(&mut hasher);
-        render_key.hash(&mut hasher);
-        let key_hash = hasher.finish();
 
         let erased = FrameSharedFn::new(move |painter_ptr: *mut Painter<'static>| {
             // SAFETY: Caller guarantees `painter_ptr` points to a valid `Painter` exclusively
@@ -413,16 +410,18 @@ impl<M: 'static> Canvas<M> {
 
         Self {
             common,
-            render_key: key_hash,
+            cache_key: None,
             draw: erased,
         }
     }
 
-    pub fn render_key<K: Hash + 'static>(mut self, render_key: K) -> Self {
+    /// Enables intermediate caching keyed by `key` so `draw` only re-executes when `key`, size,
+    /// or scale changes.
+    pub fn cache_key<K: Hash + 'static>(mut self, key: K) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         TypeId::of::<K>().hash(&mut hasher);
-        render_key.hash(&mut hasher);
-        self.render_key = hasher.finish();
+        key.hash(&mut hasher);
+        self.cache_key = Some(hasher.finish());
         self
     }
 
@@ -434,7 +433,7 @@ impl<M: 'static> Canvas<M> {
     {
         Canvas {
             common: self.common.map(f),
-            render_key: self.render_key,
+            cache_key: self.cache_key,
             draw: self.draw,
         }
     }

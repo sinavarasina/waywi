@@ -31,7 +31,7 @@ impl Application for AssetTestApp {
     type State = AssetTestState;
     type Message = AssetMsg;
 
-    fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         #[cfg(feature = "image-png")]
         let asset = {
             let bytes = png::make_rgba_png(
@@ -56,7 +56,11 @@ impl Application for AssetTestApp {
         })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             AssetMsg::LoadSvg(svg_bytes) => {
                 state.svg_asset = Some(ctx.load_image_bytes(&svg_bytes)?);
@@ -64,14 +68,14 @@ impl Application for AssetTestApp {
             #[cfg(feature = "image-png")]
             AssetMsg::Reload(path) => {
                 if let Some(a) = state.asset {
-                    ctx.reload_asset(a, path)?;
+                    ctx.reload_image(a, path)?;
                     state.reloaded = true;
                 }
             }
             #[cfg(feature = "image-png")]
             AssetMsg::Unload => {
                 if let Some(a) = state.asset {
-                    state.unloaded = ctx.unload_asset(a);
+                    state.unloaded = ctx.unload_image(a);
                 }
             }
         }
@@ -147,11 +151,15 @@ fn sprite_sheet_frame_and_playback_math() {
         impl Application for SheetApp {
             type State = SheetState;
             type Message = ();
-            fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+            fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
                 let bytes = png::make_rgba_png(96, 48, &vec![255u8; 96 * 48 * 4]);
                 Ok(SheetState(Some(ctx.load_image_bytes(&bytes)?)))
             }
-            fn update(_: &mut Self::State, _: Self::Message, _: &mut EffectCtx<'_>) -> Result<()> {
+            fn update(
+                _: &mut Self::State,
+                _: Self::Message,
+                _: &mut EffectCtx<'_, Self::Message>,
+            ) -> Result<()> {
                 Ok(())
             }
             fn view(_: &Self::State) -> Surfaces<Self::Message> {
@@ -165,7 +173,7 @@ fn sprite_sheet_frame_and_playback_math() {
         .unwrap();
         let asset = rt.state().0.unwrap();
         let sheet = SpriteSheet::new(asset)
-            .frame_size(32.logical_px(), 24.logical_px())
+            .frame_size(32, 24)
             .animation("idle", Frames::range(0..3), 6.fps())
             .animation_with_mode(
                 "bounce",
@@ -215,7 +223,7 @@ fn raw_rgb_and_rgba_images_support_rowstride_and_premultiplication() {
     impl Application for RawApp {
         type State = RawState;
         type Message = ();
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             // 2x2 RGBA with rowstride = 10 (2px*4 + 2 padding bytes on first row)
             let padded_rgba = vec![
                 200, 100, 50, 128, 255, 255, 255, 255, 0, 0, // row 0 + pad
@@ -231,7 +239,11 @@ fn raw_rgb_and_rgba_images_support_rowstride_and_premultiplication() {
                 short_err,
             })
         }
-        fn update(_: &mut Self::State, _: Self::Message, _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(
+            _: &mut Self::State,
+            _: Self::Message,
+            _: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
             Ok(())
         }
         fn view(_: &Self::State) -> Surfaces<Self::Message> {
@@ -267,7 +279,7 @@ fn sized_svg_loading_scales_small_icons_without_clobbering_intrinsic_cache() {
     impl Application for SizedSvgApp {
         type State = SizedSvgState;
         type Message = ();
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12"><rect width="16" height="12" fill="blue"/></svg>"#;
             let intrinsic = Some(ctx.load_image_bytes(svg)?);
             let sized_bytes = Some(ctx.load_image_bytes_sized(svg, 48)?);
@@ -283,7 +295,11 @@ fn sized_svg_loading_scales_small_icons_without_clobbering_intrinsic_cache() {
                 sized_file,
             })
         }
-        fn update(_: &mut Self::State, _: Self::Message, _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(
+            _: &mut Self::State,
+            _: Self::Message,
+            _: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
             Ok(())
         }
         fn view(_: &Self::State) -> Surfaces<Self::Message> {
@@ -342,22 +358,22 @@ fn reclaim_after_present_file_and_bytes_redecode_on_resize_and_reload() {
         type State = ReclaimState;
         type Message = Msg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             let file_asset = ctx.load_image(RED_PATH.get().unwrap())?;
             let bytes_asset = ctx.load_image_bytes(GREEN_PNG.get().unwrap())?;
-            assert!(ctx.set_asset_retention(file_asset, AssetRetention::ReclaimAfterPresent));
-            assert!(ctx.set_asset_retention(bytes_asset, AssetRetention::ReclaimAfterPresent));
+            assert!(ctx.set_image_retention(file_asset, AssetRetention::ReclaimAfterPresent));
+            assert!(ctx.set_image_retention(bytes_asset, AssetRetention::ReclaimAfterPresent));
             assert_eq!(
-                ctx.asset_retention(file_asset),
+                ctx.image_retention(file_asset),
                 Some(AssetRetention::ReclaimAfterPresent)
             );
 
             let raw = ctx.load_rgba_image(1, 1, 4, true, &[255, 255, 255, 255])?;
             let raw_reclaim_rejected =
-                !ctx.set_asset_retention(raw, AssetRetention::ReclaimAfterPresent);
-            let raw_evict_rejected = !ctx.evict_asset_pixels(raw);
-            assert_eq!(ctx.asset_retention(raw), Some(AssetRetention::KeepDecoded));
-            assert!(ctx.unload_asset(raw));
+                !ctx.set_image_retention(raw, AssetRetention::ReclaimAfterPresent);
+            let raw_evict_rejected = !ctx.evict_image_pixels(raw);
+            assert_eq!(ctx.image_retention(raw), Some(AssetRetention::KeepDecoded));
+            assert!(ctx.unload_image(raw));
 
             Ok(ReclaimState {
                 file_asset,
@@ -371,12 +387,12 @@ fn reclaim_after_present_file_and_bytes_redecode_on_resize_and_reload() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 Msg::ReloadFile(path) => {
-                    ctx.reload_asset(state.file_asset, path)?;
-                    state.retention_after_reload = ctx.asset_retention(state.file_asset);
+                    ctx.reload_image(state.file_asset, path)?;
+                    state.retention_after_reload = ctx.image_retention(state.file_asset);
                 }
             }
             Ok(())
@@ -499,7 +515,7 @@ fn evict_asset_pixels_on_sprite_sheet_auto_redecodes_and_stays_resident() {
         type State = SpriteEvictState;
         type Message = Msg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             // 4x2 sprite sheet: left 2x2 is red (frame 0), right 2x2 is blue (frame 1).
             let mut pixels = Vec::with_capacity(4 * 2 * 4);
             for _y in 0..2 {
@@ -508,7 +524,7 @@ fn evict_asset_pixels_on_sprite_sheet_auto_redecodes_and_stays_resident() {
             }
             let encoded = png::make_rgba_png(4, 2, &pixels);
             let asset = ctx.load_image_bytes(&encoded)?;
-            let sheet = SpriteSheet::new(asset).frame_size(LogicalPx(2.0), LogicalPx(2.0));
+            let sheet = SpriteSheet::new(asset).frame_size(2, 2);
             Ok(SpriteEvictState {
                 sheet,
                 visible: true,
@@ -521,13 +537,13 @@ fn evict_asset_pixels_on_sprite_sheet_auto_redecodes_and_stays_resident() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 Msg::HideAndEvict => {
                     state.visible = false;
-                    state.first_evict = ctx.evict_asset_pixels(state.sheet.asset);
-                    state.second_evict = ctx.evict_asset_pixels(state.sheet.asset);
+                    state.first_evict = ctx.evict_image_pixels(state.sheet.asset);
+                    state.second_evict = ctx.evict_image_pixels(state.sheet.asset);
                 }
                 Msg::ShowFrame(idx) => {
                     state.visible = true;
@@ -539,14 +555,14 @@ fn evict_asset_pixels_on_sprite_sheet_auto_redecodes_and_stays_resident() {
 
         fn view(state: &Self::State) -> Surfaces<Self::Message> {
             let mut surf = Surface::overlay("sprite-evict", Output::primary())
-                .size(Size::px(LogicalPx(8.0), LogicalPx(8.0)))
+                .size((LogicalPx(8.0), LogicalPx(8.0)))
                 .background(Color::TRANSPARENT);
             if state.visible {
                 surf = surf.child(
                     Sprite::new(state.sheet.clone())
                         .frame(state.frame)
                         .filter(ImageFilter::Nearest)
-                        .size(Size::px(LogicalPx(8.0), LogicalPx(8.0))),
+                        .size((LogicalPx(8.0), LogicalPx(8.0))),
                 );
             }
             let mut out = Surfaces::new();
@@ -601,14 +617,18 @@ fn reclaim_after_present_sized_svg_preserves_scaled_dimensions() {
         type State = ReclaimSvgState;
         type Message = ();
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             let raw = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12"><rect width="16" height="12" fill="rgb(0,0,255)"/></svg>"#;
             let svg = ctx.load_image_bytes_sized(raw, 48)?;
-            assert!(ctx.set_asset_retention(svg, AssetRetention::ReclaimAfterPresent));
+            assert!(ctx.set_image_retention(svg, AssetRetention::ReclaimAfterPresent));
             Ok(ReclaimSvgState { svg })
         }
 
-        fn update(_: &mut Self::State, _: Self::Message, _: &mut EffectCtx<'_>) -> Result<()> {
+        fn update(
+            _: &mut Self::State,
+            _: Self::Message,
+            _: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
             Ok(())
         }
 

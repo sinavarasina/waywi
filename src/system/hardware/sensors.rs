@@ -14,6 +14,9 @@ pub struct ThermalSensor {
     pub critical_celsius: Option<f32>,
 }
 
+/// Snapshot of thermal sensors read from `/sys/class/hwmon`.
+pub type ThermalSnapshot = Vec<ThermalSensor>;
+
 /// Shared per-hwmon telemetry snapshot reused by GPU and hardware sensor readers.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HwmonMetrics {

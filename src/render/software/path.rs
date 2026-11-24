@@ -1,7 +1,7 @@
 //! Vector path and clip mask conversion helpers for the `tiny-skia` software backend.
 
 #[cfg(feature = "renderer-software")]
-use crate::geometry::{BufferRect, Rect as GeoRect};
+use crate::geometry::{Bounds, BufferRect};
 #[cfg(feature = "renderer-software")]
 use crate::render::canvas::{PathBuilder, PathOp};
 #[cfg(feature = "renderer-software")]
@@ -36,7 +36,7 @@ pub(super) fn build_clip_mask(
 
 #[cfg(feature = "renderer-software")]
 pub(crate) fn build_rounded_rect_path(
-    rect: GeoRect,
+    rect: Bounds,
     radius: CornerRadius,
     scale: f32,
 ) -> Option<tiny_skia::Path> {

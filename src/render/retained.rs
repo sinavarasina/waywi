@@ -1,6 +1,6 @@
 use crate::accessibility::AccessibleProps;
 use crate::arena::FrameSharedFn;
-use crate::geometry::{Affine2D, LogicalPx, Rect as GeoRect};
+use crate::geometry::{Affine2D, Bounds, LogicalPx};
 use crate::image::{ImageFilter, ImageFit, SourceRect};
 use crate::input::{ElementKey, EventHandlers, HitTestNode, NodeId};
 use crate::render::canvas::Painter;
@@ -32,14 +32,8 @@ pub(crate) enum PaintPayload {
         filter: ImageFilter,
         source_rect: Option<SourceRect>,
     },
-    Sprite {
-        sheet: Box<SpriteSheet>,
-        asset_revision: u64,
-        frame_index: usize,
-        filter: ImageFilter,
-    },
     Canvas {
-        render_key: u64,
+        cache_key: Option<u64>,
         draw: CanvasDrawHandle,
     },
     ClipPush {
@@ -68,10 +62,10 @@ impl std::fmt::Debug for CanvasDrawHandle {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DrawCommand {
     pub(crate) node_id: NodeId,
-    pub(crate) local_rect: GeoRect,
+    pub(crate) local_rect: Bounds,
     pub(crate) affine: Affine2D,
-    pub(crate) world_bounds: GeoRect,
-    pub(crate) clip_rect: Option<GeoRect>,
+    pub(crate) world_bounds: Bounds,
+    pub(crate) clip_rect: Option<Bounds>,
     pub(crate) z_index: i32,
     pub(crate) paint_order: usize,
     pub(crate) opacity: f32,
@@ -83,10 +77,10 @@ pub(crate) struct RetainedNode<M> {
     pub(crate) node_id: NodeId,
     pub(crate) key: Option<ElementKey>,
     pub(crate) kind_tag: u8,
-    pub(crate) bounds: GeoRect,
-    pub(crate) world_bounds: GeoRect,
+    pub(crate) bounds: Bounds,
+    pub(crate) world_bounds: Bounds,
     pub(crate) affine: Affine2D,
-    pub(crate) clip_rect: Option<GeoRect>,
+    pub(crate) clip_rect: Option<Bounds>,
     pub(crate) z_index: i32,
     pub(crate) visible: bool,
     pub(crate) input_enabled: bool,
@@ -126,14 +120,14 @@ pub(crate) enum RetainedVisual {
         source_rect: Option<SourceRect>,
     },
     Sprite {
-        sheet: Box<SpriteSheet>,
+        sheet: SpriteSheet,
         asset_revision: u64,
         mode: SpriteSourceState,
         resolved_frame: usize,
         filter: ImageFilter,
     },
     Canvas {
-        render_key: u64,
+        cache_key: Option<u64>,
         draw: CanvasDrawHandle,
     },
     Clip {
@@ -220,7 +214,9 @@ impl RetainedVisual {
                     ..
                 },
             ) => s1 != s2 || r1 != r2 || rf1 != rf2 || fl1 != fl2,
-            (Self::Canvas { render_key: k1, .. }, Self::Canvas { render_key: k2, .. }) => k1 != k2,
+            (Self::Canvas { cache_key: k1, .. }, Self::Canvas { cache_key: k2, .. }) => {
+                k1.is_none() || k1 != k2
+            }
             (Self::Clip { corner_radius: c1 }, Self::Clip { corner_radius: c2 }) => c1 != c2,
             _ => true,
         }
@@ -255,9 +251,7 @@ fn collect_node_recursive<M: Clone + 'static>(
     let paint_order = *order;
     *order += 1;
 
-    if (node.input_enabled && node.handlers.has_pointer_handlers())
-        || node.handlers.on_key.is_some()
-    {
+    if node.input_enabled && node.handlers.has_pointer_handlers() {
         hit_nodes.push(HitTestNode {
             node_id: node.node_id,
             local_rect: node.bounds,
@@ -321,14 +315,15 @@ fn collect_node_recursive<M: Clone + 'static>(
             resolved_frame,
             filter,
             ..
-        } => Some(PaintPayload::Sprite {
-            sheet: sheet.clone(),
+        } => Some(PaintPayload::Image {
+            asset: sheet.asset,
             asset_revision: *asset_revision,
-            frame_index: *resolved_frame,
+            fit: ImageFit::Fill,
             filter: *filter,
+            source_rect: Some(SourceRect::from(sheet.frame_source_rect(*resolved_frame))),
         }),
-        RetainedVisual::Canvas { render_key, draw } => Some(PaintPayload::Canvas {
-            render_key: *render_key,
+        RetainedVisual::Canvas { cache_key, draw } => Some(PaintPayload::Canvas {
+            cache_key: *cache_key,
             draw: draw.clone(),
         }),
         RetainedVisual::Clip { corner_radius } => Some(PaintPayload::ClipPush {

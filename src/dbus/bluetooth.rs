@@ -12,17 +12,17 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
     DBUS_SLOW_TIMEOUT, DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec,
     validate_object_path,
 };
 use super::types::{Dbus, DbusBus};
-use super::worker::{AsyncStopSignal, ServiceWatchWorker};
+use super::worker::{AsyncStopSignal, DbusWorkerHandle, ServiceWatchWorker};
 use super::zvariant_helpers::{
     ManagedObjects, dict_bool, dict_i16, dict_str, dict_str_vec, dict_u8, dict_u32,
-    get_managed_objects_async, get_managed_objects_blocking,
+    get_managed_objects, unwrap_value,
 };
 
 const BLUEZ_DEST: &str = "org.bluez";
@@ -163,7 +163,8 @@ pub enum BluetoothAgentEvent {
     Error(String),
 }
 
-/// Response payload sent back to BlueZ via [`DbusClient`] for a pending [`BluetoothAgentRequest`].
+/// Response payload sent back to BlueZ via [`BluetoothClient::reply_agent`] for a pending
+/// [`BluetoothAgentRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothAgentReply {
     Accept,
@@ -173,7 +174,7 @@ pub enum BluetoothAgentReply {
     Cancel,
 }
 
-/// Zero-polling waker-backed oneshot slot shared between `DbusClient`, `BluezAgentIface`, and
+/// Zero-polling waker-backed oneshot slot shared between `BluetoothClient`, `BluezAgentIface`, and
 /// the raw D-Bus `Cancel`/`Release` signal interceptor.
 pub(crate) struct AgentReplySlot {
     inner: Mutex<AgentReplyState>,
@@ -240,7 +241,6 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusBluetooth {
-                key: "dbus:bluetooth".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
@@ -254,30 +254,36 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusBluetoothAgent {
-                key: "dbus:bluetooth-agent".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Reads the current [`BluetoothSnapshot`] from the in-memory subscription cache (0 ms) or
-    /// queries `org.bluez` if not yet cached.
-    pub fn bluetooth_snapshot(&self) -> Result<BluetoothSnapshot> {
-        if let Ok(guard) = self.cache.bluetooth.read()
-            && let Some(ref snap) = *guard
-        {
-            return Ok(snap.clone());
-        }
-        let conn = self.connection(DbusBus::System)?;
-        let objs = get_managed_objects_blocking(&conn, BLUEZ_DEST, BLUEZ_ROOT_PATH)?;
-        Ok(parse_bluez_objects(&objs))
+/// Zero-cost domain handle for BlueZ Bluetooth adapter, device, and pairing agent operations.
+#[derive(Clone, Copy)]
+pub struct BluetoothClient<'a>(pub(super) &'a DbusClient);
+
+impl BluetoothClient<'_> {
+    /// Returns the latest cached [`BluetoothSnapshot`] from an active [`Dbus::bluetooth`]
+    /// subscription without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshot(&self) -> Option<BluetoothSnapshot> {
+        self.0.cache.bluetooth.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Queries `org.bluez` synchronously on the system bus for the current [`BluetoothSnapshot`].
+    pub fn snapshot_blocking(&self) -> Result<BluetoothSnapshot> {
+        let conn = self.0.async_connection(DbusBus::System)?;
+        futures_lite::future::block_on(async move {
+            let objs = get_managed_objects(&conn, BLUEZ_DEST, BLUEZ_ROOT_PATH).await?;
+            Ok(parse_bluez_objects(&objs))
+        })
     }
 
     /// Powers a Bluetooth adapter (`org.bluez.Adapter1.Powered`) on or off.
-    pub fn set_bluetooth_powered(&self, adapter_path: &str, powered: bool) -> Result<()> {
-        self.set_property(
+    pub fn set_powered(&self, adapter_path: &str, powered: bool) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::System,
             BLUEZ_DEST,
             adapter_path,
@@ -288,8 +294,8 @@ impl DbusClient {
     }
 
     /// Sets whether a Bluetooth adapter is visible to nearby devices (`org.bluez.Adapter1.Discoverable`).
-    pub fn set_bluetooth_discoverable(&self, adapter_path: &str, discoverable: bool) -> Result<()> {
-        self.set_property(
+    pub fn set_discoverable(&self, adapter_path: &str, discoverable: bool) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::System,
             BLUEZ_DEST,
             adapter_path,
@@ -299,25 +305,9 @@ impl DbusClient {
         )
     }
 
-    /// Sets the adapter discoverable timeout in seconds (`0` = stay discoverable indefinitely).
-    pub fn set_bluetooth_discoverable_timeout(
-        &self,
-        adapter_path: &str,
-        timeout_secs: u32,
-    ) -> Result<()> {
-        self.set_property(
-            DbusBus::System,
-            BLUEZ_DEST,
-            adapter_path,
-            BLUEZ_ADAPTER_IFACE,
-            "DiscoverableTimeout",
-            Value::from(timeout_secs),
-        )
-    }
-
     /// Sets whether a Bluetooth adapter accepts pairing requests (`org.bluez.Adapter1.Pairable`).
-    pub fn set_bluetooth_pairable(&self, adapter_path: &str, pairable: bool) -> Result<()> {
-        self.set_property(
+    pub fn set_pairable(&self, adapter_path: &str, pairable: bool) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::System,
             BLUEZ_DEST,
             adapter_path,
@@ -327,90 +317,57 @@ impl DbusClient {
         )
     }
 
-    /// Sets the adapter pairable timeout in seconds (`0` = unlimited).
-    pub fn set_bluetooth_pairable_timeout(
+    /// Starts Bluetooth device discovery on `adapter_path` on the serialized Bluetooth adapter lane,
+    /// optionally applying a transport filter (`SetDiscoveryFilter`) beforehand.
+    pub fn start_discovery(
         &self,
         adapter_path: &str,
-        timeout_secs: u32,
-    ) -> Result<()> {
-        self.set_property(
-            DbusBus::System,
-            BLUEZ_DEST,
-            adapter_path,
-            BLUEZ_ADAPTER_IFACE,
-            "PairableTimeout",
-            Value::from(timeout_secs),
-        )
-    }
-
-    /// Sets the user-friendly alias for a Bluetooth adapter (`org.bluez.Adapter1.Alias`).
-    pub fn set_bluetooth_adapter_alias(&self, adapter_path: &str, alias: &str) -> Result<()> {
-        self.set_property(
-            DbusBus::System,
-            BLUEZ_DEST,
-            adapter_path,
-            BLUEZ_ADAPTER_IFACE,
-            "Alias",
-            Value::from(alias),
-        )
-    }
-
-    /// Configures the BlueZ discovery filter (`Transport`, optional RSSI threshold, and duplicate data)
-    /// via `org.bluez.Adapter1.SetDiscoveryFilter` on the Bluetooth adapter lane.
-    pub fn set_bluetooth_discovery_filter(
-        &self,
-        adapter_path: &str,
-        transport: BluetoothTransportFilter,
-        rssi_threshold: Option<i16>,
-        duplicate_data: bool,
+        filter: Option<BluetoothTransportFilter>,
     ) -> Result<()> {
         let adapter = validate_object_path(adapter_path, "adapter path")?;
         let target = adapter.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::BluetoothAdapter,
                 DbusBus::System,
-                "Adapter1.SetDiscoveryFilter",
+                "Adapter1.StartDiscovery",
                 target,
             ),
             move |conn| async move {
-                let mut filter: HashMap<&str, Value<'_>> = HashMap::new();
-                filter.insert("Transport", Value::from(transport.as_str()));
-                filter.insert("DuplicateData", Value::from(duplicate_data));
-                if let Some(rssi) = rssi_threshold {
-                    filter.insert("RSSI", Value::from(rssi));
+                if let Some(transport) = filter {
+                    let mut dict: HashMap<&str, Value<'_>> = HashMap::new();
+                    dict.insert("Transport", Value::from(transport.as_str()));
+                    conn.call_method(
+                        Some(BLUEZ_DEST),
+                        adapter.as_str(),
+                        Some(BLUEZ_ADAPTER_IFACE),
+                        "SetDiscoveryFilter",
+                        &(dict,),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WaywiError::DbusError(format!("Adapter1.SetDiscoveryFilter failed: {e}"))
+                    })?;
                 }
                 conn.call_method(
                     Some(BLUEZ_DEST),
                     adapter.as_str(),
                     Some(BLUEZ_ADAPTER_IFACE),
-                    "SetDiscoveryFilter",
-                    &(filter,),
+                    "StartDiscovery",
+                    &(),
                 )
                 .await
                 .map_err(|e| {
-                    WaywiError::DbusError(format!("Adapter1.SetDiscoveryFilter failed: {e}"))
+                    WaywiError::DbusError(format!("Adapter1.StartDiscovery failed: {e}"))
                 })?;
                 Ok(())
             },
         )
     }
 
-    /// Starts Bluetooth device discovery on `adapter_path` on the serialized Bluetooth adapter lane.
-    pub fn start_bluetooth_discovery(&self, adapter_path: &str) -> Result<()> {
-        self.call_lane_method_unit(
-            DbusActionLane::BluetoothAdapter,
-            DbusBus::System,
-            BLUEZ_DEST,
-            adapter_path,
-            BLUEZ_ADAPTER_IFACE,
-            "StartDiscovery",
-        )
-    }
-
     /// Stops Bluetooth device discovery on `adapter_path` on the serialized Bluetooth adapter lane.
-    pub fn stop_bluetooth_discovery(&self, adapter_path: &str) -> Result<()> {
-        self.call_lane_method_unit(
+    pub fn stop_discovery(&self, adapter_path: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
             DbusActionLane::BluetoothAdapter,
             DbusBus::System,
             BLUEZ_DEST,
@@ -422,11 +379,11 @@ impl DbusClient {
 
     /// Connects a known Bluetooth device (`org.bluez.Device1.Connect`) on the Bluetooth device lane
     /// with deduplication and a 25-second paging timeout so the UI thread never freezes.
-    pub fn connect_bluetooth_device(&self, device_path: &str) -> Result<()> {
+    pub fn connect(&self, device_path: &str) -> Result<()> {
         let dev = validate_object_path(device_path, "Bluetooth device path")?;
         let target = dev.clone();
         let dedup = format!("bt:connect:{dev}");
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::BluetoothDevice,
                 DbusBus::System,
@@ -450,43 +407,10 @@ impl DbusClient {
         )
     }
 
-    /// Connects a specific Bluetooth profile UUID on `device_path` (`org.bluez.Device1.ConnectProfile`)
-    /// on the Bluetooth device lane.
-    pub fn connect_bluetooth_device_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
-        let dev = validate_object_path(device_path, "Bluetooth device path")?;
-        let target = dev.clone();
-        let uuid_owned = uuid.to_owned();
-        let dedup = format!("bt:connect-profile:{dev}:{uuid_owned}");
-        self.submit_lane_action(
-            LaneActionSpec::fast(
-                DbusActionLane::BluetoothDevice,
-                DbusBus::System,
-                "Device1.ConnectProfile",
-                target,
-            )
-            .with_dedup(dedup)
-            .with_timeout(DBUS_SLOW_TIMEOUT),
-            move |conn| async move {
-                conn.call_method(
-                    Some(BLUEZ_DEST),
-                    dev.as_str(),
-                    Some(BLUEZ_DEVICE_IFACE),
-                    "ConnectProfile",
-                    &(uuid_owned.as_str(),),
-                )
-                .await
-                .map_err(|e| {
-                    WaywiError::DbusError(format!("Device1.ConnectProfile failed: {e}"))
-                })?;
-                Ok(())
-            },
-        )
-    }
-
     /// Disconnects a connected Bluetooth device (`org.bluez.Device1.Disconnect`) on the Bluetooth
     /// device lane.
-    pub fn disconnect_bluetooth_device(&self, device_path: &str) -> Result<()> {
-        self.call_lane_method_unit(
+    pub fn disconnect(&self, device_path: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
             DbusActionLane::BluetoothDevice,
             DbusBus::System,
             BLUEZ_DEST,
@@ -496,44 +420,14 @@ impl DbusClient {
         )
     }
 
-    /// Disconnects a specific Bluetooth profile UUID on `device_path` (`org.bluez.Device1.DisconnectProfile`)
-    /// on the Bluetooth device lane.
-    pub fn disconnect_bluetooth_device_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
-        let dev = validate_object_path(device_path, "Bluetooth device path")?;
-        let target = dev.clone();
-        let uuid_owned = uuid.to_owned();
-        self.submit_lane_action(
-            LaneActionSpec::fast(
-                DbusActionLane::BluetoothDevice,
-                DbusBus::System,
-                "Device1.DisconnectProfile",
-                target,
-            ),
-            move |conn| async move {
-                conn.call_method(
-                    Some(BLUEZ_DEST),
-                    dev.as_str(),
-                    Some(BLUEZ_DEVICE_IFACE),
-                    "DisconnectProfile",
-                    &(uuid_owned.as_str(),),
-                )
-                .await
-                .map_err(|e| {
-                    WaywiError::DbusError(format!("Device1.DisconnectProfile failed: {e}"))
-                })?;
-                Ok(())
-            },
-        )
-    }
-
     /// Pairs a discovered Bluetooth device (`org.bluez.Device1.Pair`) on the Bluetooth device lane
     /// with deduplication and a 25-second timeout so neither the UI thread nor `org.bluez.Agent1`
     /// prompts are blocked.
-    pub fn pair_bluetooth_device(&self, device_path: &str) -> Result<()> {
+    pub fn pair(&self, device_path: &str) -> Result<()> {
         let dev = validate_object_path(device_path, "Bluetooth device path")?;
         let target = dev.clone();
         let dedup = format!("bt:pair:{dev}");
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::BluetoothDevice,
                 DbusBus::System,
@@ -558,8 +452,8 @@ impl DbusClient {
     }
 
     /// Cancels an in-progress pairing exchange with `device_path` (`org.bluez.Device1.CancelPairing`).
-    pub fn cancel_bluetooth_pairing(&self, device_path: &str) -> Result<()> {
-        self.call_lane_method_unit(
+    pub fn cancel_pairing(&self, device_path: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
             DbusActionLane::BluetoothAdapter,
             DbusBus::System,
             BLUEZ_DEST,
@@ -570,8 +464,8 @@ impl DbusClient {
     }
 
     /// Sets the `Trusted` flag on a Bluetooth device (`org.bluez.Device1.Trusted`).
-    pub fn trust_bluetooth_device(&self, device_path: &str, trusted: bool) -> Result<()> {
-        self.set_property(
+    pub fn trust(&self, device_path: &str, trusted: bool) -> Result<()> {
+        self.0.set_property_zvariant(
             DbusBus::System,
             BLUEZ_DEST,
             device_path,
@@ -581,38 +475,14 @@ impl DbusClient {
         )
     }
 
-    /// Sets the `Blocked` flag on a Bluetooth device (`org.bluez.Device1.Blocked`).
-    pub fn block_bluetooth_device(&self, device_path: &str, blocked: bool) -> Result<()> {
-        self.set_property(
-            DbusBus::System,
-            BLUEZ_DEST,
-            device_path,
-            BLUEZ_DEVICE_IFACE,
-            "Blocked",
-            Value::from(blocked),
-        )
-    }
-
-    /// Sets a custom display alias on a Bluetooth device (`org.bluez.Device1.Alias`).
-    pub fn set_bluetooth_device_alias(&self, device_path: &str, alias: &str) -> Result<()> {
-        self.set_property(
-            DbusBus::System,
-            BLUEZ_DEST,
-            device_path,
-            BLUEZ_DEVICE_IFACE,
-            "Alias",
-            Value::from(alias),
-        )
-    }
-
     /// Unpairs/removes a Bluetooth device from its adapter (`org.bluez.Adapter1.RemoveDevice`)
     /// on the Bluetooth adapter lane.
-    pub fn remove_bluetooth_device(&self, adapter_path: &str, device_path: &str) -> Result<()> {
+    pub fn remove(&self, adapter_path: &str, device_path: &str) -> Result<()> {
         let adapter = validate_object_path(adapter_path, "adapter path")?;
         let obj = OwnedObjectPath::try_from(device_path.to_owned())
             .map_err(|e| WaywiError::DbusError(e.to_string()))?;
         let target = device_path.to_owned();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::BluetoothAdapter,
                 DbusBus::System,
@@ -634,38 +504,11 @@ impl DbusClient {
         )
     }
 
-    /// Accepts a pending `RequestConfirmation`, `RequestAuthorization`, or `AuthorizeService`
-    /// prompt from [`Dbus::bluetooth_agent`].
-    pub fn bluetooth_agent_confirm(&self, request_id: u64) -> Result<()> {
-        self.send_bluetooth_agent_reply(request_id, BluetoothAgentReply::Accept)
-    }
-
-    /// Supplies a PIN code string for a pending `RequestPinCode` prompt from [`Dbus::bluetooth_agent`].
-    pub fn bluetooth_agent_reply_pincode(
-        &self,
-        request_id: u64,
-        pincode: impl Into<String>,
-    ) -> Result<()> {
-        self.send_bluetooth_agent_reply(request_id, BluetoothAgentReply::PinCode(pincode.into()))
-    }
-
-    /// Supplies a 6-digit numeric passkey for a pending `RequestPasskey` prompt from
-    /// [`Dbus::bluetooth_agent`].
-    pub fn bluetooth_agent_reply_passkey(&self, request_id: u64, passkey: u32) -> Result<()> {
-        self.send_bluetooth_agent_reply(request_id, BluetoothAgentReply::Passkey(passkey))
-    }
-
-    /// Rejects a pending pairing or authorization prompt from [`Dbus::bluetooth_agent`].
-    pub fn bluetooth_agent_reject(&self, request_id: u64) -> Result<()> {
-        self.send_bluetooth_agent_reply(request_id, BluetoothAgentReply::Reject)
-    }
-
-    fn send_bluetooth_agent_reply(
-        &self,
-        request_id: u64,
-        reply: BluetoothAgentReply,
-    ) -> Result<()> {
+    /// Sends a typed [`BluetoothAgentReply`] for a pending [`BluetoothAgentRequest`] identified by
+    /// `request_id`.
+    pub fn reply_agent(&self, request_id: u64, reply: BluetoothAgentReply) -> Result<()> {
         let slot = self
+            .0
             .bluetooth_agent_pending
             .lock()
             .map_err(|_| WaywiError::DbusError("bluetooth agent pending lock poisoned".into()))?
@@ -692,16 +535,17 @@ pub(crate) fn spawn_bluetooth_worker(
         sender,
         shared,
         |conn| async move {
-            let objs = get_managed_objects_async(&conn, BLUEZ_DEST, BLUEZ_ROOT_PATH).await?;
+            let objs = get_managed_objects(&conn, BLUEZ_DEST, BLUEZ_ROOT_PATH)
+                .await
+                .ok()?;
             Some(parse_bluez_objects(&objs))
         },
     )
 }
 
 pub(crate) struct BluetoothAgentWorker {
-    stop: AsyncStopSignal,
     pending: PendingAgentMap,
-    join: Option<std::thread::JoinHandle<()>>,
+    handle: DbusWorkerHandle,
 }
 
 impl BluetoothAgentWorker {
@@ -709,36 +553,22 @@ impl BluetoothAgentWorker {
         sender: calloop::channel::Sender<BluetoothAgentEvent>,
         pending: PendingAgentMap,
     ) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
         let pending_for_thread = Arc::clone(&pending);
-
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-bt-agent".to_owned())
-            .spawn(move || {
-                futures_lite::future::block_on(run_bluetooth_agent_worker(
-                    sender,
-                    pending_for_thread,
-                    stop_sig,
-                ));
-            })
-            .ok();
-
-        Self {
-            stop,
-            pending,
-            join,
-        }
+        let handle = DbusWorkerHandle::spawn("waywi-dbus-bt-agent", move |stop_sig| {
+            futures_lite::future::block_on(run_bluetooth_agent_worker(
+                sender,
+                pending_for_thread,
+                stop_sig,
+            ));
+        });
+        Self { pending, handle }
     }
 }
 
 impl Drop for BluetoothAgentWorker {
     fn drop(&mut self) {
-        self.stop.trigger();
+        self.handle.trigger_stop();
         cancel_all_pending_slots(&self.pending);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
     }
 }
 
@@ -1035,7 +865,7 @@ pub(crate) fn parse_bluez_objects(objects: &ManagedObjects) -> BluetoothSnapshot
             let battery_percentage = ifaces
                 .get(BLUEZ_BATTERY_IFACE)
                 .and_then(|bat| dict_u8(bat, "Percentage"));
-            let appearance = match props.get("Appearance").map(|v| &**v) {
+            let appearance = match props.get("Appearance").map(|v| unwrap_value(v)) {
                 Some(Value::U16(v)) => Some(*v),
                 _ => None,
             };
@@ -1173,5 +1003,19 @@ mod tests {
         cancel_all_pending_slots(&pending);
         let res = futures_lite::future::block_on(AgentReplyFuture { slot });
         assert_eq!(res, Some(BluetoothAgentReply::Cancel));
+
+        let client = DbusClient::new();
+        let slot2 = AgentReplySlot::new();
+        client
+            .bluetooth_agent_pending
+            .lock()
+            .unwrap()
+            .insert(7, Arc::clone(&slot2));
+        client
+            .bluetooth()
+            .reply_agent(7, BluetoothAgentReply::Passkey(123_456))
+            .unwrap();
+        let res2 = futures_lite::future::block_on(AgentReplyFuture { slot: slot2 });
+        assert_eq!(res2, Some(BluetoothAgentReply::Passkey(123_456)));
     }
 }

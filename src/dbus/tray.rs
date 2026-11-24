@@ -1,8 +1,11 @@
 //! System tray (`org.kde.StatusNotifierWatcher`, `org.kde.StatusNotifierItem`, and
 //! `com.canonical.dbusmenu`) host and watcher support.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -10,13 +13,14 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
     DbusActionLane, DbusClient, LaneActionSpec, validate_bus_name, validate_object_path,
 };
 use super::types::{Dbus, DbusBus};
-use super::worker::AsyncStopSignal;
+use super::worker::{AsyncStopSignal, DbusWorkerHandle};
+use super::zvariant_helpers::{get_all, unwrap_value};
 
 const SNW_BUS: &str = "org.kde.StatusNotifierWatcher";
 const SNW_PATH: &str = "/StatusNotifierWatcher";
@@ -24,6 +28,7 @@ const SNW_IFACE: &str = "org.kde.StatusNotifierWatcher";
 const SNI_IFACE: &str = "org.kde.StatusNotifierItem";
 const DBUSMENU_IFACE: &str = "com.canonical.dbusmenu";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
+const FDO_DBUS_IFACE: &str = "org.freedesktop.DBus";
 
 /// Functional category advertised by a `StatusNotifierItem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -184,73 +189,79 @@ impl Dbus {
     pub fn tray<M: 'static>(map: impl Fn(TrayEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusTray {
-                key: "dbus:status-notifier-tray".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Lists registered SNI item identifiers from the active `org.kde.StatusNotifierWatcher`.
-    pub fn tray_list_items(&self) -> Result<Vec<String>> {
-        let conn = self.connection(DbusBus::Session)?;
-        let reply = conn
-            .call_method(
-                Some(SNW_BUS),
-                SNW_PATH,
-                Some(PROPS_IFACE),
-                "Get",
-                &(SNW_IFACE, "RegisteredStatusNotifierItems"),
-            )
-            .map_err(|e| {
-                WaywiError::DbusError(format!("StatusNotifierWatcher query failed: {e}"))
-            })?;
-        let val: OwnedValue = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Vec::<String>::try_from(val).map_err(|e| WaywiError::DbusError(e.to_string()))
+/// Zero-cost domain handle for StatusNotifier system tray queries, interactions, and menus.
+#[derive(Clone, Copy)]
+pub struct TrayClient<'a>(pub(super) &'a DbusClient);
+
+impl TrayClient<'_> {
+    /// Returns the latest cached list of registered tray items from an active [`Dbus::tray`]
+    /// subscription without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_items(&self) -> Option<Vec<TrayItemSnapshot>> {
+        self.0.cache.tray.read().ok().and_then(|g| g.clone())
     }
 
-    /// Reads the current [`TrayItemSnapshot`] for `service` (either `"bus/path"` or `"bus"`).
-    pub fn tray_snapshot(&self, service: &str) -> Result<TrayItemSnapshot> {
-        let (bus_name, object_path) = split_sni_service(service, None);
-        let conn = self.connection(DbusBus::Session)?;
-        let reply = conn
-            .call_method(
-                Some(bus_name.as_str()),
-                object_path.as_str(),
-                Some(PROPS_IFACE),
-                "GetAll",
-                &(SNI_IFACE,),
-            )
-            .map_err(|e| {
-                WaywiError::DbusError(format!(
-                    "StatusNotifierItem GetAll failed for {service}: {e}"
-                ))
-            })?;
-        let props: HashMap<String, OwnedValue> = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(parse_tray_item_props(bus_name, object_path, &props))
+    /// Queries the active `org.kde.StatusNotifierWatcher` synchronously on the session bus and
+    /// introspects all registered tray items.
+    pub fn items_blocking(&self) -> Result<Vec<TrayItemSnapshot>> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(async move {
+            let reply = conn
+                .call_method(
+                    Some(SNW_BUS),
+                    SNW_PATH,
+                    Some(PROPS_IFACE),
+                    "Get",
+                    &(SNW_IFACE, "RegisteredStatusNotifierItems"),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("StatusNotifierWatcher query failed: {e}"))
+                })?;
+            let val: OwnedValue = reply
+                .body()
+                .deserialize()
+                .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+            let raw_items =
+                Vec::<String>::try_from(val).map_err(|e| WaywiError::DbusError(e.to_string()))?;
+            let mut out = Vec::with_capacity(raw_items.len());
+            for raw in raw_items {
+                let (bus, path) = split_sni_service(&raw, None);
+                if let Some(snap) = fetch_tray_snapshot(&conn, &bus, &path).await {
+                    out.push(snap);
+                }
+            }
+            out.sort_by(|a, b| a.service.cmp(&b.service));
+            Ok(out)
+        })
     }
 
-    fn call_sni_action<B>(&self, service: &str, method: &'static str, body: B) -> Result<()>
+    fn call_sni_action<B>(
+        &self,
+        service: &str,
+        path: &str,
+        method: &'static str,
+        body: B,
+    ) -> Result<()>
     where
         B: serde::Serialize + zbus::zvariant::DynamicType + Send + Sync + 'static,
     {
-        let _ = validate_bus_name(service, "tray service")?;
-        let (dest, path) = split_sni_service(service, None);
+        let dest = validate_bus_name(service, "tray service")?;
+        let obj_path = validate_object_path(path, "tray object path")?;
         let op = format!("StatusNotifierItem.{method}");
-        let target = service.to_owned();
-        self.submit_lane_action(
+        let target = canonical_sni_id(&dest, &obj_path);
+        self.0.submit_lane_action(
             LaneActionSpec::fast(DbusActionLane::Desktop, DbusBus::Session, op, target),
             move |conn| async move {
                 conn.call_method(
                     Some(dest.as_str()),
-                    path.as_str(),
+                    obj_path.as_str(),
                     Some(SNI_IFACE),
                     method,
                     &body,
@@ -263,62 +274,65 @@ impl DbusClient {
     }
 
     /// Sends left-click `Activate(x, y)` to a tray item.
-    pub fn tray_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "Activate", (x, y))
+    pub fn activate(&self, service: &str, path: &str, x: i32, y: i32) -> Result<()> {
+        self.call_sni_action(service, path, "Activate", (x, y))
     }
 
     /// Sends middle-click `SecondaryActivate(x, y)` to a tray item.
-    pub fn tray_secondary_activate(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "SecondaryActivate", (x, y))
+    pub fn secondary_activate(&self, service: &str, path: &str, x: i32, y: i32) -> Result<()> {
+        self.call_sni_action(service, path, "SecondaryActivate", (x, y))
     }
 
     /// Sends right-click `ContextMenu(x, y)` to a tray item.
-    pub fn tray_context_menu(&self, service: &str, x: i32, y: i32) -> Result<()> {
-        self.call_sni_action(service, "ContextMenu", (x, y))
+    pub fn context_menu(&self, service: &str, path: &str, x: i32, y: i32) -> Result<()> {
+        self.call_sni_action(service, path, "ContextMenu", (x, y))
     }
 
     /// Sends `Scroll(delta, orientation)` (`"vertical"` or `"horizontal"`) to a tray item.
-    pub fn tray_scroll(&self, service: &str, delta: i32, orientation: &str) -> Result<()> {
-        self.call_sni_action(service, "Scroll", (delta, orientation.to_owned()))
+    pub fn scroll(&self, service: &str, path: &str, delta: i32, orientation: &str) -> Result<()> {
+        self.call_sni_action(service, path, "Scroll", (delta, orientation.to_owned()))
     }
 
-    /// Reads top-level `com.canonical.dbusmenu` entries from a tray item's `menu_path`.
-    pub fn tray_menu_layout(&self, bus_name: &str, menu_path: &str) -> Result<Vec<TrayMenuItem>> {
-        let conn = self.connection(DbusBus::Session)?;
-        let empty_props: Vec<&str> = Vec::new();
-        let reply = conn
-            .call_method(
-                Some(bus_name),
-                menu_path,
-                Some(DBUSMENU_IFACE),
-                "GetLayout",
-                &(0i32, -1i32, empty_props),
-            )
-            .map_err(|e| WaywiError::DbusError(format!("dbusmenu GetLayout failed: {e}")))?;
-        type DbusMenuLayoutNode = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
-        let (_rev, root): (u32, DbusMenuLayoutNode) = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(root.2.iter().filter_map(parse_dbusmenu_node).collect())
-    }
-
-    /// Sends a `com.canonical.dbusmenu.Event` (e.g. `"clicked"` / `"hovered"`) for `item_id`.
-    pub fn tray_menu_event(
+    /// Reads top-level `com.canonical.dbusmenu` entries synchronously from a tray item's
+    /// `menu_path`.
+    pub fn menu_layout_blocking(
         &self,
-        bus_name: &str,
+        service: &str,
         menu_path: &str,
-        item_id: i32,
-        event_id: &str,
-    ) -> Result<()> {
-        let bus = validate_bus_name(bus_name, "dbusmenu bus_name")?;
+    ) -> Result<Vec<TrayMenuItem>> {
+        let bus = validate_bus_name(service, "dbusmenu service")?;
+        let path = validate_object_path(menu_path, "dbusmenu menu_path")?;
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(async move {
+            let empty_props: Vec<&str> = Vec::new();
+            let reply = conn
+                .call_method(
+                    Some(bus.as_str()),
+                    path.as_str(),
+                    Some(DBUSMENU_IFACE),
+                    "GetLayout",
+                    &(0i32, -1i32, empty_props),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("dbusmenu GetLayout failed: {e}")))?;
+            type DbusMenuLayoutNode = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+            let (_rev, root): (u32, DbusMenuLayoutNode) = reply
+                .body()
+                .deserialize()
+                .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+            Ok(root.2.iter().filter_map(parse_dbusmenu_node).collect())
+        })
+    }
+
+    /// Triggers a `com.canonical.dbusmenu.Event("clicked")` for `item_id`.
+    pub fn trigger_menu_item(&self, service: &str, menu_path: &str, item_id: i32) -> Result<()> {
+        let bus = validate_bus_name(service, "dbusmenu service")?;
         let path = validate_object_path(menu_path, "dbusmenu menu_path")?;
         let target = path.clone();
-        let ev = validate_bus_name(event_id, "dbusmenu event_id")?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u32, |d| d.as_secs() as u32);
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::Desktop,
                 DbusBus::Session,
@@ -331,7 +345,7 @@ impl DbusClient {
                     path.as_str(),
                     Some(DBUSMENU_IFACE),
                     "Event",
-                    &(item_id, ev.as_str(), Value::from(0i32), ts),
+                    &(item_id, "clicked", Value::from(0i32), ts),
                 )
                 .await
                 .map_err(|e| WaywiError::DbusError(format!("dbusmenu Event failed: {e}")))?;
@@ -449,7 +463,7 @@ fn parse_tooltip(val: Option<&OwnedValue>) -> Option<TrayToolTip> {
 }
 
 fn parse_dbusmenu_node(val: &OwnedValue) -> Option<TrayMenuItem> {
-    let Value::Structure(st) = &**val else {
+    let Value::Structure(st) = unwrap_value(val) else {
         return None;
     };
     parse_dbusmenu_struct(st)
@@ -475,7 +489,7 @@ fn parse_dbusmenu_struct(st: &zbus::zvariant::Structure<'_>) -> Option<TrayMenuI
 
     for (k, v) in dict.iter() {
         let Value::Str(ks) = k else { continue };
-        let inner = super::zvariant_helpers::unwrap_value(v);
+        let inner = unwrap_value(v);
         match ks.as_str() {
             "label" => {
                 if let Value::Str(s) = inner {
@@ -515,7 +529,7 @@ fn parse_dbusmenu_struct(st: &zbus::zvariant::Structure<'_>) -> Option<TrayMenuI
 
     let children = if let Value::Array(ref arr) = fields[2] {
         arr.iter()
-            .filter_map(|child| match super::zvariant_helpers::unwrap_value(child) {
+            .filter_map(|child| match unwrap_value(child) {
                 Value::Structure(cst) => parse_dbusmenu_struct(cst),
                 _ => None,
             })
@@ -536,6 +550,76 @@ fn parse_dbusmenu_struct(st: &zbus::zvariant::Structure<'_>) -> Option<TrayMenuI
     })
 }
 
+/// Zero-polling waker-backed MPSC queue waking the tray async loop immediately when a local
+/// `StatusNotifierWatcher` registration arrives.
+struct NotifyQueueState<T> {
+    items: VecDeque<T>,
+    waker: Option<Waker>,
+}
+
+struct AsyncNotifyQueue<T> {
+    inner: Arc<Mutex<NotifyQueueState<T>>>,
+}
+
+impl<T> Clone for AsyncNotifyQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> AsyncNotifyQueue<T> {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(NotifyQueueState {
+                items: VecDeque::new(),
+                waker: None,
+            })),
+        }
+    }
+
+    fn push(&self, item: T) {
+        if let Ok(mut st) = self.inner.lock() {
+            st.items.push_back(item);
+            if let Some(w) = st.waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    fn drain_all(&self) -> Vec<T> {
+        if let Ok(mut st) = self.inner.lock() {
+            st.items.drain(..).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn next(&self) -> NextQueueItem<T> {
+        NextQueueItem {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct NextQueueItem<T> {
+    inner: Arc<Mutex<NotifyQueueState<T>>>,
+}
+
+impl<T> Future for NextQueueItem<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = st.items.pop_front() {
+            return Poll::Ready(item);
+        }
+        st.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 #[derive(Default)]
 struct WatcherRegistry {
     items: Vec<String>,
@@ -544,7 +628,7 @@ struct WatcherRegistry {
 
 struct StatusNotifierWatcherIface {
     registry: Arc<Mutex<WatcherRegistry>>,
-    internal_tx: std::sync::mpsc::Sender<String>,
+    local_reg_queue: AsyncNotifyQueue<String>,
 }
 
 #[interface(name = "org.kde.StatusNotifierWatcher")]
@@ -569,7 +653,7 @@ impl StatusNotifierWatcherIface {
         };
         if inserted {
             let _ = Self::status_notifier_item_registered(&emitter, &id).await;
-            let _ = self.internal_tx.send(id);
+            self.local_reg_queue.push(id);
         }
     }
 
@@ -625,32 +709,23 @@ impl StatusNotifierWatcherIface {
     async fn status_notifier_host_registered(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
-pub(crate) struct TrayWorker {
-    stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
-}
+pub(crate) struct TrayWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl TrayWorker {
     pub(crate) fn spawn(sender: calloop::channel::Sender<TrayEvent>) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-tray".to_owned())
-            .spawn(move || {
+        Self(DbusWorkerHandle::spawn(
+            "waywi-dbus-tray",
+            move |stop_sig| {
                 futures_lite::future::block_on(run_tray_worker(sender, stop_sig));
-            })
-            .ok();
-        Self { stop, join }
+            },
+        ))
     }
 }
 
-impl Drop for TrayWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
+enum TrayWake {
+    LocalRegister(String),
+    Signal(Option<zbus::Result<zbus::Message>>),
+    Stopped,
 }
 
 async fn run_tray_worker(sender: calloop::channel::Sender<TrayEvent>, stop_sig: AsyncStopSignal) {
@@ -658,10 +733,10 @@ async fn run_tray_worker(sender: calloop::channel::Sender<TrayEvent>, stop_sig: 
         items: Vec::new(),
         hosts: Vec::new(),
     }));
-    let (local_reg_tx, local_reg_rx) = std::sync::mpsc::channel::<String>();
+    let local_reg_queue = AsyncNotifyQueue::<String>::new();
     let iface = StatusNotifierWatcherIface {
         registry: Arc::clone(&registry),
-        internal_tx: local_reg_tx,
+        local_reg_queue: local_reg_queue.clone(),
     };
 
     let watcher_attempt = match zbus::connection::Builder::session() {
@@ -725,32 +800,72 @@ async fn run_tray_worker(sender: calloop::channel::Sender<TrayEvent>, stop_sig: 
         }
     }
 
-    // Listen to NameOwnerChanged, StatusNotifierWatcher signals, and StatusNotifierItem update signals.
-    let rule = zbus::MatchRule::builder()
+    // Targeted match rules so the tray worker never wakes on unrelated session D-Bus signals.
+    let Ok(snw_rule) = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .build();
-    let Ok(mut stream) = zbus::MessageStream::for_match_rule(rule, &conn, Some(128)).await else {
+        .interface(SNW_IFACE)
+    else {
+        return;
+    };
+    let Ok(sni_rule) = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(SNI_IFACE)
+    else {
+        return;
+    };
+    let Ok(owner_rule) = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(FDO_DBUS_IFACE)
+        .and_then(|b| b.interface(FDO_DBUS_IFACE))
+        .and_then(|b| b.member("NameOwnerChanged"))
+    else {
+        return;
+    };
+
+    let Ok(snw_stream) =
+        zbus::MessageStream::for_match_rule(snw_rule.build(), &conn, Some(32)).await
+    else {
+        return;
+    };
+    let Ok(sni_stream) =
+        zbus::MessageStream::for_match_rule(sni_rule.build(), &conn, Some(64)).await
+    else {
+        return;
+    };
+    let Ok(owner_stream) =
+        zbus::MessageStream::for_match_rule(owner_rule.build(), &conn, Some(64)).await
+    else {
         return;
     };
 
     use futures_lite::StreamExt;
+    let mut stream = snw_stream.or(sni_stream).or(owner_stream);
+
     while !stop_sig.is_stopped() {
-        while let Ok(new_service) = local_reg_rx.try_recv() {
+        for new_service in local_reg_queue.drain_all() {
             track_and_emit_sni(&conn, &mut tracked, &sender, &new_service).await;
         }
 
-        let next_msg = futures_lite::future::or(async { Some(stream.next().await) }, async {
-            stop_sig.wait_stopped().await;
-            None
-        })
+        let wake = futures_lite::future::or(
+            futures_lite::future::or(
+                async { TrayWake::LocalRegister(local_reg_queue.next().await) },
+                async { TrayWake::Signal(stream.next().await) },
+            ),
+            async {
+                stop_sig.wait_stopped().await;
+                TrayWake::Stopped
+            },
+        )
         .await;
 
-        while let Ok(new_service) = local_reg_rx.try_recv() {
-            track_and_emit_sni(&conn, &mut tracked, &sender, &new_service).await;
-        }
-
-        let Some(Some(Ok(msg))) = next_msg else {
-            break;
+        let msg = match wake {
+            TrayWake::Stopped => break,
+            TrayWake::LocalRegister(new_service) => {
+                track_and_emit_sni(&conn, &mut tracked, &sender, &new_service).await;
+                continue;
+            }
+            TrayWake::Signal(Some(Ok(msg))) => msg,
+            TrayWake::Signal(Some(Err(_)) | None) => break,
         };
 
         let header = msg.header();
@@ -796,12 +911,12 @@ async fn run_tray_worker(sender: calloop::channel::Sender<TrayEvent>, stop_sig: 
                     }
                 }
                 for (_canon, bus, path) in matched {
-                    if let Some(snap) = fetch_tray_snapshot_async(&conn, &bus, &path).await {
+                    if let Some(snap) = fetch_tray_snapshot(&conn, &bus, &path).await {
                         let _ = sender.send(TrayEvent::ItemUpdated(snap));
                     }
                 }
             }
-            ("org.freedesktop.DBus", "NameOwnerChanged") => {
+            (FDO_DBUS_IFACE, "NameOwnerChanged") => {
                 if let Ok((name, _old_owner, new_owner)) =
                     msg.body().deserialize::<(String, String, String)>()
                     && new_owner.is_empty()
@@ -847,9 +962,9 @@ async fn resolve_sni_owner(conn: &zbus::Connection, bus: &str) -> Option<String>
     }
     let reply = conn
         .call_method(
-            Some("org.freedesktop.DBus"),
+            Some(FDO_DBUS_IFACE),
             "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
+            Some(FDO_DBUS_IFACE),
             "GetNameOwner",
             &(bus,),
         )
@@ -877,22 +992,18 @@ async fn track_and_emit_sni(
     {
         return;
     }
-    if let Some(snap) = fetch_tray_snapshot_async(conn, &bus, &path).await {
+    if let Some(snap) = fetch_tray_snapshot(conn, &bus, &path).await {
         tracked.insert(canon, (owner, bus, path));
         let _ = sender.send(TrayEvent::ItemRegistered(snap));
     }
 }
 
-async fn fetch_tray_snapshot_async(
+async fn fetch_tray_snapshot(
     conn: &zbus::Connection,
     bus: &str,
     path: &str,
 ) -> Option<TrayItemSnapshot> {
-    let reply = conn
-        .call_method(Some(bus), path, Some(PROPS_IFACE), "GetAll", &(SNI_IFACE,))
-        .await
-        .ok()?;
-    let props: HashMap<String, OwnedValue> = reply.body().deserialize().ok()?;
+    let props = get_all(conn, bus, path, SNI_IFACE).await.ok()?;
     Some(parse_tray_item_props(
         bus.to_owned(),
         path.to_owned(),
@@ -931,5 +1042,18 @@ mod tests {
             argb32: vec![0x80, 0x11, 0x22, 0x33],
         };
         assert_eq!(pix.to_rgba(), Some(vec![0x11, 0x22, 0x33, 0x80]));
+    }
+
+    #[test]
+    fn notify_queue_wakes_async_waiter_immediately_without_polling() {
+        let q = AsyncNotifyQueue::<String>::new();
+        let q_prod = q.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            q_prod.push(":1.50/StatusNotifierItem".to_owned());
+        });
+        let got = futures_lite::future::block_on(q.next());
+        producer.join().unwrap();
+        assert_eq!(got, ":1.50/StatusNotifierItem");
     }
 }

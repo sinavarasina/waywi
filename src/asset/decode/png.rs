@@ -81,7 +81,6 @@ pub(super) fn decode(bytes: &[u8], revision: u64) -> Result<DecodedImage> {
         height,
         pixels: Arc::from(out),
         revision,
-        animated_frames: None,
     })
 }
 

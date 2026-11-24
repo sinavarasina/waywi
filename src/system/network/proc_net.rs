@@ -120,6 +120,7 @@ impl NetworkSampler {
 
     pub fn reset(&mut self) {
         self.prev.clear();
+        self.prev.shrink_to_fit();
         self.prev_time = None;
     }
 

@@ -1,6 +1,6 @@
 use bitflags::bitflags;
 
-use crate::geometry::Rect as GeoRect;
+use crate::geometry::Bounds;
 
 use super::text_input::{TextInputState, snap_char_boundary, snap_char_boundary_up};
 
@@ -157,7 +157,7 @@ pub struct ImeConfig {
     /// Plain text context around the cursor (excluding preedit).
     pub surrounding_text: Option<ImeSurroundingText>,
     /// Surface-local cursor bounding rectangle for positioning IME candidate popups.
-    pub cursor_rect: Option<GeoRect>,
+    pub cursor_rect: Option<Bounds>,
     /// Behavior hints sent via `set_content_type`.
     pub content_hint: ImeContentHint,
     /// Primary content purpose sent via `set_content_type`.
@@ -204,7 +204,7 @@ impl ImeConfig {
 
     /// Sets the surface-local cursor rectangle used by compositors to place candidate popups.
     #[must_use]
-    pub fn cursor_rect(mut self, rect: GeoRect) -> Self {
+    pub fn cursor_rect(mut self, rect: Bounds) -> Self {
         self.cursor_rect = Some(rect);
         self
     }

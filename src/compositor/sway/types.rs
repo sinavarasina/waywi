@@ -1,14 +1,7 @@
 use serde::Deserialize;
 
 use crate::arena::FrameSharedFn;
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
-
-/// Target workspace reference for Sway commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WorkspaceRef<'a> {
-    Name(&'a str),
-    Number(i32),
-}
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 /// Sway workspace snapshot (`GET_WORKSPACES` or `workspace` event payload).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -88,14 +81,23 @@ pub enum SwayEvent {
     },
 }
 
+impl SwayEvent {
+    /// Parses a Sway `i3-ipc` event frame (`msg_type`, `payload`), returning `None` for
+    /// non-event frames or malformed JSON payloads.
+    #[must_use]
+    pub fn parse_frame(msg_type: u32, payload: &[u8]) -> Option<Self> {
+        super::stream::parse_event_frame(msg_type, payload)
+    }
+}
+
 /// Sway IPC subscription helper.
 pub struct Sway;
 
 impl Sway {
+    /// Subscribes to Sway's persistent `i3-ipc` event stream.
     pub fn subscribe<M: 'static>(map: impl Fn(SwayEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::SwayEvent {
-                key: "sway-ipc-subscribe".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }

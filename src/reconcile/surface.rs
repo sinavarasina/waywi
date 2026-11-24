@@ -3,9 +3,7 @@ use std::time::Instant;
 use crate::accessibility::AccessibleProps;
 use crate::arena::FrameSharedFn;
 use crate::display::OutputId;
-use crate::geometry::{
-    BufferRect, Edges, LogicalPx, LogicalSize, Point, Rect as GeoRect, ScaleFactor,
-};
+use crate::geometry::{Bounds, BufferRect, Edges, LogicalPx, LogicalSize, Point, ScaleFactor};
 use crate::input::{
     HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, NodeId, PointerEvent,
     ScrollEvent, hit_test, hit_test_scroll,
@@ -58,11 +56,11 @@ pub(crate) struct RetainedSurface<M> {
     pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
-    pub(crate) dirty_logical_rects: Vec<GeoRect>,
+    pub(crate) dirty_logical_rects: Vec<Bounds>,
     pub(crate) needs_redraw: bool,
     pub(crate) full_redraw: bool,
     pub(crate) input_region_dirty: bool,
-    pub(crate) selective_input_rects: Vec<GeoRect>,
+    pub(crate) selective_input_rects: Vec<Bounds>,
     pub(crate) next_animation_deadline: Option<Instant>,
 }
 
@@ -292,7 +290,7 @@ pub(crate) struct HoverTransition<M> {
         feature = "alsa",
         feature = "audio-playback"
     ))]
-    pub(crate) on_hover_sound: Option<(crate::audio::SoundAsset, f32)>,
+    pub(crate) on_hover_sound: Option<crate::audio::SoundPlay>,
 }
 
 /// Output of pointer click, press, or release dispatch on a [`RetainedSurface`].
@@ -306,7 +304,7 @@ pub(crate) struct PointerDispatch<M> {
         feature = "alsa",
         feature = "audio-playback"
     ))]
-    pub(crate) click_sound: Option<(crate::audio::SoundAsset, f32)>,
+    pub(crate) click_sound: Option<crate::audio::SoundPlay>,
 }
 
 impl<M> Default for PointerDispatch<M> {

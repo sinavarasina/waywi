@@ -1,6 +1,6 @@
 use waywi::display::{Output, OutputId, OutputInfo, resolve_outputs};
 use waywi::geometry::{
-    BufferPx, BufferRect, Edges, ElementAnchor, GeoRect, Length, LogicalPx, LogicalPxExt,
+    Bounds, BufferPx, BufferRect, Edges, ElementAnchor, Length, LogicalPx, LogicalPxExt,
     LogicalSize, PercentExt, Point, Position, ScaleFactor, Size, Transform,
 };
 
@@ -50,7 +50,7 @@ fn anchor_positioning_and_transform_bounds() {
 
 #[test]
 fn buffer_rect_clamp_and_union() {
-    let r = GeoRect::new(
+    let r = Bounds::new(
         LogicalPx(10.2),
         LogicalPx(20.4),
         LogicalPx(30.0),

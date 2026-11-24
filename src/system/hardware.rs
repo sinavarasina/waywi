@@ -13,6 +13,6 @@ pub use brightness::{
     set_backlight_percent, set_backlight_raw,
 };
 pub(crate) use brightness::{DdcWorker, backlight_percent_to_raw, write_backlight_sysfs_raw};
-pub use power::{BatteryInfo, PowerStatus, read_batteries, read_batteries_from};
-pub use sensors::{ThermalSensor, read_sensors, read_sensors_from};
+pub use power::{BatteryInfo, BatterySnapshot, PowerStatus, read_batteries, read_batteries_from};
+pub use sensors::{ThermalSensor, ThermalSnapshot, read_sensors, read_sensors_from};
 pub use usb::{UsbDevice, read_usb_devices, read_usb_devices_from};

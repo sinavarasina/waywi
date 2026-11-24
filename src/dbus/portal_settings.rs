@@ -11,11 +11,12 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::render::Color;
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{DbusClient, DbusSharedBus, owned_value_to_dbus};
 use super::types::{Dbus, DbusBus, DbusValue};
 use super::worker::ServiceWatchWorker;
+use super::zvariant_helpers::unwrap_value;
 
 const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -118,75 +119,92 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusPortalSettings {
-                key: "dbus:portal-settings".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
+/// Zero-cost domain handle for XDG Desktop Portal settings and portal capability queries.
+#[derive(Clone, Copy)]
+pub struct PortalClient<'a>(pub(super) &'a DbusClient);
+
+impl PortalClient<'_> {
     /// Reads the current `org.freedesktop.appearance` snapshot (`color-scheme`, `contrast`,
-    /// `accent-color`) from `org.freedesktop.portal.Settings`.
-    pub fn portal_settings_snapshot(&self) -> Result<PortalSettingsSnapshot> {
-        let conn = self.connection(DbusBus::Session)?;
-        let reply = conn
-            .call_method(
-                Some(PORTAL_DEST),
-                PORTAL_PATH,
-                Some(PORTAL_SETTINGS_IFACE),
-                "ReadAll",
-                &(&[APPEARANCE_NAMESPACE][..],),
-            )
-            .map_err(|e| WaywiError::DbusError(format!("portal Settings.ReadAll failed: {e}")))?;
-        let all: HashMap<String, HashMap<String, OwnedValue>> = reply
-            .body()
-            .deserialize()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        Ok(parse_appearance_map(all.get(APPEARANCE_NAMESPACE)))
+    /// `accent-color`) synchronously from `org.freedesktop.portal.Settings`.
+    pub fn settings_blocking(&self) -> Result<PortalSettingsSnapshot> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(read_portal_settings(&conn))
     }
 
-    /// Reads an arbitrary setting `(namespace, key)` from `org.freedesktop.portal.Settings` using
-    /// `ReadOne` (portal v2), falling back to deprecated `Read` (portal v1) automatically.
-    pub fn portal_setting(&self, namespace: &str, key: &str) -> Result<DbusValue> {
-        let conn = self.connection(DbusBus::Session)?;
-        let raw_val: OwnedValue = match conn.call_method(
+    /// Reads an arbitrary setting `(namespace, key)` synchronously from
+    /// `org.freedesktop.portal.Settings` using `ReadOne` (portal v2), falling back to deprecated
+    /// `Read` (portal v1) automatically.
+    pub fn read_setting_blocking(&self, namespace: &str, key: &str) -> Result<DbusValue> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        let namespace = namespace.to_owned();
+        let key = key.to_owned();
+        futures_lite::future::block_on(async move {
+            let raw_val: OwnedValue = match conn
+                .call_method(
+                    Some(PORTAL_DEST),
+                    PORTAL_PATH,
+                    Some(PORTAL_SETTINGS_IFACE),
+                    "ReadOne",
+                    &(namespace.as_str(), key.as_str()),
+                )
+                .await
+            {
+                Ok(reply) => reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?,
+                Err(_) => {
+                    let reply = conn
+                        .call_method(
+                            Some(PORTAL_DEST),
+                            PORTAL_PATH,
+                            Some(PORTAL_SETTINGS_IFACE),
+                            "Read",
+                            &(namespace.as_str(), key.as_str()),
+                        )
+                        .await
+                        .map_err(|e| {
+                            WaywiError::DbusError(format!(
+                                "portal Settings.Read({namespace}, {key}) failed: {e}"
+                            ))
+                        })?;
+                    reply
+                        .body()
+                        .deserialize()
+                        .map_err(|e| WaywiError::DbusError(e.to_string()))?
+                }
+            };
+            let mut val = owned_value_to_dbus(&raw_val);
+            while let DbusValue::Variant(inner) = val {
+                val = *inner;
+            }
+            Ok(val)
+        })
+    }
+}
+
+async fn read_portal_settings(conn: &zbus::Connection) -> Result<PortalSettingsSnapshot> {
+    let reply = conn
+        .call_method(
             Some(PORTAL_DEST),
             PORTAL_PATH,
             Some(PORTAL_SETTINGS_IFACE),
-            "ReadOne",
-            &(namespace, key),
-        ) {
-            Ok(reply) => reply
-                .body()
-                .deserialize()
-                .map_err(|e| WaywiError::DbusError(e.to_string()))?,
-            Err(_) => {
-                let reply = conn
-                    .call_method(
-                        Some(PORTAL_DEST),
-                        PORTAL_PATH,
-                        Some(PORTAL_SETTINGS_IFACE),
-                        "Read",
-                        &(namespace, key),
-                    )
-                    .map_err(|e| {
-                        WaywiError::DbusError(format!(
-                            "portal Settings.Read({namespace}, {key}) failed: {e}"
-                        ))
-                    })?;
-                reply
-                    .body()
-                    .deserialize()
-                    .map_err(|e| WaywiError::DbusError(e.to_string()))?
-            }
-        };
-        let mut val = owned_value_to_dbus(&raw_val);
-        while let DbusValue::Variant(inner) = val {
-            val = *inner;
-        }
-        Ok(val)
-    }
+            "ReadAll",
+            &(&[APPEARANCE_NAMESPACE][..],),
+        )
+        .await
+        .map_err(|e| WaywiError::DbusError(format!("portal Settings.ReadAll failed: {e}")))?;
+    let all: HashMap<String, HashMap<String, OwnedValue>> = reply
+        .body()
+        .deserialize()
+        .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+    Ok(parse_appearance_map(all.get(APPEARANCE_NAMESPACE)))
 }
 
 pub(crate) fn spawn_portal_settings_worker(
@@ -200,33 +218,12 @@ pub(crate) fn spawn_portal_settings_worker(
         Some(PORTAL_SETTINGS_IFACE),
         sender,
         shared,
-        |conn| async move {
-            let reply = conn
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(PORTAL_SETTINGS_IFACE),
-                    "ReadAll",
-                    &(&[APPEARANCE_NAMESPACE][..],),
-                )
-                .await
-                .ok()?;
-            let all: HashMap<String, HashMap<String, OwnedValue>> =
-                reply.body().deserialize().ok()?;
-            Some(parse_appearance_map(all.get(APPEARANCE_NAMESPACE)))
-        },
+        |conn| async move { read_portal_settings(&conn).await.ok() },
     )
 }
 
-fn unwrap_zvariant<'a>(mut val: &'a Value<'a>) -> &'a Value<'a> {
-    while let Value::Value(inner) = val {
-        val = inner;
-    }
-    val
-}
-
 fn value_as_u32(val: &Value<'_>) -> Option<u32> {
-    match unwrap_zvariant(val) {
+    match unwrap_value(val) {
         Value::U32(v) => Some(*v),
         Value::I32(v) => u32::try_from(*v).ok(),
         Value::U64(v) => u32::try_from(*v).ok(),
@@ -237,14 +234,14 @@ fn value_as_u32(val: &Value<'_>) -> Option<u32> {
 }
 
 fn value_as_accent_color(val: &Value<'_>) -> Option<PortalAccentColor> {
-    let Value::Structure(st) = unwrap_zvariant(val) else {
+    let Value::Structure(st) = unwrap_value(val) else {
         return None;
     };
     let fields = st.fields();
     if fields.len() != 3 {
         return None;
     }
-    let as_f64 = |v: &Value<'_>| match unwrap_zvariant(v) {
+    let as_f64 = |v: &Value<'_>| match unwrap_value(v) {
         Value::F64(f) => Some(*f),
         _ => None,
     };

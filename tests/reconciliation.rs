@@ -39,14 +39,14 @@ fn child_component(count: u32) -> Element<ChildMsg> {
         .child(
             Rect::new()
                 .key("btn")
-                .size(Size::px(80.logical_px(), 32.logical_px()))
+                .size((80.logical_px(), 32.logical_px()))
                 .fill(Color::rgb(40, 120, 220))
                 .on_click(ChildMsg::Pressed),
         )
         .child(
             Rect::new()
                 .key("indicator")
-                .size(Size::px(20.logical_px(), 32.logical_px()))
+                .size((20.logical_px(), 32.logical_px()))
                 .fill(if count > 0 { Color::GREEN } else { Color::GRAY }),
         )
         .into()
@@ -58,14 +58,18 @@ impl Application for ReconcileTestApp {
     type State = ReconcileState;
     type Message = ReconcileMsg;
 
-    fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         Ok(ReconcileState {
             visible: true,
             ..Default::default()
         })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             ReconcileMsg::ShowOsd => {
                 state.visible = true;
@@ -94,14 +98,14 @@ impl Application for ReconcileTestApp {
             MEMO_BUILDS.with(|c| c.set(c.get() + 1));
             Rect::new()
                 .key("inner-memo")
-                .size(Size::px(40.logical_px(), 20.logical_px()))
+                .size((40.logical_px(), 20.logical_px()))
                 .fill(Color::RED)
                 .into()
         });
 
         surfaces.push(
             Surface::floating("main-card", Output::Primary)
-                .size(Size::px(240.logical_px(), 80.logical_px()))
+                .size((240.logical_px(), 80.logical_px()))
                 .background(Color::rgba(20, 20, 30, 220))
                 .child(
                     Column::new()
@@ -114,7 +118,7 @@ impl Application for ReconcileTestApp {
 
         surfaces.push(Surface::memo("static-badge", &state.memo_version, |_v| {
             Surface::floating("static-badge-surf", Output::Primary)
-                .size(Size::px(40.logical_px(), 40.logical_px()))
+                .size((40.logical_px(), 40.logical_px()))
                 .child(Rect::new().size(Size::fill()).fill(Color::BLUE))
         }));
 
@@ -232,7 +236,7 @@ fn pointer_buttons_and_surface_drag_routing() {
     impl Application for DragApp {
         type State = DragState;
         type Message = DragMsg;
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(DragState {
                 x: 40.0,
                 y: 50.0,
@@ -246,7 +250,7 @@ fn pointer_buttons_and_surface_drag_routing() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 DragMsg::Down(ev) => match ev.button {
@@ -289,7 +293,7 @@ fn pointer_buttons_and_surface_drag_routing() {
                             x: LogicalPx(state.x),
                             y: LogicalPx(state.y),
                         })
-                        .size(Size::px(120.logical_px(), 40.logical_px()))
+                        .size((120.logical_px(), 40.logical_px()))
                         .fill(Color::rgb(60, 120, 200))
                         .on_pointer_down(DragMsg::Down),
                 );
@@ -366,14 +370,14 @@ fn headless_dispatches_hover_leave_and_click_sound() {
         type State = HoverState;
         type Message = HoverMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             #[cfg(any(
                 feature = "pipewire",
                 feature = "pulseaudio",
                 feature = "alsa",
                 feature = "audio-playback"
             ))]
-            let sound = Some(ctx.load_sound_preset(SoundPreset::Click));
+            let sound = Some(ctx.player()?.load_preset(SoundPreset::Click));
             #[cfg(not(any(
                 feature = "pipewire",
                 feature = "pulseaudio",
@@ -396,7 +400,7 @@ fn headless_dispatches_hover_leave_and_click_sound() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 HoverMsg::Hovered => state.hovered += 1,
@@ -409,7 +413,7 @@ fn headless_dispatches_hover_leave_and_click_sound() {
         fn view(state: &Self::State) -> Surfaces<Self::Message> {
             let btn = Rect::new()
                 .key("btn")
-                .size(Size::px(100.logical_px(), 40.logical_px()))
+                .size((100.logical_px(), 40.logical_px()))
                 .fill(Color::BLUE)
                 .on_hover(HoverMsg::Hovered)
                 .on_leave(HoverMsg::Left)
@@ -421,7 +425,7 @@ fn headless_dispatches_hover_leave_and_click_sound() {
                 feature = "audio-playback"
             ))]
             let btn = if let Some(snd) = state.sound {
-                btn.on_click_sound(snd).on_hover_sound_volume(snd, 0.5)
+                btn.on_click_sound(snd).on_hover_sound((snd, 0.5))
             } else {
                 btn
             };
@@ -497,14 +501,14 @@ fn auto_group_with_fill_background_hugs_intrinsic_siblings() {
         type State = HugState;
         type Message = HugMsg;
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(HugState)
         }
 
         fn update(
             _state: &mut Self::State,
             _msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             Ok(())
         }
@@ -522,7 +526,7 @@ fn auto_group_with_fill_background_hugs_intrinsic_siblings() {
                             .align(Align::Center)
                             .child(
                                 Rect::new()
-                                    .size(Size::px(40.logical_px(), 12.logical_px()))
+                                    .size((40.logical_px(), 12.logical_px()))
                                     .fill(Color::WHITE),
                             ),
                     )
@@ -587,7 +591,7 @@ fn floating_surface_resizes_dynamically_with_px_and_auto_sizes() {
         type State = ResizeState;
         type Message = ResizeMsg;
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(ResizeState {
                 year_mode: false,
                 auto_lines: 1,
@@ -597,7 +601,7 @@ fn floating_surface_resizes_dynamically_with_px_and_auto_sizes() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 ResizeMsg::ToggleYear => state.year_mode = !state.year_mode,
@@ -615,8 +619,8 @@ fn floating_surface_resizes_dynamically_with_px_and_auto_sizes() {
             };
             surfaces.push(
                 Surface::floating("calendar", Output::Primary)
-                    .anchor(Anchor::Top | Anchor::Right)
-                    .size(Size::px(w.logical_px(), h.logical_px()))
+                    .anchor(Anchor::TOP | Anchor::RIGHT)
+                    .size((w.logical_px(), h.logical_px()))
                     .child(Rect::new().size(Size::fill()).fill(Color::BLACK)),
             );
 
@@ -624,10 +628,7 @@ fn floating_surface_resizes_dynamically_with_px_and_auto_sizes() {
             for i in 0..state.auto_lines {
                 col = col.child(
                     Rect::new()
-                        .size(Size::px(
-                            ((80 + i * 30) as f32).logical_px(),
-                            20.logical_px(),
-                        ))
+                        .size((((80 + i * 30) as f32).logical_px(), 20.logical_px()))
                         .fill(Color::WHITE),
                 );
             }
@@ -714,14 +715,14 @@ fn headless_runtime_routes_ime_events_and_reconciles_ime_config() {
         type State = ImeState;
         type Message = ImeMsg;
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(ImeState::default())
         }
 
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 ImeMsg::Ime(ev) => {
@@ -744,11 +745,11 @@ fn headless_runtime_routes_ime_events_and_reconciles_ime_config() {
             let cursor_x = (state.input.before_cursor().chars().count() as f32 * 8.0).logical_px();
             s.push(
                 Surface::floating("ime-input", Output::Primary)
-                    .size(Size::px(240.logical_px(), 44.logical_px()))
+                    .size((240.logical_px(), 44.logical_px()))
                     .ime(
                         ImeConfig::enabled()
                             .from_text_input(&state.input)
-                            .cursor_rect(GeoRect::new(
+                            .cursor_rect(Bounds::new(
                                 cursor_x,
                                 8.logical_px(),
                                 2.logical_px(),
@@ -827,7 +828,7 @@ fn headless_runtime_routes_ime_events_and_reconciles_ime_config() {
     );
     assert_eq!(
         cfg.cursor_rect,
-        Some(GeoRect::new(
+        Some(Bounds::new(
             16.logical_px(),
             8.logical_px(),
             2.logical_px(),
@@ -878,7 +879,7 @@ fn headless_popup_dismiss_and_xdg_activation_capabilities() {
         type State = State;
         type Message = Msg;
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(State {
                 popup_open: true,
                 ..State::default()
@@ -888,7 +889,7 @@ fn headless_popup_dismiss_and_xdg_activation_capabilities() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 Msg::Dismissed => {
@@ -913,16 +914,17 @@ fn headless_popup_dismiss_and_xdg_activation_capabilities() {
         fn view(state: &Self::State) -> Surfaces<Self::Message> {
             let mut s = Surfaces::new();
             s.push(
-                Surface::panel("bar", Output::Primary)
-                    .size(Size::px(800.logical_px(), 32.logical_px())),
+                Surface::panel("bar", Output::Primary).size((800.logical_px(), 32.logical_px())),
             );
             if state.popup_open {
                 s.push(
                     Surface::popup("menu", "bar")
-                        .size(Size::px(160.logical_px(), 96.logical_px()))
-                        .anchor_rect(GeoRect::from_xywh(10.0, 0.0, 60.0, 32.0))
-                        .popup_anchor(PopupAnchor::BottomLeft)
-                        .popup_gravity(PopupGravity::BottomRight)
+                        .size((160.logical_px(), 96.logical_px()))
+                        .positioner(
+                            PopupPositioner::new(Bounds::from_xywh(10.0, 0.0, 60.0, 32.0))
+                                .anchor(PopupAnchor::BottomLeft)
+                                .gravity(PopupGravity::BottomRight),
+                        )
                         .on_close(Msg::Dismissed),
                 );
             }
@@ -986,4 +988,216 @@ fn headless_popup_dismiss_and_xdg_activation_capabilities() {
             .is_some_and(std::result::Result::is_err)
     );
     assert!(rt2.activated_surfaces().is_empty());
+}
+
+#[test]
+fn typed_keys_avoid_double_hashing_on_passthrough() {
+    let ek = ElementKey::from_hashable(&"btn-primary");
+    assert_eq!(ek.into_element_key(), ek);
+    assert_eq!("btn-primary".into_element_key(), ek);
+
+    let sk = SurfaceKey::from_hashable(&("panel", 1u32));
+    assert_eq!(sk.into_surface_key(), sk);
+    assert_eq!(("panel", 1u32).into_surface_key(), sk);
+
+    let subk = SubscriptionKey::from_hashable(&"cpu-tick");
+    assert_eq!(subk.into_subscription_key(), subk);
+    assert_eq!("cpu-tick".into_subscription_key(), subk);
+}
+
+#[test]
+fn nested_memo_with_capturing_closures_preserves_entries_and_zero_arena_fallbacks() {
+    thread_local! {
+        static OUTER_BUILDS: Cell<usize> = const { Cell::new(0) };
+        static INNER_BUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Default)]
+    struct NestedState {
+        outer_ver: u32,
+        inner_ver: u32,
+        unrelated: u32,
+        clicks: u32,
+    }
+
+    #[derive(Clone)]
+    enum NestedMsg {
+        BumpUnrelated,
+        BumpOuter,
+        Clicked(u32),
+    }
+
+    struct NestedApp;
+    impl Application for NestedApp {
+        type State = NestedState;
+        type Message = NestedMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(NestedState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                NestedMsg::BumpUnrelated => state.unrelated += 1,
+                NestedMsg::BumpOuter => state.outer_ver += 1,
+                NestedMsg::Clicked(v) => state.clicks += v,
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let inner_ver = state.inner_ver;
+            let outer_ver = state.outer_ver;
+            let outer = Element::memo("outer-memo", &outer_ver, move |&ov| {
+                OUTER_BUILDS.with(|c| c.set(c.get() + 1));
+                let captured = ov + 7;
+                let inner = Element::memo("inner-memo", &inner_ver, move |&_iv| {
+                    INNER_BUILDS.with(|c| c.set(c.get() + 1));
+                    Rect::new()
+                        .key("inner-btn")
+                        .size((48.logical_px(), 24.logical_px()))
+                        .fill(Color::BLUE)
+                        .on_pointer_down(move |_| NestedMsg::Clicked(captured))
+                        .into()
+                });
+                Column::new().child(inner).into()
+            });
+
+            let mut surfaces = Surfaces::new();
+            surfaces.push(
+                Surface::floating("nested-host", Output::Primary)
+                    .size((120.logical_px(), 64.logical_px()))
+                    .child(outer),
+            );
+            surfaces
+        }
+    }
+
+    OUTER_BUILDS.with(|c| c.set(0));
+    INNER_BUILDS.with(|c| c.set(0));
+
+    let mut rt = HeadlessRuntime::<NestedApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+    assert_eq!(OUTER_BUILDS.with(Cell::get), 1);
+    assert_eq!(INNER_BUILDS.with(Cell::get), 1);
+
+    // 8 consecutive unrelated updates hitting outer memo must preserve inner memo across
+    // `prune_stale()` AND produce 0 FrameArenaPool heap fallbacks (no slab pinning!).
+    for _ in 0..8 {
+        rt.enqueue(NestedMsg::BumpUnrelated);
+        rt.step().unwrap();
+        assert_eq!(rt.arena_heap_fallbacks(), 0);
+    }
+    assert_eq!(OUTER_BUILDS.with(Cell::get), 1);
+    assert_eq!(INNER_BUILDS.with(Cell::get), 1);
+
+    // Invalidating outer memo while inner_ver stays constant must hit inner memo!
+    rt.enqueue(NestedMsg::BumpOuter);
+    rt.step().unwrap();
+    assert_eq!(OUTER_BUILDS.with(Cell::get), 2);
+    assert_eq!(INNER_BUILDS.with(Cell::get), 1);
+}
+
+#[test]
+fn memory_config_presets_trim_memory_and_headless_async_image_delivery() {
+    assert_eq!(
+        MemoryConfig::low_memory().default_buffer_retention,
+        BufferRetention::ReleaseAfterCommit
+    );
+    assert_eq!(
+        MemoryConfig::low_memory().default_asset_retention,
+        AssetRetention::ReclaimAfterPresent
+    );
+    assert!(
+        MemoryConfig::high_throughput().text_max_cached_buffers
+            > MemoryConfig::balanced().text_max_cached_buffers
+    );
+
+    #[derive(Default)]
+    struct MemState {
+        async_done: bool,
+        async_err: bool,
+        trimmed: bool,
+    }
+
+    #[derive(Clone)]
+    enum MemMsg {
+        RequestMissingAsync,
+        AsyncLoaded(bool),
+        Trim,
+    }
+
+    struct MemApp;
+    impl Application for MemApp {
+        type State = MemState;
+        type Message = MemMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            assert_eq!(
+                ctx.memory_config().default_asset_retention,
+                AssetRetention::ReclaimAfterPresent
+            );
+            Ok(MemState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                MemMsg::RequestMissingAsync => {
+                    ctx.load_image_async("/nonexistent/waywi-v021-test.png", |res| {
+                        MemMsg::AsyncLoaded(res.is_err())
+                    });
+                }
+                MemMsg::AsyncLoaded(is_err) => {
+                    state.async_done = true;
+                    state.async_err = is_err;
+                }
+                MemMsg::Trim => {
+                    ctx.trim_memory();
+                    state.trimmed = true;
+                }
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            Surfaces::none()
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<MemApp>::with_memory(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+        RendererPreference::Auto,
+        MemoryConfig::low_memory(),
+    )
+    .unwrap();
+
+    rt.enqueue(MemMsg::RequestMissingAsync);
+    rt.step().unwrap();
+    // Poll briefly until background worker returns the error result to HeadlessRuntime.
+    for _ in 0..50 {
+        if rt.state().async_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        rt.step().unwrap();
+    }
+    assert!(rt.state().async_done);
+    assert!(rt.state().async_err);
+
+    rt.enqueue(MemMsg::Trim);
+    rt.step().unwrap();
+    assert!(rt.state().trimmed);
+    rt.trim_memory();
 }

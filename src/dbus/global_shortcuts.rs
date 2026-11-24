@@ -1,16 +1,19 @@
 //! XDG Desktop Portal Global Shortcuts (`org.freedesktop.portal.GlobalShortcuts`) support.
 
+use std::any::TypeId;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::arena::FrameSharedFn;
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionKey, SubscriptionSpec};
 
-use super::client::DbusClient;
+use super::portal_settings::PortalClient;
 use super::types::{Dbus, DbusBus};
-use super::worker::AsyncStopSignal;
+use super::worker::{AsyncStopSignal, DbusWorkerHandle};
 
 const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -55,7 +58,7 @@ pub struct BoundGlobalShortcut {
     pub trigger_description: String,
 }
 
-/// Event produced by a [`GlobalShortcuts::subscribe`] subscription.
+/// Event produced by a [`Dbus::global_shortcuts`] subscription.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalShortcutEvent {
@@ -67,27 +70,27 @@ pub enum GlobalShortcutEvent {
     Error(String),
 }
 
-/// XDG Desktop Portal global shortcut subscription builder.
-pub struct GlobalShortcuts;
+fn hash_global_shortcuts_key(
+    app_id: &str,
+    shortcuts: &[GlobalShortcutDescriptor],
+) -> SubscriptionKey {
+    let mut hasher = DefaultHasher::new();
+    TypeId::of::<(String, Vec<GlobalShortcutDescriptor>)>().hash(&mut hasher);
+    app_id.hash(&mut hasher);
+    shortcuts.hash(&mut hasher);
+    SubscriptionKey(hasher.finish())
+}
 
-impl GlobalShortcuts {
+impl Dbus {
     /// Opens an `org.freedesktop.portal.GlobalShortcuts` session, binds `shortcuts`, and streams
     /// compositor shortcut activations cleanly without global X11 grabs.
-    pub fn subscribe<M: 'static>(
+    pub fn global_shortcuts<M: 'static>(
         app_id: impl Into<String>,
         shortcuts: Vec<GlobalShortcutDescriptor>,
         map: impl Fn(GlobalShortcutEvent) -> M + 'static,
     ) -> Subscription<M> {
         let app_id = app_id.into();
-        let mut shortcut_keys = Vec::with_capacity(shortcuts.len() + 1);
-        shortcut_keys.push(app_id.clone());
-        for s in &shortcuts {
-            shortcut_keys.push(format!(
-                "{}:{}:{:?}",
-                s.id, s.description, s.preferred_trigger
-            ));
-        }
-        let key = shortcut_keys.join("|").into_subscription_key();
+        let key = hash_global_shortcuts_key(&app_id, &shortcuts);
         Subscription {
             spec: SubscriptionSpec::GlobalShortcuts {
                 key,
@@ -99,36 +102,24 @@ impl GlobalShortcuts {
     }
 }
 
-impl Dbus {
-    /// Convenience alias for [`GlobalShortcuts::subscribe`].
-    pub fn global_shortcuts<M: 'static>(
-        app_id: impl Into<String>,
-        shortcuts: Vec<GlobalShortcutDescriptor>,
-        map: impl Fn(GlobalShortcutEvent) -> M + 'static,
-    ) -> Subscription<M> {
-        GlobalShortcuts::subscribe(app_id, shortcuts, map)
-    }
-}
-
-impl DbusClient {
-    /// Probes whether `org.freedesktop.portal.GlobalShortcuts` is exported by the session portal.
+impl PortalClient<'_> {
+    /// Probes synchronously whether `org.freedesktop.portal.GlobalShortcuts` is exported by the
+    /// session portal.
     #[must_use]
-    pub fn has_global_shortcuts_portal(&self) -> bool {
-        self.get_property(
-            DbusBus::Session,
-            PORTAL_DEST,
-            PORTAL_PATH,
-            PORTAL_GS_IFACE,
-            "version",
-        )
-        .is_ok()
+    pub fn has_global_shortcuts_blocking(&self) -> bool {
+        self.0
+            .get_property(
+                DbusBus::Session,
+                PORTAL_DEST,
+                PORTAL_PATH,
+                PORTAL_GS_IFACE,
+                "version",
+            )
+            .is_ok()
     }
 }
 
-pub(crate) struct GlobalShortcutsWorker {
-    stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
-}
+pub(crate) struct GlobalShortcutsWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl GlobalShortcutsWorker {
     pub(crate) fn spawn(
@@ -136,26 +127,14 @@ impl GlobalShortcutsWorker {
         shortcuts: Vec<GlobalShortcutDescriptor>,
         sender: calloop::channel::Sender<GlobalShortcutEvent>,
     ) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-global-shortcuts".to_owned())
-            .spawn(move || {
+        Self(DbusWorkerHandle::spawn(
+            "waywi-global-shortcuts",
+            move |stop_sig| {
                 futures_lite::future::block_on(run_portal_worker(
                     app_id, shortcuts, sender, stop_sig,
                 ));
-            })
-            .ok();
-        Self { stop, join }
-    }
-}
-
-impl Drop for GlobalShortcutsWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+            },
+        ))
     }
 }
 
@@ -491,5 +470,19 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "toggle-overlay");
         assert_eq!(list[0].trigger_description, "Super+O");
+    }
+
+    #[test]
+    fn hashes_global_shortcut_keys_deterministically() {
+        let a = vec![GlobalShortcutDescriptor::new("toggle", "Toggle").preferred_trigger("LOGO+o")];
+        let b = vec![GlobalShortcutDescriptor::new("toggle", "Toggle").preferred_trigger("LOGO+p")];
+        assert_eq!(
+            hash_global_shortcuts_key("org.example.App", &a),
+            hash_global_shortcuts_key("org.example.App", &a)
+        );
+        assert_ne!(
+            hash_global_shortcuts_key("org.example.App", &a),
+            hash_global_shortcuts_key("org.example.App", &b)
+        );
     }
 }

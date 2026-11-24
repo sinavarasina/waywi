@@ -23,6 +23,7 @@ pub(crate) struct AssetCache {
     hash_index: HashMap<u64, AssetId>,
     evicted_count: usize,
     reclaimable_count: usize,
+    default_retention: AssetRetention,
 }
 
 impl Default for AssetCache {
@@ -33,6 +34,10 @@ impl Default for AssetCache {
 
 impl AssetCache {
     pub(crate) fn new() -> Self {
+        Self::with_default_retention(AssetRetention::KeepDecoded)
+    }
+
+    pub(crate) fn with_default_retention(default_retention: AssetRetention) -> Self {
         Self {
             next_id: 1,
             next_revision: 1,
@@ -42,6 +47,7 @@ impl AssetCache {
             hash_index: HashMap::new(),
             evicted_count: 0,
             reclaimable_count: 0,
+            default_retention,
         }
     }
 
@@ -125,6 +131,10 @@ impl AssetCache {
         } else {
             self.path_index.insert(canonical.clone(), id);
         }
+        let retention = self.default_retention;
+        if retention == AssetRetention::ReclaimAfterPresent {
+            self.reclaimable_count += 1;
+        }
         self.hash_index.insert(cache_hash, id);
         self.entries.insert(
             id,
@@ -139,7 +149,7 @@ impl AssetCache {
                     min_svg_px: effective_svg_px,
                 },
                 content_hash: cache_hash,
-                retention: AssetRetention::KeepDecoded,
+                retention,
             },
         );
         Ok(asset)
@@ -147,6 +157,62 @@ impl AssetCache {
 
     pub(crate) fn load_bytes(&mut self, bytes: &[u8]) -> Result<ImageAsset> {
         self.load_bytes_sized(bytes, 0)
+    }
+
+    pub(crate) fn load_static_bytes(&mut self, bytes: &'static [u8]) -> Result<ImageAsset> {
+        self.load_static_bytes_sized(bytes, 0)
+    }
+
+    pub(crate) fn load_static_bytes_sized(
+        &mut self,
+        bytes: &'static [u8],
+        min_svg_px: u32,
+    ) -> Result<ImageAsset> {
+        let format = detect_format(bytes, None)?;
+        let base_hash = hash_bytes(bytes);
+        let (effective_svg_px, cache_hash) = svg_sized_hash(base_hash, format, min_svg_px);
+
+        if let Some(&existing_id) = self.hash_index.get(&cache_hash)
+            && let Some(entry) = self.entries.get(&existing_id)
+        {
+            return Ok(ImageAsset {
+                id: existing_id,
+                width: entry.width,
+                height: entry.height,
+            });
+        }
+
+        let revision = self.alloc_revision();
+        let decoded = decode_image_bytes_sized(bytes, format, effective_svg_px, revision)?;
+        let id = self.alloc_id();
+        let asset = ImageAsset {
+            id,
+            width: decoded.width,
+            height: decoded.height,
+        };
+        let retention = self.default_retention;
+        if retention == AssetRetention::ReclaimAfterPresent {
+            self.reclaimable_count += 1;
+        }
+        self.hash_index.insert(cache_hash, id);
+        self.entries.insert(
+            id,
+            CacheEntry {
+                width: decoded.width,
+                height: decoded.height,
+                revision,
+                format: Some(format),
+                image: Some(decoded),
+                source: AssetSource::StaticBytes {
+                    bytes,
+                    format,
+                    min_svg_px: effective_svg_px,
+                },
+                content_hash: cache_hash,
+                retention,
+            },
+        );
+        Ok(asset)
     }
 
     pub(crate) fn load_bytes_sized(&mut self, bytes: &[u8], min_svg_px: u32) -> Result<ImageAsset> {
@@ -172,6 +238,10 @@ impl AssetCache {
             width: decoded.width,
             height: decoded.height,
         };
+        let retention = self.default_retention;
+        if retention == AssetRetention::ReclaimAfterPresent {
+            self.reclaimable_count += 1;
+        }
         self.hash_index.insert(cache_hash, id);
         self.entries.insert(
             id,
@@ -187,7 +257,7 @@ impl AssetCache {
                     min_svg_px: effective_svg_px,
                 },
                 content_hash: cache_hash,
-                retention: AssetRetention::KeepDecoded,
+                retention,
             },
         );
         Ok(asset)
@@ -240,7 +310,6 @@ impl AssetCache {
                     height,
                     pixels: Arc::from(premultiplied_rgba),
                     revision,
-                    animated_frames: None,
                 }),
                 source: AssetSource::RawPixels,
                 content_hash,
@@ -407,6 +476,14 @@ impl AssetCache {
             path: p,
             min_svg_px: 0,
         });
+        let retention = if source.is_reclaimable() {
+            self.default_retention
+        } else {
+            AssetRetention::KeepDecoded
+        };
+        if retention == AssetRetention::ReclaimAfterPresent {
+            self.reclaimable_count += 1;
+        }
         self.entries.insert(
             id,
             CacheEntry {
@@ -417,7 +494,7 @@ impl AssetCache {
                 image: Some(decoded),
                 source,
                 content_hash,
-                retention: AssetRetention::KeepDecoded,
+                retention,
             },
         );
         asset
@@ -504,6 +581,18 @@ impl AssetCache {
                 };
                 decode_image_bytes_sized(bytes, *format, effective_svg_px, entry.revision)?
             }
+            AssetSource::StaticBytes {
+                bytes,
+                format,
+                min_svg_px,
+            } => {
+                let effective_svg_px = if *format == ImageFormat::Svg {
+                    *min_svg_px
+                } else {
+                    0
+                };
+                decode_image_bytes_sized(bytes, *format, effective_svg_px, entry.revision)?
+            }
             AssetSource::RawPixels => {
                 return Err(WaywiError::AssetDecode(format!(
                     "raw pixel asset {id:?} has no re-decodable backing source"
@@ -517,7 +606,20 @@ impl AssetCache {
         Ok(())
     }
 
-    /// Ensures every evicted `Image` or `Sprite` asset referenced by `commands` has its decoded
+    /// Evicts decoded pixel buffers for every reclaimable asset currently resident in RAM.
+    pub(crate) fn trim_reclaimable(&mut self) -> Vec<AssetId> {
+        let mut evicted = Vec::new();
+        for (&id, entry) in &mut self.entries {
+            if entry.source.is_reclaimable() && entry.image.is_some() {
+                entry.image = None;
+                self.evicted_count += 1;
+                evicted.push(id);
+            }
+        }
+        evicted
+    }
+
+    /// Ensures every evicted `Image` asset referenced by `commands` has its decoded
     /// RGBA8 pixels resident before constructing a `FrameScene`.
     ///
     /// Fast path: single branch (`O(1)`) when no cached assets are currently evicted.
@@ -526,11 +628,10 @@ impl AssetCache {
             return;
         }
         for cmd in commands {
-            let id = match &cmd.payload {
-                PaintPayload::Image { asset, .. } => asset.id,
-                PaintPayload::Sprite { sheet, .. } => sheet.asset.id,
-                _ => continue,
+            let PaintPayload::Image { asset, .. } = &cmd.payload else {
+                continue;
             };
+            let id = asset.id;
             if self.entries.get(&id).is_some_and(|e| e.image.is_none()) {
                 let _ = self.ensure_decoded(id);
                 if self.evicted_count == 0 {
@@ -553,11 +654,10 @@ impl AssetCache {
             return;
         }
         for cmd in commands {
-            let id = match &cmd.payload {
-                PaintPayload::Image { asset, .. } => asset.id,
-                PaintPayload::Sprite { sheet, .. } => sheet.asset.id,
-                _ => continue,
+            let PaintPayload::Image { asset, .. } = &cmd.payload else {
+                continue;
             };
+            let id = asset.id;
             if self.entries.get(&id).is_some_and(|e| {
                 e.retention == AssetRetention::ReclaimAfterPresent && e.image.is_some()
             }) {
@@ -604,13 +704,7 @@ impl AssetCache {
         self.entries
             .values()
             .filter_map(|e| e.image.as_ref())
-            .map(|img| {
-                let extra: usize = img
-                    .animated_frames
-                    .as_ref()
-                    .map_or(0, |frames| frames.iter().map(|f| f.pixels.len()).sum());
-                img.pixels.len() + extra
-            })
+            .map(|img| img.pixels.len())
             .sum()
     }
 

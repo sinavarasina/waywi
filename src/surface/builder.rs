@@ -1,14 +1,14 @@
 use crate::accessibility::{AccessibleProps, AccessibleRole};
 use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
-use crate::geometry::{Edges, Length, LogicalPx, Rect as GeoRect, Size};
+use crate::geometry::{Edges, Length, LogicalPx, Size};
 use crate::input::{ElementKey, ImeConfig, ImeEvent, KeyEvent, PointerEvent};
-use crate::render::{Color, Element, check_memo, set_memo_surface_hash};
+use crate::render::{Color, Element, begin_memo_check, set_memo_surface_hash};
 use crate::text::SharedStr;
 
 use super::types::{
-    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, PopupAnchor,
-    PopupConstraintAdjustment, PopupGravity, PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind,
+    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer,
+    PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind,
 };
 
 /// Wayland surface specification returned from `view(state)`.
@@ -25,7 +25,7 @@ pub struct Surface<M = ()> {
     pub(crate) exclusive_zone: i32,
     pub(crate) keyboard_interactivity: KeyboardInteractivity,
     pub(crate) input_mode: InputMode,
-    pub(crate) buffer_retention: BufferRetention,
+    pub(crate) buffer_retention: Option<BufferRetention>,
     pub(crate) popup: Option<PopupSpec>,
     pub(crate) visible: bool,
     pub(crate) background: Color,
@@ -47,32 +47,32 @@ impl<M: 'static> Surface<M> {
         set_memo_surface_hash(key.0);
         let (anchor, size, input_mode, layer) = match kind {
             SurfaceKind::Panel => (
-                Anchor::Top | Anchor::Left | Anchor::Right,
+                Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
                 Size::new(Length::Fill, LogicalPx(36.0)),
                 InputMode::Full,
                 Layer::Top,
             ),
             SurfaceKind::Floating => (
                 Anchor::empty(),
-                Size::px(LogicalPx(200.0), LogicalPx(64.0)),
+                Size::new(LogicalPx(200.0), LogicalPx(64.0)),
                 InputMode::Full,
                 Layer::Overlay,
             ),
             SurfaceKind::Overlay => (
-                Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+                Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                 Size::fill(),
                 InputMode::Selective,
                 Layer::Overlay,
             ),
             SurfaceKind::Window => (
                 Anchor::empty(),
-                Size::px(LogicalPx(480.0), LogicalPx(320.0)),
+                Size::new(LogicalPx(480.0), LogicalPx(320.0)),
                 InputMode::Full,
                 Layer::Top,
             ),
             SurfaceKind::Popup => (
                 Anchor::empty(),
-                Size::px(LogicalPx(200.0), LogicalPx(120.0)),
+                Size::new(LogicalPx(200.0), LogicalPx(120.0)),
                 InputMode::Full,
                 Layer::Overlay,
             ),
@@ -88,12 +88,12 @@ impl<M: 'static> Surface<M> {
             exclusive_zone: 0,
             keyboard_interactivity: KeyboardInteractivity::None,
             input_mode,
-            buffer_retention: BufferRetention::Retain,
+            buffer_retention: None,
             popup: None,
             visible: true,
             background: Color::TRANSPARENT,
-            title: SharedStr::from_static("waywi"),
-            namespace: SharedStr::from_static("waywi"),
+            title: SharedStr::EMPTY,
+            namespace: SharedStr::EMPTY,
             a11y: AccessibleProps::default(),
             children: FrameVec::new(),
             on_close: None,
@@ -154,60 +154,10 @@ impl<M: 'static> Surface<M> {
         self
     }
 
-    /// Replaces the full [`PopupPositioner`] for a [`Self::popup`] surface.
+    /// Replaces the [`PopupPositioner`] for a [`Self::popup`] surface.
     pub fn positioner(mut self, positioner: PopupPositioner) -> Self {
         if let Some(ref mut spec) = self.popup {
             spec.positioner = positioner;
-        }
-        self
-    }
-
-    /// Sets the parent-local logical anchor rectangle for a [`Self::popup`] surface.
-    pub fn anchor_rect(mut self, rect: GeoRect) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.anchor_rect = rect;
-        }
-        self
-    }
-
-    /// Sets the anchor point on the parent anchor rectangle for a [`Self::popup`] surface.
-    pub fn popup_anchor(mut self, anchor: PopupAnchor) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.anchor = anchor;
-        }
-        self
-    }
-
-    /// Sets the growth gravity direction for a [`Self::popup`] surface.
-    pub fn popup_gravity(mut self, gravity: PopupGravity) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.gravity = gravity;
-        }
-        self
-    }
-
-    /// Sets the logical `(dx, dy)` offset for a [`Self::popup`] surface.
-    pub fn popup_offset(mut self, dx: LogicalPx, dy: LogicalPx) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.offset_x = dx;
-            spec.positioner.offset_y = dy;
-        }
-        self
-    }
-
-    /// Sets compositor edge constraint-adjustment flags (`FLIP`/`SLIDE`/`RESIZE`) for a
-    /// [`Self::popup`] surface.
-    pub fn popup_constraints(mut self, flags: PopupConstraintAdjustment) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.constraint_adjustment = flags;
-        }
-        self
-    }
-
-    /// Enables or disables `xdg_positioner.set_reactive` on a [`Self::popup`] surface.
-    pub fn popup_reactive(mut self, reactive: bool) -> Self {
-        if let Some(ref mut spec) = self.popup {
-            spec.positioner.reactive = reactive;
         }
         self
     }
@@ -234,14 +184,14 @@ impl<M: 'static> Surface<M> {
         let surf_key = key.into_surface_key();
         set_memo_surface_hash(surf_key.0);
         // Reserve ElementKey(0) under `surf_key.0` for surface-level memoization.
-        if check_memo(ElementKey(0), dep) {
-            let mut hit = Self::new_base(surf_key, SurfaceKind::Floating, Output::Primary);
-            hit.memo_hit = true;
-            hit
-        } else {
+        if let Some(_build_guard) = begin_memo_check(ElementKey(0), dep) {
             let mut built = build(dep);
             built.key = surf_key;
             built
+        } else {
+            let mut hit = Self::new_base(surf_key, SurfaceKind::Floating, Output::Primary);
+            hit.memo_hit = true;
+            hit
         }
     }
 
@@ -292,7 +242,7 @@ impl<M: 'static> Surface<M> {
     /// surfaces so client SHM memory drops back to zero bytes once the compositor releases the
     /// committed buffer.
     pub fn buffer_retention(mut self, retention: BufferRetention) -> Self {
-        self.buffer_retention = retention;
+        self.buffer_retention = Some(retention);
         self
     }
 

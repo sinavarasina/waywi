@@ -5,7 +5,18 @@ use serde::Deserialize;
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
+
+/// Typed keyboard layout switch action for [`HyprlandClient::switch_keyboard_layout_for`](super::HyprlandClient::switch_keyboard_layout_for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyboardLayoutSwitch {
+    /// Advance to the next configured XKB layout (`"next"`).
+    Next,
+    /// Step back to the previous configured XKB layout (`"prev"`).
+    Prev,
+    /// Jump directly to a zero-based XKB layout index.
+    Index(u32),
+}
 
 /// Typed Hyprland workspace identifier.
 ///
@@ -452,7 +463,7 @@ pub struct ClientInfo {
     /// Initial window title recorded when the window first mapped (`initialTitle`).
     pub initial_title: String,
     /// Workspace that currently owns the window.
-    pub workspace: WorkspaceRefJson,
+    pub workspace: HyprlandWorkspaceRef,
     /// Monitor ID owning the window, or `None` when unassigned (`-1`).
     pub monitor: Option<i64>,
     /// Client process ID (`pid`), or `None` when absent or non-positive (`-1` / `0`).
@@ -517,7 +528,7 @@ struct ClientInfoJson {
     #[serde(default, rename = "initialTitle")]
     initial_title: String,
     #[serde(default)]
-    workspace: WorkspaceRefJson,
+    workspace: HyprlandWorkspaceRef,
     #[serde(default)]
     monitor: Option<i64>,
     #[serde(default)]
@@ -612,7 +623,7 @@ fn normalize_content_type(raw: &str) -> Option<String> {
 /// Lightweight workspace reference embedded in [`ClientInfo::workspace`] and
 /// [`MonitorInfo::active_workspace`] / [`MonitorInfo::special_workspace`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
-pub struct WorkspaceRefJson {
+pub struct HyprlandWorkspaceRef {
     #[serde(default)]
     pub id: i32,
     #[serde(default)]
@@ -623,7 +634,7 @@ pub struct WorkspaceRefJson {
     pub name: String,
 }
 
-impl WorkspaceRefJson {
+impl HyprlandWorkspaceRef {
     /// Returns `true` when this reference is unset/empty (e.g., an inactive `specialWorkspace`
     /// on `j/monitors`).
     #[inline]
@@ -689,9 +700,9 @@ pub struct MonitorInfo {
     #[serde(default)]
     pub disabled: bool,
     #[serde(rename = "activeWorkspace", default)]
-    pub active_workspace: WorkspaceRefJson,
+    pub active_workspace: HyprlandWorkspaceRef,
     #[serde(rename = "specialWorkspace", default)]
-    pub special_workspace: WorkspaceRefJson,
+    pub special_workspace: HyprlandWorkspaceRef,
 }
 
 fn default_scale() -> f32 {
@@ -1032,6 +1043,15 @@ pub enum HyprlandEvent {
     },
 }
 
+impl HyprlandEvent {
+    /// Parses a single Hyprland `socket2` event line (`NAME>>DATA`) safely without panicking on
+    /// unknown or malformed lines.
+    #[must_use]
+    pub fn parse_line(line: &str) -> Option<Self> {
+        super::stream::parse_event_line(line)
+    }
+}
+
 /// Hyprland subscription helper (`Hyprland::subscribe(...)`).
 pub struct Hyprland;
 
@@ -1040,7 +1060,6 @@ impl Hyprland {
     pub fn subscribe<M: 'static>(map: impl Fn(HyprlandEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::HyprlandEvent {
-                key: "hyprland-socket2".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
@@ -1363,7 +1382,7 @@ mod tests {
         assert_eq!(rules[1].gaps_in, Some([4, 4, 4, 4]));
         assert_eq!(rules[1].gaps_out, Some([106, 192, 106, 192]));
 
-        let special_ref: WorkspaceRefJson = serde_json::from_str(
+        let special_ref: HyprlandWorkspaceRef = serde_json::from_str(
             r#"{"address":"special:magic","type":"special","name":"special:magic"}"#,
         )
         .unwrap();
@@ -1371,7 +1390,7 @@ mod tests {
         assert!(special_ref.is_special());
         assert_eq!(special_ref.special_name(), Some("magic"));
 
-        let empty_ref: WorkspaceRefJson =
+        let empty_ref: HyprlandWorkspaceRef =
             serde_json::from_str(r#"{"address":"","type":"","name":""}"#).unwrap();
         assert!(empty_ref.is_empty());
         assert!(!empty_ref.is_special());

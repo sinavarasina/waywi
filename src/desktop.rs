@@ -6,12 +6,15 @@
 //! `DBusActivatable` metadata, `XDG_ACTIVATION_TOKEN` handoff, and XDG Icon Theme lookup across
 //! user and system icon themes with `index.theme` inheritance.
 
+use std::ffi::OsStr;
+use std::path::PathBuf;
+
 pub mod entry;
 pub mod icons;
 pub mod xdg;
 
 pub use entry::{
-    DesktopAction, DesktopEntry, DesktopSearchMatch, default_application_dirs,
+    DesktopAction, DesktopEntry, DesktopSearchMatch, LaunchOptions, default_application_dirs,
     filter_launcher_entries, find_desktop_entry, parse_desktop_entry, scan_desktop_entries,
     scan_desktop_entries_in, search_desktop_entries, search_desktop_entries_with_weights,
 };
@@ -19,36 +22,52 @@ pub use icons::{
     IconThemeInfo, XdgIconLookup, default_icon_dirs, detect_active_icon_theme,
     parse_icon_theme_index, resolve_icon_path,
 };
-pub use xdg::{
-    XdgBaseDirs, XdgUserDirs, xdg_cache_home, xdg_config_dirs, xdg_config_home, xdg_data_dirs,
-    xdg_data_home, xdg_runtime_dir, xdg_state_home,
-};
+pub use xdg::{XdgBaseDirs, XdgUserDirs};
+
+/// Configuration for detached child process spawning via [`spawn_with`] and [`spawn_shell`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpawnOptions {
+    pub working_dir: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+
+impl SpawnOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
 
 /// Spawns `program` with `args` detached in its own session (`setsid`) with stdio redirected to
-/// `/dev/null` and reaps the child in a background thread on exit so it never becomes a zombie.
-pub fn spawn_detached(program: &str, args: &[&str]) -> crate::error::Result<()> {
-    spawn_detached_in(program, args, None)
+/// `/dev/null`, reaps the child in a background thread on exit so it never becomes a zombie, and
+/// returns the spawned child PID.
+pub fn spawn_detached(
+    program: impl AsRef<OsStr>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> crate::error::Result<u32> {
+    spawn_with(program, args, &SpawnOptions::default())
 }
 
-/// Spawns `program` with `args` and optional `working_dir` detached in its own session (`setsid`)
-/// with stdio redirected to `/dev/null`, reaping the child on exit.
-pub fn spawn_detached_in(
-    program: &str,
-    args: &[&str],
-    working_dir: Option<&std::path::Path>,
-) -> crate::error::Result<()> {
-    spawn_detached_with_env(program, args, working_dir, &[])
-}
-
-/// Spawns `program` with `args`, optional `working_dir`, and child-only environment variables
-/// (such as `XDG_ACTIVATION_TOKEN`) detached in its own session (`setsid`), reaping the child on
-/// exit.
-pub fn spawn_detached_with_env(
-    program: &str,
-    args: &[&str],
-    working_dir: Option<&std::path::Path>,
-    env_vars: &[(&str, &str)],
-) -> crate::error::Result<()> {
+/// Spawns `program` with `args` and explicit [`SpawnOptions`] (optional `working_dir` and
+/// child-only environment variables) detached in its own session (`setsid`), reaps the child on
+/// exit, and returns the spawned child PID.
+pub fn spawn_with(
+    program: impl AsRef<OsStr>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    options: &SpawnOptions,
+) -> crate::error::Result<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -57,10 +76,10 @@ pub fn spawn_detached_with_env(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(dir) = working_dir {
+    if let Some(ref dir) = options.working_dir {
         cmd.current_dir(dir);
     }
-    for &(k, v) in env_vars {
+    for (k, v) in &options.env {
         cmd.env(k, v);
     }
     // SAFETY: `setsid()` is async-signal-safe and called in `pre_exec` before exec.
@@ -73,17 +92,19 @@ pub fn spawn_detached_with_env(
         });
     }
     let mut child = cmd.spawn()?;
+    let pid = child.id();
     let _ = std::thread::Builder::new()
         .name("waywi-reaper".to_string())
         .spawn(move || {
             let _ = child.wait();
         });
-    Ok(())
+    Ok(pid)
 }
 
-/// Spawns a shell command (`sh -c <command>`) detached in its own session and reaps it on exit.
-pub fn spawn_shell_detached(command: &str) -> crate::error::Result<()> {
-    spawn_detached("sh", &["-c", command])
+/// Spawns a shell command (`sh -c <command>`) detached in its own session with `options`, reaps
+/// it on exit, and returns the spawned child PID.
+pub fn spawn_shell(command: &str, options: &SpawnOptions) -> crate::error::Result<u32> {
+    spawn_with("sh", ["-c", command], options)
 }
 
 #[cfg(test)]
@@ -92,8 +113,15 @@ mod tests {
 
     #[test]
     fn spawn_detached_reaps_short_lived_child_and_reports_missing_binary() {
-        assert!(spawn_detached("/nonexistent-waywi-binary-check", &[]).is_err());
-        assert!(spawn_detached("true", &[]).is_ok());
+        assert!(
+            spawn_detached(
+                "/nonexistent-waywi-binary-check",
+                std::iter::empty::<&str>()
+            )
+            .is_err()
+        );
+        let pid = spawn_detached("true", std::iter::empty::<&str>()).expect("spawn true");
+        assert!(pid > 0);
 
         // Give the reaper thread a brief window to wait() on `true` and confirm no zombie child remains.
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -105,11 +133,19 @@ mod tests {
     }
 
     #[test]
-    fn spawn_detached_in_applies_working_dir_and_errors_on_missing_dir() {
+    fn spawn_with_and_spawn_shell_apply_working_dir_and_env() {
         let missing = std::env::temp_dir().join("waywi-nonexistent-workdir-check");
-        assert!(spawn_detached_in("true", &[], Some(&missing)).is_err());
+        let bad_opts = SpawnOptions::new().working_dir(&missing);
+        assert!(spawn_with("true", std::iter::empty::<&str>(), &bad_opts).is_err());
 
         let tmp = std::env::temp_dir();
-        assert!(spawn_detached_in("true", &[], Some(&tmp)).is_ok());
+        let good_opts = SpawnOptions::new()
+            .working_dir(&tmp)
+            .env("WAYWI_TEST_VAR", "1");
+        let pid = spawn_with("true", std::iter::empty::<&str>(), &good_opts).expect("spawn_with");
+        assert!(pid > 0);
+
+        let shell_pid = spawn_shell("true", &good_opts).expect("spawn_shell");
+        assert!(shell_pid > 0);
     }
 }

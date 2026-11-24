@@ -44,8 +44,6 @@ pub mod display;
 pub mod effect;
 pub mod error;
 pub mod geometry;
-#[cfg(feature = "hyprland-ipc")]
-pub use compositor::hyprland;
 #[cfg(feature = "idle-notify")]
 pub mod idle;
 pub mod image;
@@ -55,15 +53,13 @@ pub mod render;
 pub mod sprite;
 pub mod subscription;
 pub mod surface;
-#[cfg(feature = "sway-ipc")]
-pub use compositor::sway;
 pub mod system;
 pub mod text;
 pub mod timer;
 
-pub use app::{App, Application, HeadlessRuntime};
+pub use app::{App, Application, HeadlessRuntime, MemoryConfig};
 pub use capabilities::{Capabilities, Capability};
-pub use display::{Output, OutputId, OutputInfo};
+pub use display::{Output, OutputId, OutputInfo, OutputTransform};
 pub use effect::EffectCtx;
-pub use error::{Result, WaywiError};
+pub use error::{ErrorKind, Result, WaywiError};
 pub use surface::{Surface, Surfaces};

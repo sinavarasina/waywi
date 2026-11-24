@@ -111,14 +111,33 @@ impl Size {
             height: Length::Auto,
         }
     }
+}
 
+impl<W: Into<Length>, H: Into<Length>> From<(W, H)> for Size {
     #[inline]
-    #[must_use]
-    pub const fn px(width: LogicalPx, height: LogicalPx) -> Self {
-        Self {
-            width: Length::Px(width),
-            height: Length::Px(height),
-        }
+    fn from((w, h): (W, H)) -> Self {
+        Self::new(w, h)
+    }
+}
+
+impl From<LogicalSize> for Size {
+    #[inline]
+    fn from(size: LogicalSize) -> Self {
+        Self::new(size.width, size.height)
+    }
+}
+
+impl From<LogicalPx> for Edges {
+    #[inline]
+    fn from(all: LogicalPx) -> Self {
+        Self::all(all)
+    }
+}
+
+impl From<(LogicalPx, LogicalPx)> for Edges {
+    #[inline]
+    fn from((vertical, horizontal): (LogicalPx, LogicalPx)) -> Self {
+        Self::symmetric(vertical, horizontal)
     }
 }
 

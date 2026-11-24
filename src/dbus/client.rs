@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
@@ -10,17 +11,21 @@ use zbus::zvariant::{
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
-use super::bluetooth::BluetoothSnapshot;
-use super::logind::LogindSnapshot;
-use super::modem::ModemSnapshot;
-use super::mpris::MprisSnapshot;
-use super::network_manager::NetworkManagerSnapshot;
-use super::power_profiles::PowerProfileSnapshot;
+use super::bluetooth::{BluetoothClient, BluetoothSnapshot};
+use super::idle_privacy::{GeoClueClient, ScreenSaverClient};
+use super::logind::{LogindClient, LogindSnapshot};
+use super::modem::{ModemClient, ModemSnapshot};
+use super::mpris::{MprisClient, MprisSnapshot};
+use super::network_manager::{NetworkManagerClient, NetworkManagerSnapshot};
+use super::notifications::NotificationsClient;
+use super::portal_settings::PortalClient;
+use super::power_profiles::{PowerProfileSnapshot, PowerProfilesClient};
+use super::tray::{TrayClient, TrayEvent, TrayItemSnapshot};
 use super::types::{Dbus, DbusBus, DbusValue};
-use super::udisks::UDisksSnapshot;
-use super::upower::UPowerSnapshot;
+use super::udisks::{UDisksClient, UDisksSnapshot};
+use super::upower::{UPowerClient, UPowerSnapshot};
 use super::worker::AsyncStopSignal;
 
 /// Shared async `zbus::Connection` slot reused across [`DbusClient`] and D-Bus observer workers.
@@ -95,43 +100,20 @@ impl DbusActionLane {
     }
 }
 
-/// Optional structured return metadata from a completed background D-Bus action.
+/// Typed reply payload returned by a completed asynchronous [`DbusClient`] action.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct DbusActionPayload {
-    pub(crate) reply_object_path: Option<String>,
-    pub(crate) count: Option<usize>,
-    pub(crate) reply: Vec<DbusValue>,
+pub enum DbusActionReply {
+    #[default]
+    Unit,
+    ObjectPath(String),
+    MountPath(PathBuf),
+    Count(usize),
+    Values(Vec<DbusValue>),
 }
 
-impl DbusActionPayload {
-    pub(crate) fn with_object_path(path: String) -> Self {
-        Self {
-            reply_object_path: Some(path),
-            count: None,
-            reply: Vec::new(),
-        }
-    }
-
-    pub(crate) fn with_count(count: usize) -> Self {
-        Self {
-            reply_object_path: None,
-            count: Some(count),
-            reply: Vec::new(),
-        }
-    }
-
-    pub(crate) fn with_reply(reply: Vec<DbusValue>) -> Self {
-        Self {
-            reply_object_path: None,
-            count: None,
-            reply,
-        }
-    }
-}
-
-impl From<()> for DbusActionPayload {
+impl From<()> for DbusActionReply {
     fn from((): ()) -> Self {
-        Self::default()
+        Self::Unit
     }
 }
 
@@ -148,15 +130,8 @@ pub struct DbusActionResult {
     pub operation: String,
     /// Target D-Bus object path, bus name, or SSID associated with the action.
     pub target: String,
-    /// Optional D-Bus object path returned by the method reply (such as the `ActiveConnection`
-    /// object path from [`DbusClient::nm_connect_wifi`], [`DbusClient::nm_connect_hidden_wifi`],
-    /// or [`DbusClient::nm_activate_connection`]).
-    pub reply_object_path: Option<String>,
-    /// Optional item count returned by the operation (such as the number of deleted saved Wi-Fi
-    /// profiles from [`DbusClient::nm_forget_wifi_ssid`]).
-    pub count: Option<usize>,
-    /// Decoded D-Bus reply body values returned by generic [`DbusClient::call_method`] calls.
-    pub reply: Vec<DbusValue>,
+    /// Typed reply payload returned by the completed D-Bus action.
+    pub reply: DbusActionReply,
     /// `None` when the D-Bus call succeeded within its timeout, or `Some(message)` when the
     /// D-Bus call failed or timed out at runtime.
     pub error: Option<String>,
@@ -192,7 +167,6 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusActionResults {
-                key: "dbus:action-results".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
@@ -200,58 +174,49 @@ impl Dbus {
 }
 
 #[derive(Default)]
+struct ActionOutboxState {
+    recent: VecDeque<DbusActionResult>,
+    sender: Option<calloop::channel::Sender<DbusActionResult>>,
+}
+
+#[derive(Default)]
 pub(crate) struct DbusActionOutbox {
-    recent: Mutex<VecDeque<DbusActionResult>>,
-    last_error: Mutex<Option<String>>,
-    sender: Mutex<Option<calloop::channel::Sender<DbusActionResult>>>,
+    state: Mutex<ActionOutboxState>,
 }
 
 impl DbusActionOutbox {
     fn record(&self, result: DbusActionResult) {
-        if let Some(ref err) = result.error
-            && let Ok(mut g) = self.last_error.lock()
-        {
-            *g = Some(err.clone());
-        }
-        if let Ok(mut q) = self.recent.lock() {
-            if q.len() >= LANE_CAPACITY {
-                q.pop_front();
+        if let Ok(mut st) = self.state.lock() {
+            if let Some(ref tx) = st.sender {
+                let _ = tx.send(result);
+            } else {
+                if st.recent.len() >= LANE_CAPACITY {
+                    st.recent.pop_front();
+                }
+                st.recent.push_back(result);
             }
-            q.push_back(result.clone());
-        }
-        if let Ok(g) = self.sender.lock()
-            && let Some(ref tx) = *g
-        {
-            let _ = tx.send(result);
         }
     }
 
-    fn drain_results(&self) -> Vec<DbusActionResult> {
-        let Ok(mut q) = self.recent.lock() else {
-            return Vec::new();
-        };
-        q.drain(..).collect()
+    fn attach(&self, sender: calloop::channel::Sender<DbusActionResult>) {
+        if let Ok(mut st) = self.state.lock() {
+            for item in st.recent.drain(..) {
+                let _ = sender.send(item);
+            }
+            st.sender = Some(sender);
+        }
     }
 
-    fn last_result(&self) -> Option<DbusActionResult> {
-        let Ok(q) = self.recent.lock() else {
-            return None;
-        };
-        q.back().cloned()
+    fn detach(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.sender = None;
+        }
     }
 
-    fn last_error(&self) -> Option<String> {
-        let Ok(g) = self.last_error.lock() else {
-            return None;
-        };
-        g.clone()
-    }
-
-    fn take_last_error(&self) -> Option<String> {
-        let Ok(mut g) = self.last_error.lock() else {
-            return None;
-        };
-        g.take()
+    fn clear(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.recent.clear();
+        }
     }
 }
 
@@ -264,27 +229,18 @@ impl DbusActionResultWorker {
         sender: calloop::channel::Sender<DbusActionResult>,
         outbox: Arc<DbusActionOutbox>,
     ) -> Self {
-        if let Ok(q) = outbox.recent.lock() {
-            for item in q.iter() {
-                let _ = sender.send(item.clone());
-            }
-        }
-        if let Ok(mut g) = outbox.sender.lock() {
-            *g = Some(sender);
-        }
+        outbox.attach(sender);
         Self { outbox }
     }
 }
 
 impl Drop for DbusActionResultWorker {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.outbox.sender.lock() {
-            *g = None;
-        }
+        self.outbox.detach();
     }
 }
 
-type BoxedDbusFuture = Pin<Box<dyn Future<Output = Result<DbusActionPayload>> + Send + 'static>>;
+type BoxedDbusFuture = Pin<Box<dyn Future<Output = Result<DbusActionReply>> + Send + 'static>>;
 type BoxedDbusJob = Box<dyn FnOnce(zbus::Connection) -> BoxedDbusFuture + Send + 'static>;
 
 /// Metadata describing a single queued D-Bus lane action.
@@ -498,20 +454,16 @@ fn run_lane_thread(
                     bus: item.bus,
                     operation: item.operation,
                     target: item.target,
-                    reply_object_path: None,
-                    count: None,
-                    reply: Vec::new(),
+                    reply: DbusActionReply::Unit,
                     error: Some(err_msg),
                 }
             }
-            LaneExecOutcome::Finished(Ok(payload)) => DbusActionResult {
+            LaneExecOutcome::Finished(Ok(reply)) => DbusActionResult {
                 lane,
                 bus: item.bus,
                 operation: item.operation,
                 target: item.target,
-                reply_object_path: payload.reply_object_path,
-                count: payload.count,
-                reply: payload.reply,
+                reply,
                 error: None,
             },
             LaneExecOutcome::Finished(Err(err)) => DbusActionResult {
@@ -519,9 +471,7 @@ fn run_lane_thread(
                 bus: item.bus,
                 operation: item.operation,
                 target: item.target,
-                reply_object_path: None,
-                count: None,
-                reply: Vec::new(),
+                reply: DbusActionReply::Unit,
                 error: Some(err.to_string()),
             },
         };
@@ -643,7 +593,7 @@ fn run_shared_timer_thread(shared: Arc<(Mutex<SharedTimerState>, Condvar)>) {
 }
 
 enum LaneExecOutcome {
-    Finished(Result<DbusActionPayload>),
+    Finished(Result<DbusActionReply>),
     TimedOut,
     Stopped,
 }
@@ -722,7 +672,7 @@ impl DbusActionPool {
 
     pub(crate) fn submit<P, F, Fut>(&self, spec: LaneActionSpec, f: F) -> Result<()>
     where
-        P: Into<DbusActionPayload> + Send + 'static,
+        P: Into<DbusActionReply> + Send + 'static,
         F: FnOnce(zbus::Connection) -> Fut + Send + 'static,
         Fut: Future<Output = Result<P>> + Send + 'static,
     {
@@ -744,9 +694,7 @@ impl Drop for DbusActionPool {
     }
 }
 
-/// Shared in-memory cache of the latest snapshots observed by D-Bus background workers, so UI
-/// queries (`mpris_snapshot`, `bluetooth_snapshot`, `network_manager_snapshot`, etc.) read the
-/// latest snapshot directly instead of issuing D-Bus calls.
+/// Shared in-memory cache of the latest snapshots observed by D-Bus background workers.
 #[derive(Default)]
 pub(crate) struct DbusSnapshotCache {
     pub(crate) mpris: RwLock<Option<Vec<MprisSnapshot>>>,
@@ -757,13 +705,72 @@ pub(crate) struct DbusSnapshotCache {
     pub(crate) power_profiles: RwLock<Option<PowerProfileSnapshot>>,
     pub(crate) logind: RwLock<Option<LogindSnapshot>>,
     pub(crate) modem: RwLock<Option<ModemSnapshot>>,
+    pub(crate) tray: RwLock<Option<Vec<TrayItemSnapshot>>>,
 }
 
-/// D-Bus client backed by `zbus` (bounded per-domain action lanes + shared snapshot cache +
-/// dedicated async-io subscription workers).
+impl DbusSnapshotCache {
+    pub(crate) fn clear(&self) {
+        if let Ok(mut g) = self.mpris.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.bluetooth.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.network_manager.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.upower.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.udisks.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.power_profiles.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.logind.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.modem.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.tray.write() {
+            *g = None;
+        }
+    }
+
+    pub(crate) fn apply_tray_event(&self, event: &TrayEvent) {
+        let Ok(mut guard) = self.tray.write() else {
+            return;
+        };
+        match event {
+            TrayEvent::WatcherReady { .. } => {
+                if guard.is_none() {
+                    *guard = Some(Vec::new());
+                }
+            }
+            TrayEvent::ItemRegistered(item) | TrayEvent::ItemUpdated(item) => {
+                let items = guard.get_or_insert_with(Vec::new);
+                if let Some(existing) = items.iter_mut().find(|x| x.service == item.service) {
+                    *existing = item.clone();
+                } else {
+                    items.push(item.clone());
+                    items.sort_by(|a, b| a.service.cmp(&b.service));
+                }
+            }
+            TrayEvent::ItemUnregistered { service } => {
+                if let Some(items) = guard.as_mut() {
+                    items.retain(|x| x.service != *service);
+                }
+            }
+            TrayEvent::Error(_) => {}
+        }
+    }
+}
+
+/// D-Bus client backed by async `zbus::Connection` (bounded per-domain action lanes + shared
+/// snapshot cache + dedicated async-io subscription workers).
 pub struct DbusClient {
-    session: RwLock<Option<zbus::blocking::Connection>>,
-    system: RwLock<Option<zbus::blocking::Connection>>,
     shared_session: DbusSharedBus,
     shared_system: DbusSharedBus,
     action_pool: DbusActionPool,
@@ -771,6 +778,8 @@ pub struct DbusClient {
     pub(crate) cache: Arc<DbusSnapshotCache>,
     pub(crate) notifications_state: Arc<super::notifications::NotificationServerState>,
     pub(crate) bluetooth_agent_pending: super::bluetooth::PendingAgentMap,
+    cache_snapshots: bool,
+    idle_disconnect: bool,
 }
 
 impl Default for DbusClient {
@@ -782,14 +791,17 @@ impl Default for DbusClient {
 impl DbusClient {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_config(true, true)
+    }
+
+    #[must_use]
+    pub(crate) fn with_config(cache_snapshots: bool, idle_disconnect: bool) -> Self {
         let shared_session = Arc::new(Mutex::new(None));
         let shared_system = Arc::new(Mutex::new(None));
         let action_pool =
             DbusActionPool::new(Arc::clone(&shared_session), Arc::clone(&shared_system));
         let action_outbox = Arc::clone(&action_pool.outbox);
         Self {
-            session: RwLock::new(None),
-            system: RwLock::new(None),
             shared_session,
             shared_system,
             action_pool,
@@ -797,6 +809,29 @@ impl DbusClient {
             cache: Arc::new(DbusSnapshotCache::default()),
             notifications_state: Arc::new(super::notifications::NotificationServerState::default()),
             bluetooth_agent_pending: Arc::new(Mutex::new(HashMap::new())),
+            cache_snapshots,
+            idle_disconnect,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn cache_enabled(&self) -> bool {
+        self.cache_snapshots
+    }
+
+    /// Clears cached D-Bus snapshots and buffered action results, and drops cached shared bus
+    /// connections when idle disconnect is enabled so unused connections close once no worker
+    /// holds a clone.
+    pub fn trim_cache(&self) {
+        self.cache.clear();
+        self.action_outbox.clear();
+        if self.idle_disconnect {
+            if let Ok(mut g) = self.shared_session.lock() {
+                *g = None;
+            }
+            if let Ok(mut g) = self.shared_system.lock() {
+                *g = None;
+            }
         }
     }
 
@@ -807,60 +842,120 @@ impl DbusClient {
         }
     }
 
-    /// Drains buffered asynchronous [`DbusActionResult`] outcomes completed on background lanes.
-    #[must_use]
-    pub fn drain_action_results(&self) -> Vec<DbusActionResult> {
-        self.action_outbox.drain_results()
-    }
-
-    /// Returns the most recently completed [`DbusActionResult`], if any.
-    #[must_use]
-    pub fn last_action_result(&self) -> Option<DbusActionResult> {
-        self.action_outbox.last_result()
-    }
-
-    /// Returns the most recent runtime error from a background D-Bus action lane, if any.
-    #[must_use]
-    pub fn last_action_error(&self) -> Option<String> {
-        self.action_outbox.last_error()
-    }
-
-    /// Takes and clears the most recent runtime error from a background D-Bus action lane.
-    #[must_use]
-    pub fn take_last_action_error(&self) -> Option<String> {
-        self.action_outbox.take_last_error()
+    pub(super) fn async_connection(&self, bus: DbusBus) -> Result<zbus::Connection> {
+        let slot = match bus {
+            DbusBus::Session => &self.shared_session,
+            DbusBus::System => &self.shared_system,
+        };
+        connect_shared_bus(bus, slot)
     }
 
     /// Schedules a bounded, timeout-protected asynchronous D-Bus action described by `spec`.
     pub(crate) fn submit_lane_action<P, F, Fut>(&self, spec: LaneActionSpec, f: F) -> Result<()>
     where
-        P: Into<DbusActionPayload> + Send + 'static,
+        P: Into<DbusActionReply> + Send + 'static,
         F: FnOnce(zbus::Connection) -> Fut + Send + 'static,
         Fut: Future<Output = Result<P>> + Send + 'static,
     {
         self.action_pool.submit(spec, f)
     }
 
-    pub(super) fn connection(&self, bus: DbusBus) -> Result<zbus::blocking::Connection> {
-        let slot = match bus {
-            DbusBus::Session => &self.session,
-            DbusBus::System => &self.system,
-        };
-        if let Ok(guard) = slot.read()
-            && let Some(ref conn) = *guard
-        {
-            return Ok(conn.clone());
-        }
-        let shared = self.shared_bus(bus);
-        let async_conn = connect_shared_bus(bus, &shared)?;
-        let conn = zbus::blocking::Connection::from(async_conn);
-        if let Ok(mut guard) = slot.write() {
-            *guard = Some(conn.clone());
-        }
-        Ok(conn)
+    // ---- Zero-cost Copy domain sub-handles ----
+
+    /// Returns the MPRIS media player domain handle (`org.mpris.MediaPlayer2`).
+    #[inline]
+    #[must_use]
+    pub fn mpris(&self) -> MprisClient<'_> {
+        MprisClient(self)
     }
 
-    /// Reads a D-Bus property via `org.freedesktop.DBus.Properties.Get`.
+    /// Returns the NetworkManager domain handle (`org.freedesktop.NetworkManager`).
+    #[inline]
+    #[must_use]
+    pub fn nm(&self) -> NetworkManagerClient<'_> {
+        NetworkManagerClient(self)
+    }
+
+    /// Returns the BlueZ Bluetooth domain handle (`org.bluez`).
+    #[inline]
+    #[must_use]
+    pub fn bluetooth(&self) -> BluetoothClient<'_> {
+        BluetoothClient(self)
+    }
+
+    /// Returns the UDisks2 storage domain handle (`org.freedesktop.UDisks2`).
+    #[inline]
+    #[must_use]
+    pub fn udisks(&self) -> UDisksClient<'_> {
+        UDisksClient(self)
+    }
+
+    /// Returns the systemd-logind session/power domain handle (`org.freedesktop.login1`).
+    #[inline]
+    #[must_use]
+    pub fn logind(&self) -> LogindClient<'_> {
+        LogindClient(self)
+    }
+
+    /// Returns the StatusNotifier system tray domain handle.
+    #[inline]
+    #[must_use]
+    pub fn tray(&self) -> TrayClient<'_> {
+        TrayClient(self)
+    }
+
+    /// Returns the XDG Desktop Notifications server domain handle (`org.freedesktop.Notifications`).
+    #[inline]
+    #[must_use]
+    pub fn notifications(&self) -> NotificationsClient<'_> {
+        NotificationsClient(self)
+    }
+
+    /// Returns the power-profiles-daemon domain handle.
+    #[inline]
+    #[must_use]
+    pub fn power_profiles(&self) -> PowerProfilesClient<'_> {
+        PowerProfilesClient(self)
+    }
+
+    /// Returns the UPower battery/peripheral domain handle (`org.freedesktop.UPower`).
+    #[inline]
+    #[must_use]
+    pub fn upower(&self) -> UPowerClient<'_> {
+        UPowerClient(self)
+    }
+
+    /// Returns the ModemManager cellular modem domain handle (`org.freedesktop.ModemManager1`).
+    #[inline]
+    #[must_use]
+    pub fn modem(&self) -> ModemClient<'_> {
+        ModemClient(self)
+    }
+
+    /// Returns the XDG Desktop Portal settings/capabilities domain handle.
+    #[inline]
+    #[must_use]
+    pub fn portal(&self) -> PortalClient<'_> {
+        PortalClient(self)
+    }
+
+    /// Returns the `org.freedesktop.ScreenSaver` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn screensaver(&self) -> ScreenSaverClient<'_> {
+        ScreenSaverClient(self)
+    }
+
+    /// Returns the `org.freedesktop.GeoClue2` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn geoclue(&self) -> GeoClueClient<'_> {
+        GeoClueClient(self)
+    }
+
+    // ---- Core raw D-Bus operations ----
+
+    /// Reads a D-Bus property synchronously via `org.freedesktop.DBus.Properties.Get`.
     pub fn get_property(
         &self,
         bus: DbusBus,
@@ -869,40 +964,58 @@ impl DbusClient {
         interface: &str,
         property: &str,
     ) -> Result<DbusValue> {
-        let conn = self.connection(bus)?;
-        let proxy = zbus::blocking::fdo::PropertiesProxy::builder(&conn)
-            .destination(destination)
-            .and_then(|b| b.path(path))
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?
-            .build()
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        let iface_name = zbus::names::InterfaceName::try_from(interface)
-            .map_err(|e| WaywiError::DbusError(e.to_string()))?;
-        let val = proxy
-            .get(iface_name, property)
-            .map_err(|e| WaywiError::DbusError(format!("property read failed: {e}")))?;
-        Ok(owned_value_to_dbus(&val))
+        let dest = validate_bus_name(destination, "destination")?;
+        let path_owned = validate_object_path(path, "object path")?;
+        let iface = validate_bus_name(interface, "interface")?;
+        let prop = validate_bus_name(property, "property")?;
+        let conn = self.async_connection(bus)?;
+        futures_lite::future::block_on(async move {
+            let reply = conn
+                .call_method(
+                    Some(dest.as_str()),
+                    path_owned.as_str(),
+                    Some("org.freedesktop.DBus.Properties"),
+                    "Get",
+                    &(iface.as_str(), prop.as_str()),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("property read failed: {e}")))?;
+            let val: OwnedValue = reply
+                .body()
+                .deserialize()
+                .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+            Ok(owned_value_to_dbus(&val))
+        })
     }
 
-    /// Enqueues a zero-argument D-Bus method call on the appropriate domain lane.
-    pub fn call_method_unit(
+    /// Enqueues a D-Bus property write via `org.freedesktop.DBus.Properties.Set` using a typed
+    /// [`DbusValue`].
+    pub fn set_property(
         &self,
         bus: DbusBus,
         destination: &str,
         path: &str,
         interface: &str,
-        method: &str,
+        property: &str,
+        value: &DbusValue,
     ) -> Result<()> {
-        let lane = classify_target_lane(destination, interface);
-        self.call_lane_method_unit(lane, bus, destination, path, interface, method)
+        let owned = dbus_value_to_owned(value.unwrap_variant())?;
+        self.set_property_zvariant(
+            bus,
+            destination,
+            path,
+            interface,
+            property,
+            Value::from(owned),
+        )
     }
 
-    /// Enqueues a generic D-Bus method call with typed [`DbusValue`] arguments on the appropriate
-    /// domain lane.
+    /// Enqueues a generic D-Bus method call with typed [`DbusValue`] arguments (including empty
+    /// `&[]` for zero-argument methods) on the appropriate domain lane.
     ///
-    /// Arguments are validated and encoded synchronously before enqueuing so invalid values (such
-    /// as malformed [`DbusValue::ObjectPath`]) fail immediately. Decoded reply arguments are
-    /// delivered asynchronously via [`DbusActionResult::reply`] on [`Dbus::action_results`].
+    /// Arguments are validated and encoded synchronously before enqueuing so invalid values fail
+    /// immediately. Decoded reply arguments are delivered asynchronously via
+    /// [`DbusActionResult::reply`] on [`Dbus::action_results`].
     pub fn call_method(
         &self,
         bus: DbusBus,
@@ -946,7 +1059,12 @@ impl DbusClient {
                 .map_err(|e| {
                     WaywiError::DbusError(format!("{iface}.{method_owned} failed: {e}"))
                 })?;
-                Ok(DbusActionPayload::with_reply(decode_message_body(&msg)))
+                let values = decode_message_body(&msg);
+                if values.is_empty() {
+                    Ok(DbusActionReply::Unit)
+                } else {
+                    Ok(DbusActionReply::Values(values))
+                }
             },
         )
     }
@@ -967,49 +1085,31 @@ impl DbusClient {
         let iface = validate_bus_name(interface, "interface")?;
         let method_owned = validate_bus_name(method, "method")?;
         let encoded_args = encode_dbus_args(args)?;
-        let conn = self.connection(bus)?;
-        let msg = if encoded_args.is_empty() {
-            conn.call_method(
-                Some(dest.as_str()),
-                path_owned.as_str(),
-                Some(iface.as_str()),
-                method_owned.as_str(),
-                &(),
-            )
-        } else {
-            let body = args_to_structure(encoded_args)?;
-            conn.call_method(
-                Some(dest.as_str()),
-                path_owned.as_str(),
-                Some(iface.as_str()),
-                method_owned.as_str(),
-                &body,
-            )
-        }
-        .map_err(|e| WaywiError::DbusError(format!("{iface}.{method_owned} failed: {e}")))?;
-        Ok(decode_message_body(&msg))
-    }
-
-    /// Enqueues a D-Bus property write via `org.freedesktop.DBus.Properties.Set` using a typed
-    /// [`DbusValue`].
-    pub fn set_property_value(
-        &self,
-        bus: DbusBus,
-        destination: &str,
-        path: &str,
-        interface: &str,
-        property: &str,
-        value: &DbusValue,
-    ) -> Result<()> {
-        let owned = dbus_value_to_owned(value.unwrap_variant())?;
-        self.set_property(
-            bus,
-            destination,
-            path,
-            interface,
-            property,
-            Value::from(owned),
-        )
+        let conn = self.async_connection(bus)?;
+        futures_lite::future::block_on(async move {
+            let msg = if encoded_args.is_empty() {
+                conn.call_method(
+                    Some(dest.as_str()),
+                    path_owned.as_str(),
+                    Some(iface.as_str()),
+                    method_owned.as_str(),
+                    &(),
+                )
+                .await
+            } else {
+                let body = args_to_structure(encoded_args)?;
+                conn.call_method(
+                    Some(dest.as_str()),
+                    path_owned.as_str(),
+                    Some(iface.as_str()),
+                    method_owned.as_str(),
+                    &body,
+                )
+                .await
+            }
+            .map_err(|e| WaywiError::DbusError(format!("{iface}.{method_owned} failed: {e}")))?;
+            Ok(decode_message_body(&msg))
+        })
     }
 
     pub(crate) fn call_lane_method_unit(
@@ -1047,8 +1147,8 @@ impl DbusClient {
     }
 
     /// Enqueues a D-Bus property write via `org.freedesktop.DBus.Properties.Set` on the
-    /// appropriate domain lane.
-    pub(super) fn set_property(
+    /// appropriate domain lane using a raw `zvariant::Value`.
+    pub(super) fn set_property_zvariant(
         &self,
         bus: DbusBus,
         destination: &str,
@@ -1287,51 +1387,71 @@ mod tests {
     }
 
     #[test]
-    fn records_action_results_errors_and_timeouts() {
-        let outbox = DbusActionOutbox::default();
+    fn outbox_drains_once_on_attach_and_streams_without_buffering() {
+        let outbox = Arc::new(DbusActionOutbox::default());
         outbox.record(DbusActionResult {
             lane: DbusActionLane::NetworkManager,
             bus: DbusBus::System,
             operation: "NetworkManager.AddAndActivateConnection".to_owned(),
             target: "Example_WiFi".to_owned(),
-            reply_object_path: Some(
+            reply: DbusActionReply::ObjectPath(
                 "/org/freedesktop/NetworkManager/ActiveConnection/9".to_owned(),
             ),
-            count: None,
-            reply: Vec::new(),
             error: None,
         });
-        assert!(outbox.last_result().is_some_and(|r| r.is_ok()));
-        assert!(outbox.last_error().is_none());
 
+        let (tx1, rx1) = calloop::channel::channel();
+        let worker1 = DbusActionResultWorker::spawn(tx1, Arc::clone(&outbox));
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx1.try_recv().is_err());
+
+        // While attached, recorded results stream directly without growing `recent`.
         outbox.record(DbusActionResult {
             lane: DbusActionLane::BluetoothDevice,
             bus: DbusBus::System,
             operation: "Device1.Connect".to_owned(),
             target: "/org/bluez/hci0/dev_11_22_33_44_55_66".to_owned(),
-            reply_object_path: None,
-            count: None,
-            reply: Vec::new(),
+            reply: DbusActionReply::Unit,
             error: Some("Device1.Connect failed: Host is down".to_owned()),
         });
-        assert!(outbox.last_result().is_some_and(|r| r.is_err()));
-        assert_eq!(
-            outbox.take_last_error().as_deref(),
-            Some("Device1.Connect failed: Host is down")
-        );
-        assert!(outbox.last_error().is_none());
-        assert_eq!(outbox.drain_results().len(), 2);
+        let streamed = rx1.try_recv().expect("streamed live while attached");
+        assert!(streamed.is_err());
+        assert!(outbox.state.lock().unwrap().recent.is_empty());
+
+        drop(worker1);
+
+        // Re-attaching must never replay already-delivered results.
+        let (tx2, rx2) = calloop::channel::channel();
+        let _worker2 = DbusActionResultWorker::spawn(tx2, Arc::clone(&outbox));
+        assert!(rx2.try_recv().is_err());
 
         let timer = SharedDbusTimer::new();
         let stop = AsyncStopSignal::new();
         let outcome = run_with_timeout_or_stop(
-            Box::pin(async { futures_lite::future::pending::<Result<DbusActionPayload>>().await }),
+            Box::pin(async { futures_lite::future::pending::<Result<DbusActionReply>>().await }),
             Duration::from_millis(25),
             &stop,
             &timer,
         );
         timer.shutdown();
         assert!(matches!(outcome, LaneExecOutcome::TimedOut));
+    }
+
+    #[test]
+    fn trim_cache_clears_snapshots_and_respects_config() {
+        let client = DbusClient::with_config(false, true);
+        assert!(!client.cache_enabled());
+
+        *client.cache.upower.write().unwrap() = Some(UPowerSnapshot {
+            on_battery: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            client.upower().cached_snapshot().map(|s| s.on_battery),
+            Some(true)
+        );
+        client.trim_cache();
+        assert!(client.upower().cached_snapshot().is_none());
     }
 
     #[test]
@@ -1373,7 +1493,7 @@ mod tests {
                 DbusValue::String("alpha".to_owned()),
                 DbusValue::String("beta".to_owned()),
             ]),
-            DbusValue::Dict(props.clone()),
+            DbusValue::Dict(props),
         ];
         let encoded = encode_dbus_args(&multi_input).unwrap();
         let body = args_to_structure(encoded).unwrap();

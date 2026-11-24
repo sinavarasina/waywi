@@ -2,26 +2,28 @@
 //! subscription, and runtime types.
 
 pub use crate::accessibility::AccessibleRole;
-pub use crate::app::{App, Application, HeadlessRuntime};
+pub use crate::app::{App, Application, HeadlessRuntime, MemoryConfig};
 pub use crate::capabilities::{Capabilities, Capability};
 #[cfg(feature = "clipboard")]
 pub use crate::clipboard::{Clipboard, ClipboardEvent, ClipboardSelection, ClipboardSnapshot};
 pub use crate::desktop::{
-    DesktopAction, DesktopEntry, DesktopSearchMatch, XdgBaseDirs, XdgIconLookup, XdgUserDirs,
-    filter_launcher_entries, resolve_icon_path, scan_desktop_entries, search_desktop_entries,
-    search_desktop_entries_with_weights, spawn_detached, spawn_detached_in,
-    spawn_detached_with_env, spawn_shell_detached,
+    DesktopAction, DesktopEntry, DesktopSearchMatch, LaunchOptions, SpawnOptions, XdgBaseDirs,
+    XdgIconLookup, XdgUserDirs, filter_launcher_entries, resolve_icon_path, scan_desktop_entries,
+    search_desktop_entries, search_desktop_entries_with_weights, spawn_detached, spawn_shell,
+    spawn_with,
 };
-pub use crate::display::{Output, OutputId, OutputInfo};
+pub use crate::display::{Output, OutputId, OutputInfo, OutputTransform};
 pub use crate::effect::EffectCtx;
-pub use crate::error::{Result, WaywiError};
+pub use crate::error::{ErrorKind, Result, WaywiError};
 pub use crate::geometry::{
-    Bounds, BufferPx, BufferRect, Edges, ElementAnchor, GeoRect, Length, LogicalPx, LogicalPxExt,
+    Bounds, BufferPx, BufferRect, Edges, ElementAnchor, Length, LogicalPx, LogicalPxExt,
     LogicalSize, Percent, PercentExt, Point, Position, ScaleFactor, Size, Transform,
 };
 #[cfg(feature = "idle-notify")]
 pub use crate::idle::{Idle, IdleEvent};
-pub use crate::image::{AssetRetention, Image, ImageAsset, ImageFilter, ImageFit, SourceRect};
+pub use crate::image::{
+    AssetId, AssetRetention, Image, ImageAsset, ImageFilter, ImageFit, SourceRect,
+};
 pub use crate::input::{
     ElementKey, ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit,
     ImeSurroundingText, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout,
@@ -40,11 +42,11 @@ pub use crate::surface::{
     Surfaces,
 };
 pub use crate::system::{
-    BacklightDevice, BatteryInfo, BrightnessSnapshot, ByteSize, CalendarDayCell, CalendarMonth,
-    CalendarRow, DataRate, DdcMonitorInfo, FreqUnit, LocalDateTime, NetInterfaceKind,
-    NetInterfaceSnapshot, NetLinkState, NetworkSnapshot, PrivacyAccessEntry, PrivacyAccessKind,
-    PrivacyAccessSource, PrivacySnapshot, RateUnit, SnapshotState, System, TimeFormat,
-    TimeSnapshot, UsbDevice, read_usb_devices, read_usb_devices_from,
+    BacklightDevice, BatteryInfo, BatterySnapshot, BrightnessSnapshot, ByteSize, CalendarDayCell,
+    CalendarMonth, CalendarRow, DataRate, DdcMonitorInfo, FreqUnit, LocalDateTime,
+    NetInterfaceKind, NetInterfaceSnapshot, NetLinkState, NetworkSnapshot, PrivacyAccessEntry,
+    PrivacyAccessKind, PrivacyAccessSource, PrivacySnapshot, RateUnit, SnapshotState, System,
+    ThermalSnapshot, TimeFormat, TimeSnapshot, UsbDevice,
 };
 pub use crate::text::{
     Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextBoundsMode, TextCursorMetrics,
@@ -54,8 +56,9 @@ pub use crate::timer::Timer;
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use crate::audio::{
-    Audio, AudioCapture, AudioCard, AudioChannelPosition, AudioClient, AudioDevice, AudioEvent,
-    AudioPort, AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream,
+    Audio, AudioCard, AudioChannelPosition, AudioClient, AudioDevice, AudioDirection, AudioEvent,
+    AudioPort, AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream,
+    AudioTarget, AudioVolume,
 };
 #[cfg(any(
     feature = "pipewire",
@@ -63,43 +66,40 @@ pub use crate::audio::{
     feature = "alsa",
     feature = "audio-playback"
 ))]
-pub use crate::audio::{AudioPlayer, SoundAsset, SoundData, SoundPreset};
+pub use crate::audio::{AudioPlayer, SoundAsset, SoundData, SoundId, SoundPlay, SoundPreset};
 
 #[cfg(feature = "control-ipc")]
 pub use crate::control::{Control, ControlRequest, Signal};
 
 #[cfg(feature = "hyprland-ipc")]
-pub use crate::hyprland::{
+pub use crate::compositor::hyprland::{
     ClientInfo, CursorPos, Hyprland, HyprlandClient, HyprlandDevices, HyprlandEvent,
     HyprlandKeyboard, HyprlandLayout, HyprlandMouse, HyprlandOption, HyprlandOptionValue,
-    HyprlandVersion, MonitorInfo, WorkspaceId, WorkspaceInfo, WorkspaceRuleInfo, WorkspaceType,
+    HyprlandVersion, HyprlandWorkspaceRef, KeyboardLayoutSwitch, MonitorInfo, WorkspaceId,
+    WorkspaceInfo, WorkspaceRuleInfo, WorkspaceType,
 };
 
 #[cfg(feature = "sway-ipc")]
-pub use crate::sway::{Sway, SwayClient, SwayEvent, SwayOutput, SwayWorkspace, WorkspaceRef};
+pub use crate::compositor::sway::{Sway, SwayClient, SwayEvent, SwayOutput, SwayWorkspace};
 
 #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
-pub use crate::compositor::{CompositorClient, CompositorWorkspace, WorkspaceTarget};
+pub use crate::compositor::{
+    Compositor, CompositorClient, CompositorEvent, CompositorWorkspace, WorkspaceTarget,
+};
 
 #[cfg(feature = "dbus")]
 pub use crate::dbus::{
-    BluetoothAdapter, BluetoothAgentEvent, BluetoothAgentRequest, BluetoothDevice,
-    BluetoothSnapshot, BluetoothTransportFilter, Dbus, DbusBus, DbusClient, DbusSignalEvent,
-    DbusValue, DesktopNotification, GeoClueSnapshot, LogindEvent, LogindInhibitor,
-    LogindPowerCapabilities, LogindSnapshot, ModemAccessTech, ModemInfo, ModemRegistrationState,
-    ModemSnapshot, ModemState, MprisPlaybackStatus, MprisSnapshot, NetworkManagerSnapshot,
-    NmAccessPoint, NmActiveConnection, NmConnectivity, NmDeviceInfo, NmDeviceType,
-    NmSavedConnection, NmState, NmWifiSecurity, NotificationCapabilities, NotificationCloseReason,
-    NotificationEvent, NotificationImageData, NotificationUrgency, PortalAccentColor,
-    PortalColorScheme, PortalContrast, PortalSettingsSnapshot, PowerActionSupport,
-    PowerProfileHold, PowerProfileKind, PowerProfileSnapshot, ScreenSaverSnapshot, TrayCategory,
-    TrayEvent, TrayIconPixmap, TrayItemSnapshot, TrayMenuItem, TrayStatus, TrayToolTip,
-    UDisksBlockDevice, UDisksDrive, UDisksSnapshot, UPowerDevice, UPowerDeviceKind,
-    UPowerDeviceState, UPowerSnapshot,
+    BluetoothAgentEvent, BluetoothAgentReply, BluetoothAgentRequest, BluetoothClient,
+    BluetoothSnapshot, Dbus, DbusActionLane, DbusActionReply, DbusActionResult, DbusBus,
+    DbusClient, DbusSignalEvent, DbusValue, DesktopNotification, GeoClueClient, GeoClueSnapshot,
+    LogindClient, LogindEvent, LogindSnapshot, ModemClient, ModemSnapshot, MprisClient, MprisEvent,
+    MprisLoopStatus, MprisPlaybackStatus, MprisSnapshot, NetworkManagerClient,
+    NetworkManagerSnapshot, NotificationCapabilities, NotificationCloseReason, NotificationEvent,
+    NotificationUrgency, NotificationsClient, PortalClient, PortalColorScheme,
+    PortalSettingsSnapshot, PowerAction, PowerProfileKind, PowerProfileSnapshot,
+    PowerProfilesClient, ScreenSaverClient, ScreenSaverSnapshot, TrayClient, TrayEvent,
+    TrayItemSnapshot, UDisksClient, UDisksMountOptions, UDisksSnapshot, UPowerClient,
+    UPowerSnapshot, WifiConnectOptions,
 };
 #[cfg(feature = "global-shortcuts")]
-pub use crate::dbus::{
-    BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent, GlobalShortcuts,
-};
-#[cfg(feature = "dbus")]
-pub use crate::dbus::{DbusActionLane, DbusActionResult, MprisEvent, MprisLoopStatus};
+pub use crate::dbus::{BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent};

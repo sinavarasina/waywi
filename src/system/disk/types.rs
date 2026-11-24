@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::system::units::ByteSize;
+use crate::system::units::{ByteSize, DataRate};
 
 /// Capacity and usage snapshot for one mounted local filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +38,8 @@ pub struct DiskDeviceIo {
     pub writes_completed: u64,
     pub read_bytes: ByteSize,
     pub write_bytes: ByteSize,
-    pub read_bytes_per_sec: f64,
-    pub write_bytes_per_sec: f64,
+    pub read_rate: DataRate,
+    pub write_rate: DataRate,
     pub read_iops: f64,
     pub write_iops: f64,
 }
@@ -50,8 +50,8 @@ pub struct DiskSnapshot {
     pub mounts: Vec<DiskMount>,
     pub io: Vec<DiskDeviceIo>,
     /// Summed read throughput across whole physical/virtual disks (`is_whole_disk`).
-    pub total_read_bytes_per_sec: f64,
+    pub total_read_rate: DataRate,
     /// Summed write throughput across whole physical/virtual disks (`is_whole_disk`).
-    pub total_write_bytes_per_sec: f64,
+    pub total_write_rate: DataRate,
     pub timestamp: Instant,
 }

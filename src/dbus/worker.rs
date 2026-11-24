@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle;
 
 use super::client::{DbusSharedBus, connect_shared_bus, decode_message_body};
 use super::types::{DbusBus, DbusSignalEvent};
@@ -63,11 +64,44 @@ impl Future for StopFuture {
     }
 }
 
-/// Dedicated lightweight D-Bus signal listener thread using `zbus` + `futures_lite` (zero `tokio`).
-pub(crate) struct DbusSignalWorker {
+/// Reusable RAII thread handle for background D-Bus workers.
+///
+/// Triggers [`AsyncStopSignal`] and joins the worker thread cleanly on drop.
+pub(crate) struct DbusWorkerHandle {
     stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
+    join: Option<JoinHandle<()>>,
 }
+
+impl DbusWorkerHandle {
+    pub(crate) fn spawn<F>(name: &'static str, f: F) -> Self
+    where
+        F: FnOnce(AsyncStopSignal) + Send + 'static,
+    {
+        let stop = AsyncStopSignal::new();
+        let stop_sig = stop.clone();
+        let join = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || f(stop_sig))
+            .ok();
+        Self { stop, join }
+    }
+
+    pub(crate) fn trigger_stop(&self) {
+        self.stop.trigger();
+    }
+}
+
+impl Drop for DbusWorkerHandle {
+    fn drop(&mut self) {
+        self.stop.trigger();
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Dedicated lightweight D-Bus signal listener thread using `zbus` + `futures_lite` (zero `tokio`).
+pub(crate) struct DbusSignalWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl DbusSignalWorker {
     pub(crate) fn spawn(
@@ -78,11 +112,9 @@ impl DbusSignalWorker {
         sender: calloop::channel::Sender<DbusSignalEvent>,
         shared: DbusSharedBus,
     ) -> Self {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("waywi-dbus-signal".to_owned())
-            .spawn(move || {
+        Self(DbusWorkerHandle::spawn(
+            "waywi-dbus-signal",
+            move |stop_sig| {
                 let Ok(conn) = connect_shared_bus(bus, &shared) else {
                     return;
                 };
@@ -139,26 +171,13 @@ impl DbusSignalWorker {
                         }
                     }
                 });
-            })
-            .ok();
-        Self { stop, join }
-    }
-}
-
-impl Drop for DbusSignalWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+            },
+        ))
     }
 }
 
 /// Reusable async D-Bus watcher thread that emits initial snapshots and updates on matching signals.
-pub(crate) struct ServiceWatchWorker {
-    stop: AsyncStopSignal,
-    join: Option<std::thread::JoinHandle<()>>,
-}
+pub(crate) struct ServiceWatchWorker(#[allow(dead_code)] DbusWorkerHandle);
 
 impl ServiceWatchWorker {
     pub(crate) fn spawn<T, F, Fut>(
@@ -175,72 +194,75 @@ impl ServiceWatchWorker {
         F: FnMut(zbus::Connection) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Option<T>>,
     {
-        let stop = AsyncStopSignal::new();
-        let stop_sig = stop.clone();
-        let join = std::thread::Builder::new()
-            .name(thread_name.to_owned())
-            .spawn(move || {
-                let Ok(conn) = connect_shared_bus(bus, &shared) else {
+        Self(DbusWorkerHandle::spawn(thread_name, move |stop_sig| {
+            let Ok(conn) = connect_shared_bus(bus, &shared) else {
+                return;
+            };
+            futures_lite::future::block_on(async move {
+                let mut last: Option<T> = None;
+                if let Some(snap) = fetch(conn.clone()).await {
+                    last = Some(snap.clone());
+                    let _ = sender.send(snap);
+                }
+
+                let mut rule_builder =
+                    zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal);
+                if let Some(s) = sender_name {
+                    let Ok(r) = rule_builder.sender(s) else {
+                        return;
+                    };
+                    rule_builder = r;
+                }
+                if let Some(i) = interface {
+                    let Ok(r) = rule_builder.interface(i) else {
+                        return;
+                    };
+                    rule_builder = r;
+                }
+                let Ok(mut stream) =
+                    zbus::MessageStream::for_match_rule(rule_builder.build(), &conn, Some(64))
+                        .await
+                else {
                     return;
                 };
-                futures_lite::future::block_on(async move {
-                    let mut last: Option<T> = None;
-                    if let Some(snap) = fetch(conn.clone()).await {
+
+                use futures_lite::StreamExt;
+                while !stop_sig.is_stopped() {
+                    let next_msg =
+                        futures_lite::future::or(async { Some(stream.next().await) }, async {
+                            stop_sig.wait_stopped().await;
+                            None
+                        })
+                        .await;
+                    let Some(Some(Ok(_))) = next_msg else {
+                        break;
+                    };
+                    // Drain all immediately-ready buffered signals so BLE discovery or UDisks
+                    // signal bursts trigger a single refresh instead of hammering the bus.
+                    let mut stream_closed = false;
+                    while let Some(item) = futures_lite::future::poll_once(stream.next()).await {
+                        match item {
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) | None => {
+                                stream_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if stop_sig.is_stopped() {
+                        break;
+                    }
+                    if let Some(snap) = fetch(conn.clone()).await
+                        && last.as_ref() != Some(&snap)
+                    {
                         last = Some(snap.clone());
                         let _ = sender.send(snap);
                     }
-
-                    let mut rule_builder =
-                        zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal);
-                    if let Some(s) = sender_name {
-                        let Ok(r) = rule_builder.sender(s) else {
-                            return;
-                        };
-                        rule_builder = r;
+                    if stream_closed {
+                        break;
                     }
-                    if let Some(i) = interface {
-                        let Ok(r) = rule_builder.interface(i) else {
-                            return;
-                        };
-                        rule_builder = r;
-                    }
-                    let Ok(mut stream) =
-                        zbus::MessageStream::for_match_rule(rule_builder.build(), &conn, Some(64))
-                            .await
-                    else {
-                        return;
-                    };
-
-                    use futures_lite::StreamExt;
-                    while !stop_sig.is_stopped() {
-                        let next_msg =
-                            futures_lite::future::or(async { Some(stream.next().await) }, async {
-                                stop_sig.wait_stopped().await;
-                                None
-                            })
-                            .await;
-                        let Some(Some(Ok(_))) = next_msg else {
-                            break;
-                        };
-                        if let Some(snap) = fetch(conn.clone()).await
-                            && last.as_ref() != Some(&snap)
-                        {
-                            last = Some(snap.clone());
-                            let _ = sender.send(snap);
-                        }
-                    }
-                });
-            })
-            .ok();
-        Self { stop, join }
-    }
-}
-
-impl Drop for ServiceWatchWorker {
-    fn drop(&mut self) {
-        self.stop.trigger();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+                }
+            });
+        }))
     }
 }

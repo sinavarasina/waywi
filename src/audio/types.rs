@@ -1,4 +1,49 @@
-use crate::subscription::{Subscription, SubscriptionKey, SubscriptionSpec};
+use std::sync::Arc;
+
+use crate::arena::FrameSharedFn;
+use crate::subscription::{Subscription, SubscriptionSpec};
+
+/// Signal flow direction for an audio device, stream, or default-device query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AudioDirection {
+    /// Playback / output direction (sinks and playback streams).
+    #[default]
+    Output,
+    /// Capture / input direction (sources/microphones and recording streams).
+    Input,
+}
+
+/// Target selector for orthogonal volume, balance, channel, and mute operations on
+/// [`super::AudioClient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioTarget {
+    /// Currently active default output sink.
+    DefaultSink,
+    /// Currently active default input source (microphone).
+    DefaultSource,
+    /// Specific output sink identified by backend device/node ID.
+    Sink(u32),
+    /// Specific input source identified by backend device/node ID.
+    Source(u32),
+    /// Per-application playback stream identified by backend stream/node ID.
+    PlaybackStream(u32),
+    /// Per-application capture stream identified by backend stream/node ID.
+    CaptureStream(u32),
+}
+
+/// Target selector for switching physical or logical ports/routes on a sink or source via
+/// [`super::AudioClient::set_port`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioPortTarget {
+    /// Currently active default output sink.
+    DefaultSink,
+    /// Currently active default input source (microphone).
+    DefaultSource,
+    /// Specific output sink identified by backend device/node ID.
+    Sink(u32),
+    /// Specific input source identified by backend device/node ID.
+    Source(u32),
+}
 
 /// Spatial speaker / channel position reported by the audio server (`SPA_PROP_channelMap` on
 /// PipeWire, `pa_channel_map` on PulseAudio, `SelemChannelId` on ALSA).
@@ -199,6 +244,46 @@ impl AudioChannelPosition {
     }
 }
 
+/// Normalized volume, per-channel levels, spatial channel map, decibel level, and mute state.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AudioVolume {
+    /// Peak linear volume level (`1.0` = unity gain / 100%, up to `1.5` = 150% boost).
+    pub linear: f32,
+    /// Per-channel linear volumes (`[left, right, ...]`).
+    pub channels: Vec<f32>,
+    /// Spatial speaker positions corresponding to [`Self::channels`].
+    pub channel_map: Vec<AudioChannelPosition>,
+    /// Peak level in decibels when reported and audible.
+    pub db: Option<f32>,
+    /// Whether the endpoint or stream is currently muted.
+    pub muted: bool,
+}
+
+impl AudioVolume {
+    /// Volume expressed as percentage (`100.0` at unity gain, clamped to `0.0..=150.0`).
+    #[must_use]
+    pub fn percent(&self) -> f32 {
+        if self.linear.is_finite() {
+            (self.linear * 100.0).clamp(0.0, 150.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Computes stereo/surround L/R balance in `-1.0..=1.0` from [`Self::channels`] and
+    /// [`Self::channel_map`]. Returns `None` for mono or non-directional channel layouts.
+    #[must_use]
+    pub fn balance(&self) -> Option<f32> {
+        compute_balance_opt(&self.channels, &self.channel_map)
+    }
+
+    /// Returns the number of channels tracked in [`Self::channels`].
+    #[must_use]
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+}
+
 /// Jack / port plug availability reported by the audio server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioPortAvailability {
@@ -222,7 +307,7 @@ impl AudioPortAvailability {
 pub struct AudioPort {
     /// Backend route/port index (PipeWire `SPA_PARAM_ROUTE_index`; `0` on PulseAudio).
     pub index: i32,
-    /// Port identifier name used with [`super::AudioClient::select_port`].
+    /// Port identifier name used with [`super::AudioClient::set_port`].
     pub name: String,
     /// Human-readable port label (e.g. `"Headphones"`, `"Line Out"`).
     pub description: String,
@@ -238,7 +323,7 @@ pub struct AudioPort {
 pub struct AudioProfile {
     /// Backend profile index (PipeWire `SPA_PARAM_PROFILE_index`; `0` on PulseAudio).
     pub index: i32,
-    /// Profile identifier name used with [`super::AudioClient::select_card_profile`].
+    /// Profile identifier name used with [`super::AudioClient::set_card_profile`].
     pub name: String,
     /// Human-readable profile description (e.g. `"Analog Stereo Duplex"`).
     pub description: String,
@@ -263,211 +348,86 @@ pub struct AudioCard {
     pub profiles: Vec<AudioProfile>,
 }
 
-/// Audio node metadata for an output sink or input source device.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Audio endpoint metadata and live volume state for an output sink or input source device.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AudioDevice {
     pub id: u32,
     pub name: String,
     pub description: String,
-    /// Owning [`AudioCard::id`], when backed by a hardware/card device.
-    pub card_id: Option<u32>,
+    /// Whether this device is currently the active default for its direction.
+    pub is_default: bool,
+    /// Current volume, channel layout, dB level, and mute state of this device.
+    pub volume: AudioVolume,
     /// Currently active port/route name on this device (e.g. `"analog-output-headphones"`).
     pub active_port: Option<String>,
     /// Switchable ports/routes available on this device under the active card profile.
     pub ports: Vec<AudioPort>,
-    /// Spatial speaker/channel layout reported for this device (`[FrontLeft, FrontRight, ...]`).
-    pub channel_map: Vec<AudioChannelPosition>,
 }
 
-/// Per-application playback stream routed into a sink (PulseAudio sink input, PipeWire
-/// `Stream/Output/Audio` node).
+/// Unified per-application playback or capture stream (PulseAudio sink input / source output,
+/// PipeWire `Stream/Output/Audio` or `Stream/Input/Audio` node).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AudioStream {
     pub id: u32,
-    /// Human-readable application/stream name (`application.name` -> binary -> raw node name).
+    /// Whether this stream is playing back (`Output`) or capturing (`Input`).
+    pub direction: AudioDirection,
+    /// Human-readable stream/application label.
     pub name: String,
+    /// Application display name (`application.name`), when reported.
+    pub app_name: Option<String>,
     /// Executable binary name (`application.process.binary`), when reported.
-    pub binary: Option<String>,
-    /// XDG / theme icon hint (`application.icon_name` or `application.icon-name`), when reported.
-    pub icon_name: Option<String>,
-    /// Application / Flatpak portal identifier (`application.id` or `pipewire.access.portal.app_id`), when reported.
-    pub app_id: Option<String>,
-    pub sink_id: Option<u32>,
-    pub linear: f32,
-    /// Per-channel linear volumes (`[left, right, ...]`).
-    pub channels: Vec<f32>,
-    /// Spatial channel positions corresponding to [`Self::channels`].
-    pub channel_map: Vec<AudioChannelPosition>,
-    pub db: Option<f32>,
-    pub muted: bool,
+    pub binary_name: Option<String>,
+    /// Media role hint (`media.role`, e.g. `"music"`, `"phone"`, `"video"`), when reported.
+    pub media_role: Option<String>,
+    /// Backend sink/source ID this stream is currently routed to, when known.
+    pub device_id: Option<u32>,
+    /// Whether the stream is currently corked/paused/suspended.
+    pub corked: bool,
+    /// Current volume, channel layout, dB level, and mute state of this stream.
+    pub volume: AudioVolume,
 }
 
-impl AudioStream {
-    /// Stereo/surround L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
-    #[must_use]
-    pub fn balance(&self) -> f32 {
-        compute_balance_with_map(&self.channels, &self.channel_map)
-    }
-}
-
-/// Per-application capture stream recorded from a source (PulseAudio source output, PipeWire
-/// `Stream/Input/Audio` node).
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct AudioCapture {
-    pub id: u32,
-    /// Human-readable application/stream name (`application.name` -> binary -> raw node name).
-    pub name: String,
-    /// Executable binary name (`application.process.binary`), when reported.
-    pub binary: Option<String>,
-    /// XDG / theme icon hint (`application.icon_name` or `application.icon-name`), when reported.
-    pub icon_name: Option<String>,
-    /// Application / Flatpak portal identifier (`application.id` or `pipewire.access.portal.app_id`), when reported.
-    pub app_id: Option<String>,
-    pub source_id: Option<u32>,
-    pub linear: f32,
-    /// Per-channel linear volumes (`[left, right, ...]`).
-    pub channels: Vec<f32>,
-    /// Spatial channel positions corresponding to [`Self::channels`].
-    pub channel_map: Vec<AudioChannelPosition>,
-    pub db: Option<f32>,
-    pub muted: bool,
-}
-
-impl AudioCapture {
-    /// Stereo/surround L/R balance in `-1.0..=1.0` (`-1.0` = full left, `0.0` = center/mono, `+1.0` = full right).
-    #[must_use]
-    pub fn balance(&self) -> f32 {
-        compute_balance_with_map(&self.channels, &self.channel_map)
-    }
-}
-
-/// Point-in-time snapshot of the default audio sink, default source (mic), available devices,
-/// sound cards/profiles, and per-application playback/capture streams.
+/// Point-in-time snapshot of all discovered output sinks, input sources, per-application streams,
+/// and sound cards.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AudioSnapshot {
-    pub linear: f32,
-    /// Per-channel linear volumes of the active default sink (`[left, right, ...]`).
-    pub channels: Vec<f32>,
-    /// Spatial speaker positions corresponding to [`Self::channels`].
-    pub channel_map: Vec<AudioChannelPosition>,
-    pub db: Option<f32>,
-    pub muted: bool,
-    pub default_sink: Option<AudioDevice>,
-    pub devices: Vec<AudioDevice>,
-    pub source_linear: f32,
-    /// Per-channel linear volumes of the active default source (`[left, right, ...]`).
-    pub source_channels: Vec<f32>,
-    /// Spatial channel positions corresponding to [`Self::source_channels`].
-    pub source_channel_map: Vec<AudioChannelPosition>,
-    pub source_db: Option<f32>,
-    pub source_muted: bool,
-    pub default_source: Option<AudioDevice>,
+    pub sinks: Vec<AudioDevice>,
     pub sources: Vec<AudioDevice>,
-    /// Discovered sound cards and their switchable profiles.
-    pub cards: Vec<AudioCard>,
+    pub default_sink_id: Option<u32>,
+    pub default_source_id: Option<u32>,
     pub streams: Vec<AudioStream>,
-    pub captures: Vec<AudioCapture>,
+    pub cards: Vec<AudioCard>,
 }
 
 impl AudioSnapshot {
-    /// Output sink volume expressed as percentage (`100.0` at unity gain).
+    /// Returns the active default output sink, if present.
     #[must_use]
-    pub fn percent(&self) -> f32 {
-        (self.linear * 100.0).clamp(0.0, 150.0)
+    pub fn default_sink(&self) -> Option<&AudioDevice> {
+        self.default_sink_id
+            .and_then(|id| self.sinks.iter().find(|d| d.id == id))
+            .or_else(|| self.sinks.iter().find(|d| d.is_default))
     }
 
-    /// Input source (microphone) volume expressed as percentage (`100.0` at unity gain).
+    /// Returns the active default input source (microphone), if present.
     #[must_use]
-    pub fn source_percent(&self) -> f32 {
-        (self.source_linear * 100.0).clamp(0.0, 150.0)
+    pub fn default_source(&self) -> Option<&AudioDevice> {
+        self.default_source_id
+            .and_then(|id| self.sources.iter().find(|d| d.id == id))
+            .or_else(|| self.sources.iter().find(|d| d.is_default))
     }
 
-    /// Stereo/surround L/R balance of the active default sink in `-1.0..=1.0` (`0.0` when centered or mono).
-    #[must_use]
-    pub fn balance(&self) -> f32 {
-        compute_balance_with_map(&self.channels, &self.channel_map)
-    }
-
-    /// Stereo/surround L/R balance of the active default source in `-1.0..=1.0` (`0.0` when centered or mono).
-    #[must_use]
-    pub fn source_balance(&self) -> f32 {
-        compute_balance_with_map(&self.source_channels, &self.source_channel_map)
-    }
-
-    /// Ports available on the active default output sink.
-    #[must_use]
-    pub fn ports(&self) -> &[AudioPort] {
-        self.default_sink
-            .as_ref()
-            .map_or(&[], |d| d.ports.as_slice())
-    }
-
-    /// Currently active [`AudioPort`] on the default output sink, if any.
-    #[must_use]
-    pub fn active_port(&self) -> Option<&AudioPort> {
-        let sink = self.default_sink.as_ref()?;
-        let active = sink.active_port.as_deref()?;
-        sink.ports.iter().find(|p| p.name == active)
-    }
-
-    /// Ports available on the active default input source.
-    #[must_use]
-    pub fn source_ports(&self) -> &[AudioPort] {
-        self.default_source
-            .as_ref()
-            .map_or(&[], |d| d.ports.as_slice())
-    }
-
-    /// Currently active [`AudioPort`] on the default input source, if any.
-    #[must_use]
-    pub fn active_source_port(&self) -> Option<&AudioPort> {
-        let src = self.default_source.as_ref()?;
-        let active = src.active_port.as_deref()?;
-        src.ports.iter().find(|p| p.name == active)
-    }
-
-    /// Looks up an [`AudioCard`] by its backend `card_id`.
-    #[must_use]
-    pub fn card(&self, card_id: u32) -> Option<&AudioCard> {
-        self.cards.iter().find(|c| c.id == card_id)
-    }
-
-    /// Returns the [`AudioCard`] backing [`Self::default_sink`], if known.
-    #[must_use]
-    pub fn default_sink_card(&self) -> Option<&AudioCard> {
-        self.default_sink
-            .as_ref()
-            .and_then(|d| d.card_id)
-            .and_then(|id| self.card(id))
-    }
-
-    /// Returns the [`AudioCard`] backing [`Self::default_source`], if known.
-    #[must_use]
-    pub fn default_source_card(&self) -> Option<&AudioCard> {
-        self.default_source
-            .as_ref()
-            .and_then(|d| d.card_id)
-            .and_then(|id| self.card(id))
-    }
-
-    /// Playback stream volume expressed as percentage (`100.0` at unity gain); `0.0` for an
-    /// unknown stream ID.
-    #[must_use]
-    pub fn stream_percent(&self, id: u32) -> f32 {
+    /// Iterates over all per-application playback streams (`AudioDirection::Output`).
+    pub fn playback_streams(&self) -> impl Iterator<Item = &AudioStream> {
         self.streams
             .iter()
-            .find(|s| s.id == id)
-            .map_or(0.0, |s| (s.linear * 100.0).clamp(0.0, 150.0))
+            .filter(|s| s.direction == AudioDirection::Output)
     }
 
-    /// Capture stream volume expressed as percentage (`100.0` at unity gain); `0.0` for an
-    /// unknown stream ID.
-    #[must_use]
-    pub fn capture_percent(&self, id: u32) -> f32 {
-        self.captures
+    /// Iterates over all per-application capture streams (`AudioDirection::Input`).
+    pub fn capture_streams(&self) -> impl Iterator<Item = &AudioStream> {
+        self.streams
             .iter()
-            .find(|c| c.id == id)
-            .map_or(0.0, |c| (c.linear * 100.0).clamp(0.0, 150.0))
+            .filter(|s| s.direction == AudioDirection::Input)
     }
 }
 
@@ -483,24 +443,10 @@ fn resolve_channel_position(
     }
 }
 
-/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes using the standard ITU/ALSA
-/// speaker map for `channels.len()` (`2` = Stereo, `4` = Quad, `6` = 5.1 Surround, `8` = 7.1 Surround).
-///
-/// Center and LFE channels are excluded from L/R balance calculation (`pa_cvolume_get_balance`
-/// semantics). Returns `0.0` when fewer than 2 directional channels are present or silent.
-#[must_use]
-pub fn compute_stereo_balance(channels: &[f32]) -> f32 {
-    compute_balance_with_map(channels, &[])
-}
-
-/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes and an explicit
-/// [`AudioChannelPosition`] map (falling back to the standard layout for `channels.len()` when
-/// `channel_map` is empty or contains [`AudioChannelPosition::Unknown`]).
-#[must_use]
-pub fn compute_balance_with_map(channels: &[f32], channel_map: &[AudioChannelPosition]) -> f32 {
+fn compute_balance_opt(channels: &[f32], channel_map: &[AudioChannelPosition]) -> Option<f32> {
     let count = channels.len();
     if count < 2 {
-        return 0.0;
+        return None;
     }
     let mut left_sum = 0.0_f32;
     let mut left_n = 0_u32;
@@ -520,16 +466,34 @@ pub fn compute_balance_with_map(channels: &[f32], channel_map: &[AudioChannelPos
     }
 
     if left_n == 0 || right_n == 0 {
-        return 0.0;
+        return None;
     }
     let l = left_sum / (left_n as f32);
     let r = right_sum / (right_n as f32);
     let max = l.max(r);
     if max <= 1e-6 {
-        0.0
+        Some(0.0)
     } else {
-        ((r - l) / max).clamp(-1.0, 1.0)
+        Some(((r - l) / max).clamp(-1.0, 1.0))
     }
+}
+
+/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes using the standard ITU/ALSA
+/// speaker map for `channels.len()` (`2` = Stereo, `4` = Quad, `6` = 5.1 Surround, `8` = 7.1 Surround).
+///
+/// Center and LFE channels are excluded from L/R balance calculation (`pa_cvolume_get_balance`
+/// semantics). Returns `0.0` when fewer than 2 directional channels are present or silent.
+#[must_use]
+pub fn compute_stereo_balance(channels: &[f32]) -> f32 {
+    compute_balance_with_map(channels, &[])
+}
+
+/// Computes L/R balance in `-1.0..=1.0` from per-channel linear volumes and an explicit
+/// [`AudioChannelPosition`] map (falling back to the standard layout for `channels.len()` when
+/// `channel_map` is empty or contains [`AudioChannelPosition::Unknown`]).
+#[must_use]
+pub fn compute_balance_with_map(channels: &[f32], channel_map: &[AudioChannelPosition]) -> f32 {
+    compute_balance_opt(channels, channel_map).unwrap_or(0.0)
 }
 
 /// Scales `current` per-channel linear volumes so their peak equals `target_linear`, preserving
@@ -737,44 +701,61 @@ pub(crate) fn sanitize_linear_channels(volumes: &[f32]) -> Option<Vec<f32>> {
     )
 }
 
-/// Event emitted by the audio monitor.
+/// Granular event emitted by the audio backend monitor.
 #[non_exhaustive]
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioEvent {
-    Updated(AudioSnapshot),
-    DeviceAdded(AudioDevice),
-    DeviceRemoved(u32),
-    Disconnected,
-    Reconnected,
+    DeviceAdded {
+        direction: AudioDirection,
+        id: u32,
+        name: String,
+    },
+    DeviceRemoved {
+        direction: AudioDirection,
+        id: u32,
+    },
+    DefaultDeviceChanged {
+        direction: AudioDirection,
+        name: Option<String>,
+    },
+    VolumeChanged {
+        direction: AudioDirection,
+        volume: AudioVolume,
+    },
+    CardProfileChanged {
+        card_id: u32,
+        active_profile: Option<String>,
+    },
+    PortChanged {
+        direction: AudioDirection,
+        device_id: u32,
+        active_port: Option<String>,
+    },
+    BackendDisconnected,
+    BackendReconnected,
 }
 
 /// Audio subscription constructors.
 pub struct Audio;
 
 impl Audio {
-    /// Subscribes to default sink/source volume, mute, and device snapshots whenever audio state
-    /// changes.
-    pub fn subscribe<M: 'static>(map: impl Fn(AudioSnapshot) -> M + 'static) -> Subscription<M> {
+    /// Subscribes to full audio state snapshots (`Arc<AudioSnapshot>`) whenever sinks, sources,
+    /// streams, cards, volumes, or defaults change.
+    pub fn subscribe<M: 'static>(
+        map: impl Fn(Arc<AudioSnapshot>) -> M + 'static,
+    ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::AudioSnapshot {
-                key: SubscriptionKey::from_hashable(&(
-                    "audio-snapshot",
-                    std::any::TypeId::of::<M>(),
-                )),
-                map: crate::arena::FrameSharedFn::new(map),
+                map: FrameSharedFn::new(map),
             },
         }
     }
 
-    /// Subscribes to audio events including connect/disconnect and device hotplug transitions.
-    pub fn subscribe_events<M: 'static>(
-        map: impl Fn(AudioEvent) -> M + 'static,
-    ) -> Subscription<M> {
+    /// Subscribes to discrete audio lifecycle and device/volume change events.
+    pub fn events<M: 'static>(map: impl Fn(AudioEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::AudioEvent {
-                key: SubscriptionKey::from_hashable(&("audio-event", std::any::TypeId::of::<M>())),
-                map: crate::arena::FrameSharedFn::new(map),
+                map: FrameSharedFn::new(map),
             },
         }
     }
@@ -783,51 +764,127 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioCapture, AudioCard, AudioChannelPosition, AudioDevice, AudioPort,
-        AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, apply_linear_balance,
-        apply_linear_balance_with_map, compute_balance_with_map, compute_stereo_balance,
-        sanitize_linear_channels, scale_linear_channels,
+        AudioCard, AudioChannelPosition, AudioDevice, AudioDirection, AudioPort,
+        AudioPortAvailability, AudioProfile, AudioSnapshot, AudioStream, AudioVolume,
+        apply_linear_balance, apply_linear_balance_with_map, compute_balance_with_map,
+        compute_stereo_balance, sanitize_linear_channels, scale_linear_channels,
     };
 
     #[test]
-    fn percent_helpers_map_unity_to_100_and_unknown_to_zero() {
-        let snap = AudioSnapshot {
-            linear: 1.5,
-            streams: vec![AudioStream {
-                id: 3,
-                name: "Firefox".into(),
-                binary: None,
-                icon_name: None,
-                app_id: None,
-                sink_id: None,
-                linear: 0.5,
-                channels: vec![0.5, 0.5],
-                channel_map: Vec::new(),
-                db: None,
+    fn volume_helpers_and_snapshot_accessors_work() {
+        let sink = AudioDevice {
+            id: 10,
+            name: "alsa_output.pci".into(),
+            description: "Built-in Output".into(),
+            is_default: true,
+            volume: AudioVolume {
+                linear: 1.5,
+                channels: vec![1.5, 0.75],
+                channel_map: vec![
+                    AudioChannelPosition::FrontLeft,
+                    AudioChannelPosition::FrontRight,
+                ],
+                db: Some(10.5),
                 muted: false,
+            },
+            active_port: Some("analog-output-headphones".into()),
+            ports: vec![AudioPort {
+                index: 4,
+                name: "analog-output-headphones".into(),
+                description: "Headphones".into(),
+                priority: 9900,
+                availability: AudioPortAvailability::Available,
             }],
-            captures: vec![AudioCapture {
-                id: 5,
-                name: "Recorder".into(),
-                binary: Some("rec".into()),
-                icon_name: None,
-                app_id: None,
-                source_id: None,
+        };
+        let source = AudioDevice {
+            id: 20,
+            name: "alsa_input.mic".into(),
+            description: "Mic".into(),
+            is_default: true,
+            volume: AudioVolume {
                 linear: 0.75,
                 channels: vec![0.75],
-                channel_map: Vec::new(),
+                channel_map: vec![AudioChannelPosition::Mono],
                 db: None,
                 muted: true,
+            },
+            active_port: None,
+            ports: Vec::new(),
+        };
+        let snap = AudioSnapshot {
+            sinks: vec![sink.clone()],
+            sources: vec![source.clone()],
+            default_sink_id: Some(10),
+            default_source_id: Some(20),
+            streams: vec![
+                AudioStream {
+                    id: 3,
+                    direction: AudioDirection::Output,
+                    name: "Firefox".into(),
+                    app_name: Some("Firefox".into()),
+                    binary_name: Some("firefox".into()),
+                    media_role: Some("video".into()),
+                    device_id: Some(10),
+                    corked: false,
+                    volume: AudioVolume {
+                        linear: 0.5,
+                        channels: vec![0.5, 0.5],
+                        channel_map: vec![
+                            AudioChannelPosition::FrontLeft,
+                            AudioChannelPosition::FrontRight,
+                        ],
+                        db: None,
+                        muted: false,
+                    },
+                },
+                AudioStream {
+                    id: 5,
+                    direction: AudioDirection::Input,
+                    name: "Recorder".into(),
+                    app_name: Some("Recorder".into()),
+                    binary_name: Some("rec".into()),
+                    media_role: None,
+                    device_id: Some(20),
+                    corked: true,
+                    volume: AudioVolume {
+                        linear: 0.75,
+                        channels: vec![0.75],
+                        channel_map: vec![AudioChannelPosition::Mono],
+                        db: None,
+                        muted: true,
+                    },
+                },
+            ],
+            cards: vec![AudioCard {
+                id: 45,
+                name: "alsa_card.pci".into(),
+                description: "HD Audio".into(),
+                active_profile: Some("output:analog-stereo".into()),
+                profiles: vec![AudioProfile {
+                    index: 1,
+                    name: "output:analog-stereo".into(),
+                    description: "Analog Stereo".into(),
+                    priority: 6565,
+                    available: true,
+                }],
             }],
-            ..AudioSnapshot::default()
         };
 
-        assert_eq!(snap.percent(), 150.0);
-        assert_eq!(snap.stream_percent(3), 50.0);
-        assert_eq!(snap.stream_percent(4), 0.0);
-        assert_eq!(snap.capture_percent(5), 75.0);
-        assert_eq!(snap.capture_percent(6), 0.0);
-        assert_eq!(snap.source_percent(), 0.0);
+        assert_eq!(snap.default_sink(), Some(&sink));
+        assert_eq!(snap.default_source(), Some(&source));
+        assert_eq!(sink.volume.percent(), 150.0);
+        assert_eq!(sink.volume.channel_count(), 2);
+        assert!((sink.volume.balance().unwrap() - (-0.5)).abs() < 1e-5);
+        assert_eq!(source.volume.percent(), 75.0);
+        assert_eq!(source.volume.channel_count(), 1);
+        assert_eq!(source.volume.balance(), None);
+
+        let playback: Vec<u32> = snap.playback_streams().map(|s| s.id).collect();
+        let capture: Vec<u32> = snap.capture_streams().map(|s| s.id).collect();
+        assert_eq!(playback, vec![3]);
+        assert_eq!(capture, vec![5]);
+        assert!(sink.ports[0].availability.is_available());
+        assert!(!AudioPortAvailability::Unavailable.is_available());
     }
 
     #[test]
@@ -839,19 +896,16 @@ mod tests {
         assert!((compute_stereo_balance(&[0.8, 0.4]) - (-0.5)).abs() < 1e-5);
         assert!((compute_stereo_balance(&[0.3, 0.6]) - 0.5).abs() < 1e-5);
 
-        // Scaling preserves 2:1 L/R balance ratio.
         let scaled = scale_linear_channels(&[0.8, 0.4], &[0.8, 0.4], 2, 0.6);
         assert!((scaled[0] - 0.6).abs() < 1e-5);
         assert!((scaled[1] - 0.3).abs() < 1e-5);
         assert!((compute_stereo_balance(&scaled) - (-0.5)).abs() < 1e-5);
 
-        // Scaling back up from 0.0 recovers the non-zero template ratios.
         let muted_zero = [0.0, 0.0];
         let recovered = scale_linear_channels(&muted_zero, &[0.8, 0.4], 2, 0.8);
         assert!((recovered[0] - 0.8).abs() < 1e-5);
         assert!((recovered[1] - 0.4).abs() < 1e-5);
 
-        // Applying balance adjusts L/R while keeping peak master level.
         let left_biased = apply_linear_balance(&[0.8, 0.8], 2, 0.8, -0.5);
         assert!((left_biased[0] - 0.8).abs() < 1e-5);
         assert!((left_biased[1] - 0.4).abs() < 1e-5);
@@ -868,8 +922,6 @@ mod tests {
 
     #[test]
     fn surround_5_1_and_7_1_balance_preserves_center_lfe_and_front_rear_fade() {
-        // 5.1 layout: [FL, FR, FC, LFE, RL, RR] with custom center (0.7), subwoofer (0.5),
-        // and front (0.8) vs rear (0.6) fade.
         let map_5_1 = AudioChannelPosition::default_map_for_count(6);
         assert_eq!(
             map_5_1,
@@ -885,88 +937,26 @@ mod tests {
         let ch_5_1 = [0.8, 0.8, 0.7, 0.5, 0.6, 0.6];
         assert!((compute_balance_with_map(&ch_5_1, &map_5_1) - 0.0).abs() < 1e-5);
 
-        // Pan 50% left (-0.5):
-        // - FL (0.8) and RL (0.6) stay at 0.8 and 0.6 (front/rear fade ratio preserved)
-        // - FR (0.8 -> 0.4) and RR (0.6 -> 0.3) scale down by 0.5 (front/rear fade preserved)
-        // - FC (0.7) and LFE (0.5) are completely untouched!
         let panned = apply_linear_balance_with_map(&ch_5_1, &map_5_1, 6, 0.8, -0.5);
-        assert!((panned[0] - 0.8).abs() < 1e-5); // FL
-        assert!((panned[1] - 0.4).abs() < 1e-5); // FR
-        assert!((panned[2] - 0.7).abs() < 1e-5); // FC untouched
-        assert!((panned[3] - 0.5).abs() < 1e-5); // LFE untouched
-        assert!((panned[4] - 0.6).abs() < 1e-5); // RL
-        assert!((panned[5] - 0.3).abs() < 1e-5); // RR
+        assert!((panned[0] - 0.8).abs() < 1e-5);
+        assert!((panned[1] - 0.4).abs() < 1e-5);
+        assert!((panned[2] - 0.7).abs() < 1e-5);
+        assert!((panned[3] - 0.5).abs() < 1e-5);
+        assert!((panned[4] - 0.6).abs() < 1e-5);
+        assert!((panned[5] - 0.3).abs() < 1e-5);
         assert!((compute_balance_with_map(&panned, &map_5_1) - (-0.5)).abs() < 1e-5);
 
-        // 7.1 layout: [FL, FR, FC, LFE, RL, RR, SL, SR]
         let map_7_1 = AudioChannelPosition::default_map_for_count(8);
         let ch_7_1 = [0.8, 0.8, 0.75, 0.4, 0.8, 0.8, 0.8, 0.8];
         let panned_7_1 = apply_linear_balance_with_map(&ch_7_1, &map_7_1, 8, 0.8, 0.5);
-        assert!((panned_7_1[0] - 0.4).abs() < 1e-5); // FL
-        assert!((panned_7_1[1] - 0.8).abs() < 1e-5); // FR
-        assert!((panned_7_1[2] - 0.75).abs() < 1e-5); // FC untouched
-        assert!((panned_7_1[3] - 0.4).abs() < 1e-5); // LFE untouched
-        assert!((panned_7_1[4] - 0.4).abs() < 1e-5); // RL
-        assert!((panned_7_1[5] - 0.8).abs() < 1e-5); // RR
-        assert!((panned_7_1[6] - 0.4).abs() < 1e-5); // SL
-        assert!((panned_7_1[7] - 0.8).abs() < 1e-5); // SR
+        assert!((panned_7_1[0] - 0.4).abs() < 1e-5);
+        assert!((panned_7_1[1] - 0.8).abs() < 1e-5);
+        assert!((panned_7_1[2] - 0.75).abs() < 1e-5);
+        assert!((panned_7_1[3] - 0.4).abs() < 1e-5);
+        assert!((panned_7_1[4] - 0.4).abs() < 1e-5);
+        assert!((panned_7_1[5] - 0.8).abs() < 1e-5);
+        assert!((panned_7_1[6] - 0.4).abs() < 1e-5);
+        assert!((panned_7_1[7] - 0.8).abs() < 1e-5);
         assert!((compute_balance_with_map(&panned_7_1, &map_7_1) - 0.5).abs() < 1e-5);
-    }
-
-    #[test]
-    fn snapshot_exposes_active_ports_and_cards() {
-        let hp_port = AudioPort {
-            index: 4,
-            name: "analog-output-headphones".into(),
-            description: "Headphones".into(),
-            priority: 9900,
-            availability: AudioPortAvailability::Available,
-        };
-        let lo_port = AudioPort {
-            index: 3,
-            name: "analog-output-lineout".into(),
-            description: "Line Out".into(),
-            priority: 9000,
-            availability: AudioPortAvailability::Available,
-        };
-        let sink = AudioDevice {
-            id: 57,
-            name: "alsa_output.alc1220".into(),
-            description: "ALC1220 Analog".into(),
-            card_id: Some(45),
-            active_port: Some("analog-output-headphones".into()),
-            ports: vec![hp_port.clone(), lo_port],
-            channel_map: vec![
-                AudioChannelPosition::FrontLeft,
-                AudioChannelPosition::FrontRight,
-            ],
-        };
-        let card = AudioCard {
-            id: 45,
-            name: "alsa_card.pci-0000_0c_00.6".into(),
-            description: "Ryzen HD Audio Controller".into(),
-            active_profile: Some("output:analog-stereo+input:analog-stereo".into()),
-            profiles: vec![AudioProfile {
-                index: 1,
-                name: "output:analog-stereo+input:analog-stereo".into(),
-                description: "Analog Stereo Duplex".into(),
-                priority: 6565,
-                available: true,
-            }],
-        };
-        let snap = AudioSnapshot {
-            linear: 0.8,
-            channels: vec![0.8, 0.4],
-            default_sink: Some(sink.clone()),
-            devices: vec![sink],
-            cards: vec![card.clone()],
-            ..AudioSnapshot::default()
-        };
-        assert!((snap.balance() - (-0.5)).abs() < 1e-5);
-        assert_eq!(snap.active_port(), Some(&hp_port));
-        assert_eq!(snap.ports().len(), 2);
-        assert_eq!(snap.default_sink_card(), Some(&card));
-        assert!(hp_port.availability.is_available());
-        assert!(!AudioPortAvailability::Unavailable.is_available());
     }
 }

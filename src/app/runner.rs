@@ -8,6 +8,7 @@ use crate::subscription::Subscriptions;
 use crate::surface::Surfaces;
 
 use super::event_loop::run_event_loop;
+use super::memory::MemoryConfig;
 
 /// Model-View-Update trait defining a WayWi application.
 pub trait Application: Sized {
@@ -17,10 +18,14 @@ pub trait Application: Sized {
     type Message: Clone + 'static;
 
     /// Initializes application state once when the runtime connects.
-    fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State>;
+    fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State>;
 
     /// Processes a single message, mutating state and optionally triggering controlled side effects.
-    fn update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_>) -> Result<()>;
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()>;
 
     /// Declares desired Wayland surfaces and their UI trees for the current state.
     fn view(state: &Self::State) -> Surfaces<Self::Message>;
@@ -37,6 +42,7 @@ pub struct App {
     pub(crate) name: Option<String>,
     pub(crate) control_socket_override: Option<PathBuf>,
     pub(crate) renderer_preference: crate::render::RendererPreference,
+    pub(crate) memory_config: MemoryConfig,
 }
 
 impl App {
@@ -53,6 +59,14 @@ impl App {
     #[must_use]
     pub fn renderer(mut self, preference: crate::render::RendererPreference) -> Self {
         self.renderer_preference = preference;
+        self
+    }
+
+    /// Configures runtime buffer retention and cache limits (presets: [`MemoryConfig::balanced`],
+    /// [`MemoryConfig::low_memory`], [`MemoryConfig::high_throughput`]).
+    #[must_use]
+    pub fn memory(mut self, config: MemoryConfig) -> Self {
+        self.memory_config = config;
         self
     }
 
@@ -83,10 +97,5 @@ impl App {
     /// compositors and in-process `wayland-server` protocol testing).
     pub fn run_on_connection<A: Application>(self, conn: Connection) -> Result<()> {
         run_event_loop::<A>(self, conn)
-    }
-
-    /// Convenience shortcut equivalent to `App::new().run::<A>()`.
-    pub fn start<A: Application>() -> Result<()> {
-        Self::new().run::<A>()
     }
 }

@@ -1,16 +1,19 @@
 //! Local single-instance Unix control socket transport.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
+use std::ops::Deref;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use calloop::channel as calloop_channel;
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
@@ -118,7 +121,7 @@ pub fn send_command_with_reply(
 /// Binds a non-blocking local control listener, safely replacing stale unowned socket files.
 ///
 /// Replacement only happens after a failed connect probe returned `ECONNREFUSED` and the socket
-/// file proven to be owned by this user, avoiding both unlinking a live foreign socket and the
+/// file is proven to be owned by this user, avoiding both unlinking a live foreign socket and the
 /// unprotected probe-then-unlink race.
 pub(crate) fn bind_control_listener(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
@@ -126,7 +129,7 @@ pub(crate) fn bind_control_listener(path: &Path) -> Result<UnixListener> {
     }
     match UnixListener::bind(path) {
         Ok(listener) => return finish_bind(listener),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {}
         Err(e) => return Err(e.into()),
     }
     match UnixStream::connect(path) {
@@ -136,7 +139,7 @@ pub(crate) fn bind_control_listener(path: &Path) -> Result<UnixListener> {
                 path.display()
             )));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {}
         Err(e) => {
             return Err(WaywiError::IpcError(format!(
                 "control socket {} is not connectable ({e})",
@@ -151,8 +154,7 @@ pub(crate) fn bind_control_listener(path: &Path) -> Result<UnixListener> {
                 path.display()
             )));
         }
-        Ok(_) => {}
-        Err(_) => {}
+        Ok(_) | Err(_) => {}
     }
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -241,26 +243,27 @@ fn push_trimmed_line(raw: &[u8], out: &mut Vec<String>) {
     }
 }
 
-type ReplyWriterInstaller = Rc<dyn Fn(UnixStream, Vec<u8>)>;
+type ReplyWriterPayload = (UnixStream, Vec<u8>);
+type ReplyWriterSender = calloop_channel::Sender<ReplyWriterPayload>;
 
 struct PendingReply {
     stream: Option<UnixStream>,
-    insert_writer: Option<ReplyWriterInstaller>,
+    reply_writer_tx: Option<ReplyWriterSender>,
 }
 
 impl PendingReply {
-    fn new(stream: UnixStream, insert_writer: ReplyWriterInstaller) -> Self {
+    fn new(stream: UnixStream, reply_writer_tx: ReplyWriterSender) -> Self {
         Self {
             stream: Some(stream),
-            insert_writer: Some(insert_writer),
+            reply_writer_tx: Some(reply_writer_tx),
         }
     }
 
-    fn send(&mut self, bytes: &[u8]) -> Result<()> {
+    fn send(&mut self, bytes: &[u8]) -> bool {
         let Some(stream) = self.stream.take() else {
-            return Ok(());
+            return false;
         };
-        let insert_writer = self.insert_writer.take();
+        let reply_writer_tx = self.reply_writer_tx.take();
         let capped = &bytes[..bytes.len().min(MAX_CONTROL_REPLY_BYTES)];
         let mut written = 0usize;
         let mut s_ref = &stream;
@@ -268,30 +271,27 @@ impl PendingReply {
         while written < capped.len() {
             match s_ref.write(&capped[written..]) {
                 Ok(0) => {
-                    return Err(WaywiError::IpcError(
-                        "control client disconnected during reply".into(),
-                    ));
+                    let _ = stream.shutdown(Shutdown::Write);
+                    return false;
                 }
                 Ok(n) => written += n,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    if let Some(installer) = insert_writer {
-                        installer(stream, capped[written..].to_vec());
-                        return Ok(());
+                    if let Some(tx) = reply_writer_tx
+                        && tx.send((stream, capped[written..].to_vec())).is_ok()
+                    {
+                        return true;
                     }
-                    return Err(WaywiError::IpcError(
-                        "control reply socket buffer full".into(),
-                    ));
+                    return false;
                 }
-                Err(e) => {
-                    return Err(WaywiError::IpcError(format!(
-                        "failed writing control reply: {e}"
-                    )));
+                Err(_) => {
+                    let _ = stream.shutdown(Shutdown::Write);
+                    return false;
                 }
             }
         }
         let _ = stream.shutdown(Shutdown::Write);
-        Ok(())
+        true
     }
 }
 
@@ -303,13 +303,17 @@ impl Drop for PendingReply {
     }
 }
 
-/// Incoming command line from a local control socket, paired with a one-shot reply handle when
-/// received through [`Control::socket_requests`](super::Control::socket_requests).
+/// Incoming command line from a local control socket, paired with a thread-safe (`Send + Sync`)
+/// one-shot reply handle.
+///
+/// Implements [`Deref<Target = str>`] and [`AsRef<str>`] for direct string matching, and
+/// automatically shuts down the reply write-half on [`Drop`] if [`ControlRequest::reply`] was not
+/// invoked so [`send_command_with_reply`] callers receive EOF immediately.
 #[derive(Clone)]
 pub struct ControlRequest {
     id: u64,
     command: String,
-    reply: Option<Rc<RefCell<Option<PendingReply>>>>,
+    reply: Option<Arc<Mutex<Option<PendingReply>>>>,
 }
 
 impl PartialEq for ControlRequest {
@@ -319,6 +323,28 @@ impl PartialEq for ControlRequest {
 }
 
 impl Eq for ControlRequest {}
+
+impl AsRef<str> for ControlRequest {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        &self.command
+    }
+}
+
+impl Deref for ControlRequest {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl fmt::Display for ControlRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.command)
+    }
+}
 
 impl fmt::Debug for ControlRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -347,24 +373,29 @@ impl ControlRequest {
     /// Returns `true` when this request still holds an unsent one-shot reply slot.
     #[must_use]
     pub fn can_reply(&self) -> bool {
-        self.reply
-            .as_ref()
-            .is_some_and(|slot| slot.borrow().is_some())
+        self.reply.as_ref().is_some_and(|slot| match slot.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        })
     }
 
     /// Writes a bounded reply back to the requesting peer and closes the reply half cleanly.
     ///
-    /// Returns `Ok(true)` if the reply was dispatched, or `Ok(false)` if this request has no active
-    /// reply channel or was already answered.
-    pub fn reply(&self, response: impl AsRef<str>) -> Result<bool> {
+    /// Returns `true` if the reply was dispatched (written immediately or queued for non-blocking
+    /// completion on the event loop), or `false` if this request has no active reply channel, was
+    /// already answered, or writing failed.
+    pub fn reply(&self, body: impl AsRef<[u8]>) -> bool {
         let Some(ref slot) = self.reply else {
-            return Ok(false);
+            return false;
         };
-        let Some(mut pending) = slot.borrow_mut().take() else {
-            return Ok(false);
+        let pending = match slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
         };
-        pending.send(response.as_ref().as_bytes())?;
-        Ok(true)
+        let Some(mut pending) = pending else {
+            return false;
+        };
+        pending.send(body.as_ref())
     }
 }
 
@@ -420,31 +451,24 @@ struct PendingControlClient {
 struct PendingControlPool {
     next_id: u64,
     next_req_id: u64,
+    next_writer_id: u64,
     clients: HashMap<u64, PendingControlClient>,
+    reply_writers: HashMap<u64, RegistrationToken>,
     timer_token: Option<RegistrationToken>,
 }
 
 /// Active `calloop` registration managing the control `UnixListener`, bounded non-blocking
-/// client streams, and an on-demand expiration timer.
+/// client streams, slow-client reply writers, and an on-demand expiration timer.
 pub(crate) struct ControlSocketRegistration {
     path: PathBuf,
     listener_token: RegistrationToken,
+    reply_channel_token: RegistrationToken,
     pool: Rc<RefCell<PendingControlPool>>,
-    reply_enabled: Rc<Cell<bool>>,
+    #[cfg(test)]
+    reply_writer_tx: ReplyWriterSender,
 }
 
 impl ControlSocketRegistration {
-    #[inline]
-    #[must_use]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    #[inline]
-    pub(crate) fn set_reply_enabled(&self, enabled: bool) {
-        self.reply_enabled.set(enabled);
-    }
-
     #[cfg(test)]
     #[must_use]
     pub(crate) fn pending_count(&self) -> usize {
@@ -457,12 +481,17 @@ impl ControlSocketRegistration {
         self.pool.borrow().timer_token.is_some()
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn active_reply_writer_count(&self) -> usize {
+        self.pool.borrow().reply_writers.len()
+    }
+
     /// Binds `path` and registers the control socket listener on `loop_handle` using default
     /// pending-client limits and deadlines.
     pub(crate) fn bind_and_insert<D: 'static, F>(
         path: PathBuf,
         loop_handle: &LoopHandle<'static, D>,
-        reply_enabled: bool,
         on_requests: F,
     ) -> Result<Self>
     where
@@ -473,7 +502,6 @@ impl ControlSocketRegistration {
             loop_handle,
             MAX_PENDING_CONTROL_CLIENTS,
             CONTROL_CLIENT_DEADLINE,
-            reply_enabled,
             on_requests,
         )
     }
@@ -483,7 +511,6 @@ impl ControlSocketRegistration {
         loop_handle: &LoopHandle<'static, D>,
         max_pending: usize,
         client_deadline: Duration,
-        reply_enabled: bool,
         on_requests: F,
     ) -> Result<Self>
     where
@@ -491,58 +518,83 @@ impl ControlSocketRegistration {
     {
         let listener = bind_control_listener(&path)?;
         let pool = Rc::new(RefCell::new(PendingControlPool::default()));
-        let reply_flag = Rc::new(Cell::new(reply_enabled));
         let on_reqs: Rc<dyn Fn(Vec<ControlRequest>)> = Rc::new(on_requests);
 
+        let (reply_writer_tx, reply_writer_rx) = calloop_channel::channel::<ReplyWriterPayload>();
         let lh_writer = loop_handle.clone();
-        let insert_writer: ReplyWriterInstaller = Rc::new(move |stream, remaining| {
-            insert_reply_writer(&lh_writer, stream, remaining, client_deadline);
-        });
-
-        let pool_cb = Rc::clone(&pool);
-        let lh_cb = loop_handle.clone();
-        let on_reqs_cb = Rc::clone(&on_reqs);
-        let reply_flag_cb = Rc::clone(&reply_flag);
-
-        let src = Generic::new(listener, Interest::READ, Mode::Level);
-        let listener_token = loop_handle
-            .insert_source(src, move |_, fd, _| {
-                accept_pending_clients(
-                    fd,
-                    &lh_cb,
-                    &pool_cb,
-                    &on_reqs_cb,
-                    &insert_writer,
-                    &reply_flag_cb,
-                    max_pending,
-                    client_deadline,
-                );
-                Ok(PostAction::Continue)
+        let pool_writer = Rc::clone(&pool);
+        let reply_channel_token = loop_handle
+            .insert_source(reply_writer_rx, move |evt, _, _| {
+                if let calloop_channel::Event::Msg((stream, remaining)) = evt {
+                    insert_reply_writer(
+                        &lh_writer,
+                        &pool_writer,
+                        stream,
+                        remaining,
+                        client_deadline,
+                    );
+                }
             })
             .map_err(|e| {
                 let _ = std::fs::remove_file(&path);
                 WaywiError::IpcError(format!(
-                    "failed to register control socket {}: {e}",
+                    "failed to register control reply writer channel {}: {e}",
                     path.display()
                 ))
             })?;
 
+        let pool_cb = Rc::clone(&pool);
+        let lh_cb = loop_handle.clone();
+        let on_reqs_cb = Rc::clone(&on_reqs);
+        #[cfg(test)]
+        let test_writer_tx = reply_writer_tx.clone();
+
+        let src = Generic::new(listener, Interest::READ, Mode::Level);
+        let listener_token = match loop_handle.insert_source(src, move |_, fd, _| {
+            accept_pending_clients(
+                fd,
+                &lh_cb,
+                &pool_cb,
+                &on_reqs_cb,
+                &reply_writer_tx,
+                max_pending,
+                client_deadline,
+            );
+            Ok(PostAction::Continue)
+        }) {
+            Ok(tok) => tok,
+            Err(e) => {
+                loop_handle.remove(reply_channel_token);
+                let _ = std::fs::remove_file(&path);
+                return Err(WaywiError::IpcError(format!(
+                    "failed to register control socket {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+
         Ok(Self {
             path,
             listener_token,
+            reply_channel_token,
             pool,
-            reply_enabled: reply_flag,
+            #[cfg(test)]
+            reply_writer_tx: test_writer_tx,
         })
     }
 
-    /// Unregisters the listener, all pending client streams, and any active timer, and unlinks the
-    /// socket file.
+    /// Unregisters the listener, reply-writer channel, all pending client streams, all active
+    /// slow-client reply writers, and any active timer, and unlinks the socket file.
     pub(crate) fn remove<D>(self, loop_handle: &LoopHandle<'static, D>) {
         loop_handle.remove(self.listener_token);
+        loop_handle.remove(self.reply_channel_token);
         let _ = std::fs::remove_file(&self.path);
         let mut pool = self.pool.borrow_mut();
         for (_, client) in pool.clients.drain() {
             loop_handle.remove(client.token);
+        }
+        for (_, writer_tok) in pool.reply_writers.drain() {
+            loop_handle.remove(writer_tok);
         }
         if let Some(timer_tok) = pool.timer_token.take() {
             loop_handle.remove(timer_tok);
@@ -552,50 +604,63 @@ impl ControlSocketRegistration {
 
 fn insert_reply_writer<D: 'static>(
     loop_handle: &LoopHandle<'static, D>,
+    pool: &Rc<RefCell<PendingControlPool>>,
     stream: UnixStream,
     remaining: Vec<u8>,
     deadline_dur: Duration,
 ) {
+    let writer_id = {
+        let mut p = pool.borrow_mut();
+        let id = p.next_writer_id;
+        p.next_writer_id = p.next_writer_id.wrapping_add(1);
+        id
+    };
     let mut pos = 0usize;
     let deadline = Instant::now() + deadline_dur;
+    let pool_cb = Rc::clone(pool);
     let writer_src = Generic::new(stream, Interest::WRITE, Mode::Level);
-    let _ = loop_handle.insert_source(writer_src, move |_, fd, _| {
+    if let Ok(token) = loop_handle.insert_source(writer_src, move |_, fd, _| {
         if Instant::now() >= deadline {
+            pool_cb.borrow_mut().reply_writers.remove(&writer_id);
             return Ok(PostAction::Remove);
         }
         let mut s_ref: &UnixStream = fd;
         while pos < remaining.len() {
             match s_ref.write(&remaining[pos..]) {
-                Ok(0) => return Ok(PostAction::Remove),
+                Ok(0) => {
+                    pool_cb.borrow_mut().reply_writers.remove(&writer_id);
+                    return Ok(PostAction::Remove);
+                }
                 Ok(n) => pos += n,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(PostAction::Continue),
-                Err(_) => return Ok(PostAction::Remove),
+                Err(_) => {
+                    pool_cb.borrow_mut().reply_writers.remove(&writer_id);
+                    return Ok(PostAction::Remove);
+                }
             }
         }
         let _ = fd.shutdown(Shutdown::Write);
+        pool_cb.borrow_mut().reply_writers.remove(&writer_id);
         Ok(PostAction::Remove)
-    });
+    }) {
+        pool.borrow_mut().reply_writers.insert(writer_id, token);
+    }
 }
 
 fn build_control_requests(
     cmds: Vec<String>,
     stream: &UnixStream,
     pool: &Rc<RefCell<PendingControlPool>>,
-    insert_writer: &ReplyWriterInstaller,
-    with_reply: bool,
+    reply_writer_tx: &ReplyWriterSender,
 ) -> Vec<ControlRequest> {
     let mut out = Vec::with_capacity(cmds.len());
-    let shared_reply = if with_reply {
-        stream.try_clone().ok().map(|dup| {
-            Rc::new(RefCell::new(Some(PendingReply::new(
-                dup,
-                Rc::clone(insert_writer),
-            ))))
-        })
-    } else {
-        None
-    };
+    let shared_reply = stream.try_clone().ok().map(|dup| {
+        Arc::new(Mutex::new(Some(PendingReply::new(
+            dup,
+            reply_writer_tx.clone(),
+        ))))
+    });
 
     let mut p = pool.borrow_mut();
     for command in cmds {
@@ -604,20 +669,18 @@ fn build_control_requests(
         out.push(ControlRequest {
             id,
             command,
-            reply: shared_reply.as_ref().map(Rc::clone),
+            reply: shared_reply.as_ref().map(Arc::clone),
         });
     }
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn accept_pending_clients<D: 'static>(
     listener: &UnixListener,
     loop_handle: &LoopHandle<'static, D>,
     pool: &Rc<RefCell<PendingControlPool>>,
     on_reqs: &Rc<dyn Fn(Vec<ControlRequest>)>,
-    insert_writer: &ReplyWriterInstaller,
-    reply_enabled: &Rc<Cell<bool>>,
+    reply_writer_tx: &ReplyWriterSender,
     max_pending: usize,
     client_deadline: Duration,
 ) {
@@ -631,13 +694,7 @@ fn accept_pending_clients<D: 'static>(
                 let mut cmds = Vec::new();
                 let status = read_nonblocking(&stream, &mut acc, &mut cmds);
                 if !cmds.is_empty() {
-                    let reqs = build_control_requests(
-                        cmds,
-                        &stream,
-                        pool,
-                        insert_writer,
-                        reply_enabled.get(),
-                    );
+                    let reqs = build_control_requests(cmds, &stream, pool, reply_writer_tx);
                     on_reqs(reqs);
                 }
                 if status != ReadStatus::Pending {
@@ -668,8 +725,7 @@ fn accept_pending_clients<D: 'static>(
                 let pool_client = Rc::clone(pool);
                 let lh_client = loop_handle.clone();
                 let on_reqs_client = Rc::clone(on_reqs);
-                let iw_client = Rc::clone(insert_writer);
-                let reply_flag_client = Rc::clone(reply_enabled);
+                let tx_client = reply_writer_tx.clone();
                 let client_src = Generic::new(stream, Interest::READ, Mode::Level);
                 let Ok(client_token) = loop_handle.insert_source(client_src, move |_, fd, _| {
                     handle_client_readable(
@@ -678,8 +734,7 @@ fn accept_pending_clients<D: 'static>(
                         &lh_client,
                         &pool_client,
                         &on_reqs_client,
-                        &iw_client,
-                        reply_flag_client.get(),
+                        &tx_client,
                     )
                 }) else {
                     continue;
@@ -715,8 +770,7 @@ fn handle_client_readable<D: 'static>(
     loop_handle: &LoopHandle<'static, D>,
     pool: &Rc<RefCell<PendingControlPool>>,
     on_reqs: &Rc<dyn Fn(Vec<ControlRequest>)>,
-    insert_writer: &ReplyWriterInstaller,
-    reply_enabled: bool,
+    reply_writer_tx: &ReplyWriterSender,
 ) -> std::io::Result<PostAction> {
     let mut cmds = Vec::new();
     let status = {
@@ -727,7 +781,7 @@ fn handle_client_readable<D: 'static>(
         read_nonblocking(stream, &mut client.acc, &mut cmds)
     };
     if !cmds.is_empty() {
-        let reqs = build_control_requests(cmds, stream, pool, insert_writer, reply_enabled);
+        let reqs = build_control_requests(cmds, stream, pool, reply_writer_tx);
         on_reqs(reqs);
     }
     match status {
@@ -827,12 +881,30 @@ fn arm_deadline_timer<D: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Shutdown;
 
     fn temp_socket_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("waywi-sockctl-{}-{test}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn control_request_is_clone_send_sync_and_derefs_to_str() {
+        fn assert_traits<T: Clone + Send + Sync + AsRef<str> + Deref<Target = str>>() {}
+        assert_traits::<ControlRequest>();
+
+        let req = ControlRequest {
+            id: 42,
+            command: "toggle-osd".to_owned(),
+            reply: None,
+        };
+        assert_eq!(req.command(), "toggle-osd");
+        assert_eq!(req.as_ref(), "toggle-osd");
+        assert_eq!(&*req, "toggle-osd");
+        assert!(req.starts_with("toggle"));
+        assert_eq!(req.to_string(), "toggle-osd");
+        assert!(!req.can_reply());
+        assert!(!req.reply("ignored"));
     }
 
     #[test]
@@ -889,7 +961,6 @@ mod tests {
             &lh,
             MAX_PENDING_CONTROL_CLIENTS,
             Duration::from_secs(5),
-            false,
             move |reqs| {
                 rec_cb
                     .borrow_mut()
@@ -983,7 +1054,6 @@ mod tests {
             &lh,
             MAX_PENDING_CONTROL_CLIENTS,
             Duration::from_millis(250),
-            false,
             move |reqs| {
                 rec_cb
                     .borrow_mut()
@@ -1004,8 +1074,6 @@ mod tests {
         assert!(reg.has_active_timer());
 
         // Oldest 4 silent clients (0..4) were evicted by FIFO and already received EOF.
-        // Use a short blocking read timeout instead of a single non-blocking poll so concurrent
-        // `fork -> exec` in parallel tests cannot transiently pin the server FD before `CLOEXEC`.
         for (idx, old) in silent_clients[..4].iter_mut().enumerate() {
             old.set_read_timeout(Some(Duration::from_millis(250)))
                 .unwrap();
@@ -1071,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn event_loop_supports_request_reply_and_auto_eof_on_ignored_request() {
+    fn event_loop_supports_request_reply_cross_thread_and_auto_eof_on_drop() {
         let dir = temp_socket_dir("req-reply");
         let path = dir.join("reply.sock");
         let mut el: calloop::EventLoop<'static, ()> = calloop::EventLoop::try_new().unwrap();
@@ -1084,7 +1152,6 @@ mod tests {
             &lh,
             MAX_PENDING_CONTROL_CLIENTS,
             Duration::from_secs(2),
-            true,
             move |reqs| {
                 req_cb.borrow_mut().extend(reqs);
             },
@@ -1102,10 +1169,18 @@ mod tests {
         }
         let req = pending_reqs.borrow_mut().remove(0);
         assert_eq!(req.command(), "status");
+        assert_eq!(&*req, "status");
         assert!(req.can_reply());
-        assert!(req.reply("{\"visible\":true}\n").unwrap());
+
+        // Move ControlRequest across threads and reply from a background thread!
+        let req_clone = req.clone();
+        let replied = std::thread::spawn(move || req_clone.reply("{\"visible\":true}\n"))
+            .join()
+            .unwrap();
+        assert!(replied);
         // Second call on a one-shot request is a safe no-op returning false.
-        assert!(!req.reply("second\n").unwrap());
+        assert!(!req.reply(b"second\n"));
+        assert!(!req.can_reply());
         assert_eq!(
             t_status.join().unwrap().unwrap(),
             "{\"visible\":true}\n".to_owned()
@@ -1127,6 +1202,116 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(t_ignored.join().unwrap().unwrap(), "");
         assert!(t0.elapsed() < Duration::from_millis(200));
+
+        reg.remove(&lh);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn slow_client_reply_writers_are_tracked_completed_and_cleaned_up_on_remove() {
+        let dir = temp_socket_dir("slow-writer");
+        let path = dir.join("slow.sock");
+        let mut el: calloop::EventLoop<'static, ()> = calloop::EventLoop::try_new().unwrap();
+        let lh = el.handle();
+
+        let reg = ControlSocketRegistration::bind_and_insert_with_limits(
+            path.clone(),
+            &lh,
+            MAX_PENDING_CONTROL_CLIENTS,
+            Duration::from_secs(2),
+            |_| {},
+        )
+        .unwrap();
+
+        fn fill_until_would_block(stream: &mut UnixStream) -> usize {
+            let filler = [b'x'; 4096];
+            let mut total = 0usize;
+            for chunk in [&filler[..], b"x"] {
+                loop {
+                    match stream.write(chunk) {
+                        Ok(0) => return total,
+                        Ok(n) => total += n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => panic!("unexpected fill error: {e}"),
+                    }
+                }
+            }
+            total
+        }
+
+        // Fill a non-blocking UnixStream pair send buffer until WouldBlock so PendingReply hands
+        // off to the calloop channel writer.
+        let (mut server_side, mut client_side) = UnixStream::pair().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+        client_side.set_nonblocking(true).unwrap();
+        let filled_bytes = fill_until_would_block(&mut server_side);
+        assert!(filled_bytes > 0);
+
+        let req = ControlRequest {
+            id: 1,
+            command: "big".to_owned(),
+            reply: Some(Arc::new(Mutex::new(Some(PendingReply::new(
+                server_side,
+                reg.reply_writer_tx.clone(),
+            ))))),
+        };
+        // Trigger reply from another thread; WouldBlock sends (stream, remaining) over channel.
+        assert!(
+            std::thread::spawn(move || req.reply(b"TAIL\n"))
+                .join()
+                .unwrap()
+        );
+
+        el.dispatch(Some(Duration::from_millis(20)), &mut ())
+            .unwrap();
+        assert_eq!(reg.active_reply_writer_count(), 1);
+
+        // Drain the client side while dispatching the loop so the reply writer finishes and
+        // unregisters itself.
+        let mut drained = Vec::new();
+        let mut buf = [0u8; 8192];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut got_eof = false;
+        while !got_eof && Instant::now() < deadline {
+            loop {
+                match client_side.read(&mut buf) {
+                    Ok(0) => {
+                        got_eof = true;
+                        break;
+                    }
+                    Ok(n) => drained.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("unexpected read error: {e}"),
+                }
+            }
+            if !got_eof {
+                el.dispatch(Some(Duration::from_millis(5)), &mut ())
+                    .unwrap();
+            }
+        }
+        assert!(got_eof);
+        assert!(drained.ends_with(b"TAIL\n"));
+        assert_eq!(reg.active_reply_writer_count(), 0);
+
+        // Register a second stalled writer and verify ControlSocketRegistration::remove cleans it
+        // up cleanly without leaking tokens.
+        let (mut server_side2, _stalled_client2) = UnixStream::pair().unwrap();
+        server_side2.set_nonblocking(true).unwrap();
+        assert!(fill_until_would_block(&mut server_side2) > 0);
+        let req2 = ControlRequest {
+            id: 2,
+            command: "stalled".to_owned(),
+            reply: Some(Arc::new(Mutex::new(Some(PendingReply::new(
+                server_side2,
+                reg.reply_writer_tx.clone(),
+            ))))),
+        };
+        assert!(req2.reply(b"STALLED\n"));
+        el.dispatch(Some(Duration::from_millis(20)), &mut ())
+            .unwrap();
+        assert_eq!(reg.active_reply_writer_count(), 1);
 
         reg.remove(&lh);
         let _ = std::fs::remove_dir(&dir);

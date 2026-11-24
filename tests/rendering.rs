@@ -26,12 +26,12 @@ impl Application for RenderTestApp {
     type State = RenderState;
     type Message = RenderMsg;
 
-    fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         #[cfg(feature = "image-png")]
         let sheet = {
             let bytes = png::make_rgba_png(2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]);
             let asset = ctx.load_image_bytes(&bytes)?;
-            Some(SpriteSheet::new(asset).frame_size(1.logical_px(), 1.logical_px()))
+            Some(SpriteSheet::new(asset).frame_size(1, 1))
         };
         #[cfg(not(feature = "image-png"))]
         let sheet = {
@@ -45,7 +45,11 @@ impl Application for RenderTestApp {
         })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, _ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        _ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             #[cfg(feature = "image-png")]
             RenderMsg::SetSpriteFrame(f) => state.sprite_frame = f,
@@ -59,22 +63,19 @@ impl Application for RenderTestApp {
         let canvas_color = state.canvas_color;
 
         let mut surf = Surface::floating("canvas", Output::Primary)
-            .size(Size::px(40.logical_px(), 40.logical_px()))
+            .size((40.logical_px(), 40.logical_px()))
             .background(Color::rgb(10, 20, 30))
             .child(
                 Rect::new()
                     .position(Position::absolute(0.logical_px(), 0.logical_px()))
-                    .size(Size::px(16.logical_px(), 16.logical_px()))
+                    .size((16.logical_px(), 16.logical_px()))
                     .fill(Color::rgb(255, 0, 0)),
             )
             .child(
-                Canvas::new(
-                    Size::px(16.logical_px(), 16.logical_px()),
-                    (canvas_color.r, canvas_color.g, canvas_color.b),
-                    move |p| {
-                        p.clear(canvas_color);
-                    },
-                )
+                Canvas::new((16.logical_px(), 16.logical_px()), move |p| {
+                    p.clear(canvas_color);
+                })
+                .cache_key((canvas_color.r, canvas_color.g, canvas_color.b))
                 .position(Position::absolute(20.logical_px(), 0.logical_px())),
             );
 
@@ -82,7 +83,7 @@ impl Application for RenderTestApp {
             surf = surf.child(
                 Sprite::new(sheet)
                     .frame(state.sprite_frame)
-                    .size(Size::px(8.logical_px(), 8.logical_px()))
+                    .size((8.logical_px(), 8.logical_px()))
                     .position(Position::absolute(0.logical_px(), 20.logical_px())),
             );
         }
@@ -193,7 +194,7 @@ fn scroll_state_clip_and_translate_blocks_clipped_clicks_and_pixels() {
         type State = ScrollClipState;
         type Message = ScrollClipMsg;
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(ScrollClipState {
                 scroll: ScrollState::new(20.0, 40.0),
                 clicked: Vec::new(),
@@ -203,7 +204,7 @@ fn scroll_state_clip_and_translate_blocks_clipped_clicks_and_pixels() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 ScrollClipMsg::Scrolled(ev) => {
@@ -220,7 +221,7 @@ fn scroll_state_clip_and_translate_blocks_clipped_clicks_and_pixels() {
             let mut s = Surfaces::new();
             let viewport = Clip::new(
                 Column::new()
-                    .size(Size::px(40.logical_px(), 40.logical_px()))
+                    .size((40.logical_px(), 40.logical_px()))
                     .transform(
                         Transform::identity()
                             .translate(0.logical_px(), -state.scroll.offset().logical_px()),
@@ -228,25 +229,25 @@ fn scroll_state_clip_and_translate_blocks_clipped_clicks_and_pixels() {
                     .child(
                         Rect::new()
                             .key("item-1")
-                            .size(Size::px(40.logical_px(), 20.logical_px()))
+                            .size((40.logical_px(), 20.logical_px()))
                             .fill(Color::rgb(255, 0, 0))
                             .on_click(ScrollClipMsg::Clicked(1)),
                     )
                     .child(
                         Rect::new()
                             .key("item-2")
-                            .size(Size::px(40.logical_px(), 20.logical_px()))
+                            .size((40.logical_px(), 20.logical_px()))
                             .fill(Color::rgb(0, 255, 0))
                             .on_click(ScrollClipMsg::Clicked(2)),
                     ),
             )
             .position(Position::absolute(0.logical_px(), 10.logical_px()))
-            .size(Size::px(40.logical_px(), 20.logical_px()))
+            .size((40.logical_px(), 20.logical_px()))
             .on_scroll(ScrollClipMsg::Scrolled);
 
             s.push(
                 Surface::floating("scroll-clip", Output::Primary)
-                    .size(Size::px(40.logical_px(), 40.logical_px()))
+                    .size((40.logical_px(), 40.logical_px()))
                     .background(Color::rgb(10, 20, 30))
                     .child(viewport),
             );
@@ -323,7 +324,7 @@ fn proportional_text_cursor_line_renders_at_measured_x_inside_text() {
         type State = CursorRenderState;
         type Message = CursorRenderMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             let mut input = TextInputState::with_text("iiiWWW");
             // Place cursor strictly in the middle (byte 3, between "iii" and "WWW").
             input.set_cursor_bytes(3, false);
@@ -350,7 +351,7 @@ fn proportional_text_cursor_line_renders_at_measured_x_inside_text() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            ctx: &mut EffectCtx<'_>,
+            ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 CursorRenderMsg::MoveLeft => {
@@ -375,12 +376,12 @@ fn proportional_text_cursor_line_renders_at_measured_x_inside_text() {
 
             s.push(
                 Surface::floating("prop-cursor", Output::Primary)
-                    .size(Size::px(180.logical_px(), 48.logical_px()))
+                    .size((180.logical_px(), 48.logical_px()))
                     .background(Color::rgb(12, 16, 22))
                     .ime(
                         ImeConfig::enabled()
                             .from_text_input(&state.input)
-                            .cursor_rect(GeoRect::new(
+                            .cursor_rect(Bounds::new(
                                 cursor_x,
                                 cursor_y,
                                 2.logical_px(),
@@ -396,7 +397,7 @@ fn proportional_text_cursor_line_renders_at_measured_x_inside_text() {
                     )
                     .child(
                         Rect::new()
-                            .size(Size::px(2.logical_px(), state.metrics.line_height))
+                            .size((2.logical_px(), state.metrics.line_height))
                             .fill(Color::rgb(0, 255, 0))
                             .position(Position::absolute(cursor_x, cursor_y)),
                     ),
@@ -472,7 +473,7 @@ fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
         type State = SpriteTestState;
         type Message = SpriteTestMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             // 4x2 sheet containing two 2x2 cells:
             // Frame 0 (cols 0..2): TL=Red, TR=Green, BL=Blue, BR=White.
             // Frame 1 (cols 2..4): solid Yellow.
@@ -484,16 +485,14 @@ fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
                 0, 0, 255, 255,   255, 255, 255, 255, 255, 255, 0, 255, 255, 255, 0, 255,
             ];
             let asset = ctx.load_rgba_image(4, 2, 16, true, &pixels)?;
-            let mut sheet = SpriteSheet::new(asset)
-                .frame_size(2.logical_px(), 2.logical_px())
-                .timed_animation(
-                    String::from("land_once"),
-                    [
-                        (0, Duration::from_millis(60)),
-                        (1, Duration::from_millis(90)),
-                    ],
-                    PlaybackMode::Once,
-                );
+            let mut sheet = SpriteSheet::new(asset).frame_size(2, 2).timed_animation(
+                String::from("land_once"),
+                [
+                    (0, Duration::from_millis(60)),
+                    (1, Duration::from_millis(90)),
+                ],
+                PlaybackMode::Once,
+            );
             // Register >16 dynamic animations to verify unbounded animation storage.
             for i in 0..24 {
                 sheet =
@@ -514,7 +513,7 @@ fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 SpriteTestMsg::SetFlipX(v) => state.flip_x = v,
@@ -539,7 +538,7 @@ fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
                 .flip_x(state.flip_x)
                 .transform(transform)
                 .position(Position::absolute(10.logical_px(), 10.logical_px()))
-                .size(Size::px(8.logical_px(), 8.logical_px()));
+                .size((8.logical_px(), 8.logical_px()));
 
             // Timed one-shot animated sprite inside a memoized element verifying deadline
             // preservation and `on_animation_end` delivery after the final frame's full duration.
@@ -551,13 +550,13 @@ fn sprite_flip_rotate_nearest_and_timed_on_animation_end_work_end_to_end() {
                     .filter(ImageFilter::Nearest)
                     .on_animation_end(SpriteTestMsg::AnimEnded)
                     .position(Position::absolute(24.logical_px(), 10.logical_px()))
-                    .size(Size::px(4.logical_px(), 4.logical_px()))
+                    .size((4.logical_px(), 4.logical_px()))
                     .into()
             });
 
             s.push(
                 Surface::floating("sprite-surf", Output::Primary)
-                    .size(Size::px(40.logical_px(), 32.logical_px()))
+                    .size((40.logical_px(), 32.logical_px()))
                     .background(Color::BLACK)
                     .child(static_sprite)
                     .child(animated_sprite),
@@ -657,7 +656,7 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
         type State = LayeredState;
         type Message = LayeredMsg;
 
-        fn init(ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             // Single 16x16 irregular texture atlas:
             // - Body (0, 0, 8, 12): solid Blue [0, 0, 255, 255]
             // - Eyes open (8, 0, 4, 2): solid Green [0, 255, 0, 255]
@@ -710,7 +709,7 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
         fn update(
             state: &mut Self::State,
             msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
                 LayeredMsg::SetHappyMouth(v) => state.happy_mouth = v,
@@ -729,11 +728,11 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
 
             let character = Group::new()
                 .position(Position::absolute(10.logical_px(), 10.logical_px()))
-                .size(Size::px(24.logical_px(), 24.logical_px()))
-                // Layer 1: Base body (auto-sized to 8x12 from source_rect, using Bicubic filter)
+                .size((24.logical_px(), 24.logical_px()))
+                // Layer 1: Base body (auto-sized to 8x12 from source region, using Bicubic filter)
                 .child(
                     Image::new(state.atlas)
-                        .source_rect(0, 0, 8, 12)
+                        .region((0, 0, 8, 12))
                         .filter(ImageFilter::Bicubic),
                 )
                 // Layer 2: Blinking eyes from irregular atlas SpriteSheet at (2, 2)
@@ -754,7 +753,7 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
                 // Layer 4: Arm attached at shoulder (8, 4), rotating around left-center pivot (0.0, 0.5)
                 .child(
                     Image::new(state.atlas)
-                        .source_rect(8, 8, 6, 2)
+                        .region((8, 8, 6, 2))
                         .filter(ImageFilter::Nearest)
                         .position(Position::absolute(8.logical_px(), 4.logical_px()))
                         .transform(
@@ -766,7 +765,7 @@ fn layered_paper_doll_character_from_irregular_atlas_and_custom_pivot() {
 
             s.push(
                 Surface::floating("char-surf", Output::Primary)
-                    .size(Size::px(40.logical_px(), 40.logical_px()))
+                    .size((40.logical_px(), 40.logical_px()))
                     .background(Color::BLACK)
                     .child(character),
             );
@@ -822,14 +821,14 @@ fn optical_text_bounds_centers_ink_pixels_symmetrically_in_box() {
         type State = ();
         type Message = ();
 
-        fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             Ok(())
         }
 
         fn update(
             _state: &mut Self::State,
             _msg: Self::Message,
-            _ctx: &mut EffectCtx<'_>,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             Ok(())
         }
@@ -838,7 +837,7 @@ fn optical_text_bounds_centers_ink_pixels_symmetrically_in_box() {
             let mut s = Surfaces::new();
             s.push(
                 Surface::floating("optical-box", Output::Primary)
-                    .size(Size::px(48.logical_px(), 48.logical_px()))
+                    .size((48.logical_px(), 48.logical_px()))
                     .buffer_retention(BufferRetention::ReleaseAfterCommit)
                     .background(Color::TRANSPARENT)
                     .child(
@@ -846,7 +845,7 @@ fn optical_text_bounds_centers_ink_pixels_symmetrically_in_box() {
                             .font(Font::sans())
                             .font_size(24.logical_px())
                             .line_height(1.5)
-                            .optical_bounds(true)
+                            .bounds_mode(TextBoundsMode::Optical)
                             .color(Color::WHITE)
                             .position(Position::absolute(24.logical_px(), 24.logical_px()))
                             .anchor(ElementAnchor::Center),

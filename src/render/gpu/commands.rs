@@ -3,7 +3,7 @@
 use femtovg::renderer::WGPURenderer;
 use femtovg::{Canvas, Color as FemtoColor, Paint, Path, Transform2D};
 
-use crate::geometry::{Affine2D, LogicalPx, LogicalSize, Rect as GeoRect};
+use crate::geometry::{Affine2D, Bounds, LogicalPx, LogicalSize};
 use crate::image::ImageFit;
 use crate::render::backend::FrameScene;
 use crate::render::canvas::{CanvasOp, PathOp};
@@ -83,7 +83,7 @@ pub(crate) fn encode_commands(
                     && b.color.a > 0
                 {
                     let half = b.width.0 * 0.5;
-                    let inset = GeoRect::new(
+                    let inset = Bounds::new(
                         LogicalPx(r.x.0 + half),
                         LogicalPx(r.y.0 + half),
                         LogicalPx((r.width.0 - b.width.0).max(0.0)),
@@ -129,36 +129,6 @@ pub(crate) fn encode_commands(
                     continue;
                 };
                 draw_textured_rect(canvas, cmd, scale_f, img.id, img.width, img.height, *fit);
-            }
-            PaintPayload::Sprite {
-                sheet,
-                asset_revision,
-                frame_index,
-                filter,
-            } => {
-                let src_rect = sheet.frame_source_rect(*frame_index);
-                let Some(img) = textures.resolve_sprite_cell(
-                    canvas,
-                    assets,
-                    super::textures::SpriteCellSpec {
-                        asset_id: sheet.asset.id,
-                        asset_rev: *asset_revision,
-                        src_rect,
-                        filter: *filter,
-                    },
-                    frame_seq,
-                ) else {
-                    continue;
-                };
-                draw_textured_rect(
-                    canvas,
-                    cmd,
-                    scale_f,
-                    img.id,
-                    img.width,
-                    img.height,
-                    ImageFit::Fill,
-                );
             }
             PaintPayload::Text {
                 content,
@@ -223,21 +193,22 @@ pub(crate) fn encode_commands(
                     );
                 }
             }
-            PaintPayload::Canvas { render_key, draw } => {
-                let ops = textures.resolve_canvas_ops(
-                    cmd.node_id,
-                    *render_key,
-                    LogicalSize::new(cmd.local_rect.width, cmd.local_rect.height),
-                    scale_f,
-                    draw,
-                );
+            PaintPayload::Canvas { cache_key, draw } => {
                 canvas.save();
                 canvas.reset_transform();
                 let mut offset_affine = cmd.affine;
                 offset_affine.tx += cmd.local_rect.x.0;
                 offset_affine.ty += cmd.local_rect.y.0;
                 canvas.set_transform(&to_femto_transform(offset_affine, scale_f));
-                replay_canvas_ops(canvas, ops, cmd.local_rect, cmd.opacity, scale_f);
+                let logical_size = LogicalSize::new(cmd.local_rect.width, cmd.local_rect.height);
+                if let Some(key) = *cache_key {
+                    let ops =
+                        textures.resolve_canvas_ops(cmd.node_id, key, logical_size, scale_f, draw);
+                    replay_canvas_ops(canvas, ops, cmd.local_rect, cmd.opacity, scale_f);
+                } else {
+                    let ops = textures.record_uncached_ops(logical_size, scale_f, draw);
+                    replay_canvas_ops(canvas, &ops, cmd.local_rect, cmd.opacity, scale_f);
+                }
                 canvas.restore();
             }
         }
@@ -321,7 +292,7 @@ fn draw_text_quad(
 fn replay_canvas_ops(
     canvas: &mut Canvas<WGPURenderer>,
     ops: &[CanvasOp],
-    bounds: GeoRect,
+    bounds: Bounds,
     opacity: f32,
     scale_f: f32,
 ) {
@@ -387,7 +358,7 @@ fn replay_canvas_ops(
     }
 }
 
-fn build_rounded_rect(r: GeoRect, rad: CornerRadius) -> Path {
+fn build_rounded_rect(r: Bounds, rad: CornerRadius) -> Path {
     let mut path = Path::new();
     let [tl, tr, br, bl] = rad.clamped(r.width.0, r.height.0, 1.0);
     if tl <= 0.0 && tr <= 0.0 && br <= 0.0 && bl <= 0.0 {

@@ -2,23 +2,15 @@ use super::primitives::Point;
 use super::units::{BufferPx, LogicalPx, ScaleFactor};
 
 /// Axis-aligned rectangle in logical surface coordinates.
-///
-/// Alias [`Bounds`] is also exported for callers avoiding name collision with the visual
-/// [`Rect`](crate::render::Rect) primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Rect {
+pub struct Bounds {
     pub x: LogicalPx,
     pub y: LogicalPx,
     pub width: LogicalPx,
     pub height: LogicalPx,
 }
 
-/// Convenience alias for [`Rect`] in layout and hit-testing APIs.
-pub type Bounds = Rect;
-/// Alias for [`Rect`] when avoiding collision with [`Rect`](crate::render::Rect) visual nodes.
-pub type GeoRect = Rect;
-
-impl Rect {
+impl Bounds {
     pub const ZERO: Self = Self {
         x: LogicalPx::ZERO,
         y: LogicalPx::ZERO,

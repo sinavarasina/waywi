@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use crate::geometry::Rect as GeoRect;
+use crate::geometry::Bounds;
+use crate::image::SourceRect;
 use crate::input::NodeId;
 use crate::render::{RetainedNode, RetainedVisual};
 use crate::sprite::SpriteSourceState;
@@ -28,8 +29,8 @@ pub(crate) fn collect_subtree_deadlines<M>(node: &RetainedNode<M>, out: &mut Opt
 pub(crate) fn tick_node_animations<M: Clone>(
     node: &mut RetainedNode<M>,
     now: Instant,
-    changed_frames: &mut Vec<(NodeId, usize)>,
-    dirty_rects: &mut Vec<GeoRect>,
+    changed_frames: &mut Vec<(NodeId, SourceRect)>,
+    dirty_rects: &mut Vec<Bounds>,
     next_deadline: &mut Option<Instant>,
     emitted_messages: &mut Vec<M>,
 ) {
@@ -61,7 +62,10 @@ pub(crate) fn tick_node_animations<M: Clone>(
         );
         if adv.frame_changed {
             *resolved_frame = adv.frame;
-            changed_frames.push((node.node_id, adv.frame));
+            changed_frames.push((
+                node.node_id,
+                SourceRect::from(sheet.frame_source_rect(adv.frame)),
+            ));
             dirty_rects.push(node.world_bounds);
         }
         if adv.just_finished
@@ -125,7 +129,7 @@ mod tests {
     use super::*;
     use crate::accessibility::AccessibleProps;
     use crate::asset::{AssetId, ImageAsset};
-    use crate::geometry::{Affine2D, LogicalPx};
+    use crate::geometry::Affine2D;
     use crate::image::ImageFilter;
     use crate::input::{EventHandlers, NodeId};
     use crate::sprite::{FpsExt, Frames, PlaybackMode, SpriteSheet, SpriteTimeline};
@@ -139,7 +143,7 @@ mod tests {
             height: 16,
         };
         let sheet = SpriteSheet::new(asset)
-            .frame_size(LogicalPx(16.0), LogicalPx(16.0))
+            .frame_size(16, 16)
             .animation_with_mode("walk", Frames::range(0..4), 10.fps(), PlaybackMode::Loop);
 
         let t0 = Instant::now();
@@ -163,8 +167,8 @@ mod tests {
             },
             key: None,
             kind_tag: 3,
-            bounds: GeoRect::ZERO,
-            world_bounds: GeoRect::ZERO,
+            bounds: Bounds::ZERO,
+            world_bounds: Bounds::ZERO,
             affine: Affine2D::IDENTITY,
             clip_rect: None,
             z_index: 0,
@@ -173,7 +177,7 @@ mod tests {
             opacity: 1.0,
             handlers: EventHandlers::default(),
             visual: RetainedVisual::Sprite {
-                sheet: Box::new(sheet),
+                sheet,
                 asset_revision: 1,
                 mode: SpriteSourceState::Playing {
                     animation: SharedStr::from_static("walk"),

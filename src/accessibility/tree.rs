@@ -160,17 +160,15 @@ fn push_retained_node<M>(
     if clickable {
         ak_node.add_action(Action::Click);
         ak_node.add_action(Action::Focus);
-    } else if node.handlers.on_key.is_some()
-        || matches!(
-            node.a11y.role,
-            Some(
-                AccessibleRole::Button
-                    | AccessibleRole::Switch
-                    | AccessibleRole::CheckBox
-                    | AccessibleRole::Slider
-            )
+    } else if matches!(
+        node.a11y.role,
+        Some(
+            AccessibleRole::Button
+                | AccessibleRole::Switch
+                | AccessibleRole::CheckBox
+                | AccessibleRole::Slider
         )
-    {
+    ) {
         ak_node.add_action(Action::Focus);
     }
 
@@ -371,7 +369,7 @@ mod tests {
     use super::*;
     use crate::accessibility::props::AccessibleProps;
     use crate::display::OutputId;
-    use crate::geometry::{Affine2D, Edges, LogicalSize, Rect as GeoRect, ScaleFactor};
+    use crate::geometry::{Affine2D, Bounds, Edges, LogicalSize, ScaleFactor};
     use crate::input::EventHandlers;
     use crate::reconcile::SurfaceSpec;
     use crate::surface::{Anchor, InputMode, KeyboardInteractivity, Layer, SurfaceKey};
@@ -423,13 +421,13 @@ mod tests {
             node_id: btn_id,
             key: None,
             kind_tag: 0,
-            bounds: GeoRect::new(
+            bounds: Bounds::new(
                 LogicalPx(10.0),
                 LogicalPx(4.0),
                 LogicalPx(80.0),
                 LogicalPx(28.0),
             ),
-            world_bounds: GeoRect::new(
+            world_bounds: Bounds::new(
                 LogicalPx(10.0),
                 LogicalPx(4.0),
                 LogicalPx(80.0),
@@ -469,7 +467,7 @@ mod tests {
                 kind: SurfaceKind::Panel,
                 output_id: Some(OutputId(1)),
                 layer: Layer::Top,
-                anchor: Anchor::Top,
+                anchor: Anchor::TOP,
                 margin: Edges::ZERO,
                 logical_size: LogicalSize::new(LogicalPx(800.0), LogicalPx(36.0)),
                 exclusive_zone: 36,

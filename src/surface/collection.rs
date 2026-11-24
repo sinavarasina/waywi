@@ -24,6 +24,11 @@ impl<M: 'static> Surfaces<M> {
         }
     }
 
+    /// Empty surface collection matching [`Subscriptions::none`](crate::subscription::Subscriptions::none).
+    pub fn none() -> Self {
+        Self::new()
+    }
+
     pub fn push(&mut self, surface: Surface<M>) {
         self.items.push(surface);
     }

@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Unique identifier for a decoded asset inside [`App`](crate::app::App)'s shared asset cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,19 +44,6 @@ pub struct DecodedImage {
     pub pixels: Arc<[u8]>,
     /// Monotonically incremented whenever this asset is reloaded.
     pub revision: u64,
-    /// Animated GIF frames if loaded from an animated GIF (`image-gif` feature).
-    #[allow(dead_code)]
-    pub animated_frames: Option<Arc<Vec<DecodedGifFrame>>>,
-}
-
-/// Single frame of an animated GIF (distinct from [`SpriteSheet`](crate::sprite::SpriteSheet)).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct DecodedGifFrame {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Arc<[u8]>,
-    pub delay: Duration,
 }
 
 /// Supported image format detected from magic bytes or extension.
@@ -99,6 +85,11 @@ pub(super) enum AssetSource {
     },
     EncodedBytes {
         bytes: Arc<[u8]>,
+        format: ImageFormat,
+        min_svg_px: u32,
+    },
+    StaticBytes {
+        bytes: &'static [u8],
         format: ImageFormat,
         min_svg_px: u32,
     },

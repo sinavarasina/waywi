@@ -1,63 +1,35 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use crate::arena::FrameArenaPool;
-use crate::asset::AssetCache;
-use crate::capabilities::Capabilities;
+use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
-use crate::effect::{AsyncAssetWorker, EffectCtx};
-use crate::error::Result;
-use crate::geometry::{LogicalPx, LogicalSize, Point, ScaleFactor};
+use crate::effect::ActivationCallback;
+use crate::error::{Result, WaywiError};
+use crate::geometry::{LogicalPx, LogicalSize, Point};
 use crate::input::{ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, ScrollEvent};
-use crate::reconcile::{PointerDispatch, ReconcileTargets, Reconciler, RetainedSurfaceKey};
-use crate::render::{
-    ActiveRenderer, MemoStore, RenderBackend, RendererPreference, enter_memo_scope,
-};
-use crate::system::SystemProviders;
-use crate::timer::TimerScheduler;
+use crate::reconcile::RetainedSurfaceKey;
+use crate::render::{FrameScene, RenderBackend, RendererPreference};
+use crate::surface::SurfaceKey;
+use crate::text::SharedStr;
 
+use super::core::CoreEngine;
+use super::memory::MemoryConfig;
 use super::runner::Application;
 use super::subscription_mgr::flatten_specs;
 
 /// Deterministic headless runtime driving any [`Application`] without opening a Wayland socket.
 ///
 /// Designed for unit/integration tests and Criterion event-dispatch benchmarks verifying view
-/// reconciliation, memo skipping, zero steady-state arena leaks, hit-testing, timers, and
-/// rendering pipelines cleanly.
+/// reconciliation, memo skipping, zero steady-state arena leaks, hit-testing, timers, memory
+/// trimming, and rendering pipelines cleanly.
 pub struct HeadlessRuntime<A: Application> {
     state: A::State,
-    capabilities: Capabilities,
     outputs: Vec<OutputInfo>,
-    assets: AssetCache,
-    asset_worker: AsyncAssetWorker,
-    system: SystemProviders,
-    renderer: ActiveRenderer,
-    arena: FrameArenaPool,
-    memo_store: MemoStore,
-    reconciler: Reconciler<A::Message>,
-    timers: TimerScheduler<A::Message>,
-    configured_sizes: HashMap<RetainedSurfaceKey, LogicalSize>,
-    surface_scales: HashMap<RetainedSurfaceKey, ScaleFactor>,
+    core: CoreEngine<A::Message>,
     inbox: VecDeque<A::Message>,
-    quit_requested: bool,
     frame_buffers: HashMap<RetainedSurfaceKey, Vec<u8>>,
     activation_seq: u64,
-    activated_surfaces: Vec<(crate::surface::SurfaceKey, String)>,
-    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-    audio: crate::audio::AudioClient,
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    player: crate::audio::AudioPlayer,
-    #[cfg(feature = "hyprland-ipc")]
-    hyprland: Option<crate::hyprland::HyprlandClient>,
-    #[cfg(feature = "sway-ipc")]
-    sway: Option<crate::sway::SwayClient>,
-    #[cfg(feature = "dbus")]
-    dbus: crate::dbus::DbusClient,
+    activated_surfaces: Vec<(SurfaceKey, String)>,
     #[cfg(feature = "accessibility")]
     a11y_tree_state: crate::accessibility::AccessibilityTreeState,
 }
@@ -65,158 +37,84 @@ pub struct HeadlessRuntime<A: Application> {
 impl<A: Application> HeadlessRuntime<A> {
     /// Boots `A` against a synthetic output list and explicit [`Capabilities`].
     pub fn new(capabilities: Capabilities, outputs: Vec<OutputInfo>) -> Result<Self> {
-        Self::new_with_renderer(capabilities, outputs, RendererPreference::Auto)
+        Self::with_memory(
+            capabilities,
+            outputs,
+            RendererPreference::Auto,
+            MemoryConfig::default(),
+        )
     }
 
     /// Boots `A` against synthetic outputs using an explicit [`RendererPreference`].
     pub fn new_with_renderer(
-        mut capabilities: Capabilities,
+        capabilities: Capabilities,
         outputs: Vec<OutputInfo>,
         renderer_pref: RendererPreference,
     ) -> Result<Self> {
-        #[allow(unused_mut)]
-        let mut renderer = ActiveRenderer::from_preference(renderer_pref, None);
-        capabilities.set(
-            crate::capabilities::Capability::GpuRenderer,
-            renderer.is_gpu_active(),
-        );
-        let mut assets = AssetCache::new();
-        let asset_worker = AsyncAssetWorker::new();
-        let mut system = SystemProviders::new();
-        let mut quit_requested = false;
-        let mut pending_after = Vec::new();
-        let mut reloaded_assets = Vec::new();
-        let mut pending_activation_requests = Vec::new();
-        let mut pending_surface_activations = Vec::new();
+        Self::with_memory(
+            capabilities,
+            outputs,
+            renderer_pref,
+            MemoryConfig::default(),
+        )
+    }
 
-        #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-        let audio = crate::audio::AudioClient::new();
-        #[cfg(any(
-            feature = "pipewire",
-            feature = "pulseaudio",
-            feature = "alsa",
-            feature = "audio-playback"
-        ))]
-        let player = crate::audio::AudioPlayer::new();
-        #[cfg(feature = "hyprland-ipc")]
-        let hyprland = None;
-        #[cfg(feature = "sway-ipc")]
-        let sway = None;
-        #[cfg(feature = "dbus")]
-        let dbus = crate::dbus::DbusClient::new();
-
-        #[cfg(feature = "text")]
-        let mut measure_cursor = |content: &crate::text::SharedStr,
-                                  style: crate::text::TextMeasureStyle<'_>,
-                                  cursor_byte: usize| {
-            renderer.measure_text_cursor(content, style, cursor_byte, 0)
-        };
-
-        let state = {
-            let mut ctx = EffectCtx {
-                quit_requested: &mut quit_requested,
-                capabilities: &capabilities,
-                outputs: &outputs,
-                assets: &mut assets,
-                asset_worker: &asset_worker,
-                system: &mut system,
-                pending_after: &mut pending_after,
-                reloaded_assets: &mut reloaded_assets,
-                pending_activation_requests: &mut pending_activation_requests,
-                pending_surface_activations: &mut pending_surface_activations,
-                #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-                audio: &audio,
-                #[cfg(any(
-                    feature = "pipewire",
-                    feature = "pulseaudio",
-                    feature = "alsa",
-                    feature = "audio-playback"
-                ))]
-                player: &player,
-                #[cfg(feature = "hyprland-ipc")]
-                hyprland: hyprland.as_ref(),
-                #[cfg(feature = "sway-ipc")]
-                sway: sway.as_ref(),
-                #[cfg(feature = "dbus")]
-                dbus: &dbus,
-                #[cfg(feature = "clipboard")]
-                clipboard_writer: None,
-                #[cfg(feature = "text")]
-                text_cursor_measurer: &mut measure_cursor,
-            };
-            A::init(&mut ctx)?
-        };
-
-        let mut timers = TimerScheduler::new();
+    /// Boots `A` against synthetic outputs using an explicit [`RendererPreference`] and
+    /// [`MemoryConfig`].
+    pub fn with_memory(
+        capabilities: Capabilities,
+        outputs: Vec<OutputInfo>,
+        renderer_pref: RendererPreference,
+        memory: MemoryConfig,
+    ) -> Result<Self> {
+        let mut core = CoreEngine::new(
+            capabilities,
+            renderer_pref,
+            None,
+            memory,
+            SharedStr::from_static("waywi-headless"),
+            false,
+        )?;
         let now = Instant::now();
-        for (delay, factory) in pending_after {
-            if let Ok(msg) = factory().downcast::<A::Message>() {
-                timers.push_imperative(now + delay, *msg);
-            }
-        }
+        let (init_res, post) = core.run_effect(
+            &outputs,
+            #[cfg(feature = "clipboard")]
+            None,
+            now,
+            |ctx| A::init(ctx),
+        );
+        let state = init_res?;
 
         let mut rt = Self {
             state,
-            capabilities,
             outputs,
-            assets,
-            asset_worker,
-            system,
-            renderer,
-            arena: FrameArenaPool::new(),
-            memo_store: MemoStore::default(),
-            reconciler: Reconciler::new(),
-            timers,
-            configured_sizes: HashMap::new(),
-            surface_scales: HashMap::new(),
+            core,
             inbox: VecDeque::new(),
-            quit_requested,
             frame_buffers: HashMap::new(),
             activation_seq: 0,
             activated_surfaces: Vec::new(),
-            #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-            audio,
-            #[cfg(any(
-                feature = "pipewire",
-                feature = "pulseaudio",
-                feature = "alsa",
-                feature = "audio-playback"
-            ))]
-            player,
-            #[cfg(feature = "hyprland-ipc")]
-            hyprland,
-            #[cfg(feature = "sway-ipc")]
-            sway,
-            #[cfg(feature = "dbus")]
-            dbus,
             #[cfg(feature = "accessibility")]
             a11y_tree_state: crate::accessibility::AccessibilityTreeState::default(),
         };
-        rt.drain_activation_effects(pending_activation_requests, pending_surface_activations);
+        rt.drain_activation_effects(post.activation_requests, post.surface_activations);
         rt.step_at(now)?;
         Ok(rt)
     }
 
     fn drain_activation_effects(
         &mut self,
-        requests: Vec<(Option<String>, crate::effect::BoxedActivationCallback)>,
-        activations: Vec<(crate::surface::SurfaceKey, String)>,
+        requests: Vec<(Option<String>, ActivationCallback<A::Message>)>,
+        activations: Vec<(SurfaceKey, String)>,
     ) {
-        let supported = self
-            .capabilities
-            .has(crate::capabilities::Capability::XdgActivation);
+        let supported = self.core.capabilities.has(Capability::XdgActivation);
         for (_app_id, callback) in requests {
             let result = if supported {
                 self.activation_seq = self.activation_seq.saturating_add(1);
                 Ok(format!("headless-activation-token-{}", self.activation_seq))
             } else {
-                Err(crate::error::WaywiError::UnsupportedCapability(
-                    crate::capabilities::Capability::XdgActivation,
-                ))
+                Err(WaywiError::UnsupportedCapability(Capability::XdgActivation))
             };
-            if let Ok(msg) = callback(result).downcast::<A::Message>() {
-                self.inbox.push_back(*msg);
-            }
+            self.inbox.push_back(callback(result));
         }
         if supported {
             self.activated_surfaces.extend(activations);
@@ -227,113 +125,57 @@ impl<A: Application> HeadlessRuntime<A> {
         self.inbox.push_back(msg);
     }
 
+    /// Immediately trims all reclaimable caches and transient buffers in the headless engine.
+    pub fn trim_memory(&mut self) {
+        self.core.trim_memory();
+    }
+
     pub fn step(&mut self) -> Result<()> {
         self.step_at(Instant::now())
     }
 
     pub fn step_at(&mut self, now: Instant) -> Result<()> {
-        for msg in self.timers.collect_due(now) {
-            self.inbox.push_back(msg);
-        }
-        for msg in self.system.collect_due::<A::Message>(now) {
-            self.inbox.push_back(msg);
-        }
-        let (_, _, anim_msgs) = self.reconciler.tick_animations(now);
-        for msg in anim_msgs {
-            self.inbox.push_back(msg);
-        }
+        let _ = self.core.collect_core_due(now, &mut self.inbox);
 
         while let Some(msg) = self.inbox.pop_front() {
-            let mut pending_after = Vec::new();
-            let mut reloaded_assets = Vec::new();
-            let mut pending_activation_requests = Vec::new();
-            let mut pending_surface_activations = Vec::new();
-            #[cfg(feature = "text")]
-            let frame_seq = self.reconciler.frame_seq;
-            #[cfg(feature = "text")]
-            let mut measure_cursor = |content: &crate::text::SharedStr,
-                                      style: crate::text::TextMeasureStyle<'_>,
-                                      cursor_byte: usize| {
-                self.renderer
-                    .measure_text_cursor(content, style, cursor_byte, frame_seq)
-            };
-            let mut ctx = EffectCtx {
-                quit_requested: &mut self.quit_requested,
-                capabilities: &self.capabilities,
-                outputs: &self.outputs,
-                assets: &mut self.assets,
-                asset_worker: &self.asset_worker,
-                system: &mut self.system,
-                pending_after: &mut pending_after,
-                reloaded_assets: &mut reloaded_assets,
-                pending_activation_requests: &mut pending_activation_requests,
-                pending_surface_activations: &mut pending_surface_activations,
-                #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-                audio: &self.audio,
-                #[cfg(any(
-                    feature = "pipewire",
-                    feature = "pulseaudio",
-                    feature = "alsa",
-                    feature = "audio-playback"
-                ))]
-                player: &self.player,
-                #[cfg(feature = "hyprland-ipc")]
-                hyprland: self.hyprland.as_ref(),
-                #[cfg(feature = "sway-ipc")]
-                sway: self.sway.as_ref(),
-                #[cfg(feature = "dbus")]
-                dbus: &self.dbus,
+            let (res, post) = self.core.run_effect(
+                &self.outputs,
                 #[cfg(feature = "clipboard")]
-                clipboard_writer: None,
-                #[cfg(feature = "text")]
-                text_cursor_measurer: &mut measure_cursor,
-            };
-            A::update(&mut self.state, msg, &mut ctx)?;
-            for (delay, factory) in pending_after {
-                if let Ok(m) = factory().downcast::<A::Message>() {
-                    self.timers.push_imperative(now + delay, *m);
-                }
-            }
-            for (aid, rev) in reloaded_assets {
-                self.reconciler.invalidate_asset(aid, rev);
-            }
-            self.drain_activation_effects(pending_activation_requests, pending_surface_activations);
+                None,
+                now,
+                |ctx| A::update(&mut self.state, msg, ctx),
+            );
+            res?;
+            self.drain_activation_effects(post.activation_requests, post.surface_activations);
         }
 
-        let _arena_guard = self.arena.enter_scope();
-        let subs = A::subscriptions(&self.state);
-        let mut flat = Vec::new();
-        flatten_specs(&subs, &mut flat);
-        self.timers.reconcile(flat.iter().copied(), now);
-        self.system.reconcile(flat.iter().copied());
-
         let report = {
-            let _memo_guard = enter_memo_scope(&mut self.memo_store);
-            let declared = A::view(&self.state);
-            self.reconciler.reconcile(
-                declared,
-                &ReconcileTargets {
-                    outputs: &self.outputs,
-                    configured_sizes: &self.configured_sizes,
-                    surface_scales: &self.surface_scales,
-                },
-                &mut self.renderer,
-                &self.assets,
-                now,
-            )
+            let _arena_guard = self.core.arena.enter_scope();
+            let subs = A::subscriptions(&self.state);
+            let mut flat = Vec::new();
+            flatten_specs(&subs, &mut flat);
+            self.core.timers.reconcile(flat.iter().copied(), now);
+            self.core
+                .system_samplers
+                .reconcile(flat.iter().copied(), &mut self.core.system);
+
+            self.core
+                .reconcile_view(&self.outputs, now, || A::view(&self.state))
         };
-        self.memo_store.prune_stale();
 
         for rk in &report.removed_surfaces {
             self.frame_buffers.remove(rk);
+            self.core.renderer.drop_surface_target(*rk);
+            self.core.configured_sizes.remove(rk);
+            self.core.surface_scales.remove(rk);
         }
 
         let mut reclaim_candidates = Vec::new();
-        for (rk, surf) in &mut self.reconciler.surfaces {
+        for (rk, surf) in &mut self.core.reconciler.surfaces {
             if !surf.needs_redraw {
                 continue;
             }
-            self.assets.ensure_decoded_for_commands(&surf.commands);
+            self.core.assets.ensure_decoded_for_commands(&surf.commands);
             let eff = surf.effective_logical_size();
             let (bw, bh) = eff.to_buffer_ceil(surf.scale);
             let len = (bw.0 as usize) * (bh.0 as usize) * 4;
@@ -344,80 +186,59 @@ impl<A: Application> HeadlessRuntime<A> {
             }
             let damage = surf.dirty_buffer_rects();
             if cfg!(any(feature = "renderer-software", feature = "renderer-gpu")) {
-                self.renderer.render_argb8888(
+                self.core.renderer.render_argb8888(
                     buf,
                     bw,
                     bh,
                     &damage,
-                    crate::render::FrameScene {
+                    FrameScene {
                         scale: surf.scale,
                         background: surf.spec.background,
                         commands: &surf.commands,
-                        assets: &self.assets,
-                        frame_seq: self.reconciler.frame_seq,
+                        assets: &self.core.assets,
+                        frame_seq: self.core.reconciler.frame_seq,
                     },
                 )?;
             }
             surf.needs_redraw = false;
             surf.full_redraw = false;
             surf.dirty_logical_rects.clear();
-            self.assets
+            self.core
+                .assets
                 .collect_reclaimable_from_commands(&surf.commands, &mut reclaim_candidates);
         }
-        self.assets.reclaim_assets(&reclaim_candidates);
+        self.core.assets.reclaim_assets(&reclaim_candidates);
 
         Ok(())
     }
 
-    fn enqueue_pointer_dispatch(&mut self, dispatch: PointerDispatch<A::Message>) -> bool {
-        let mut dispatched = false;
-        if let Some(msg) = dispatch.on_click {
-            self.inbox.push_back(msg);
-            dispatched = true;
-        }
-        #[cfg(any(
-            feature = "pipewire",
-            feature = "pulseaudio",
-            feature = "alsa",
-            feature = "audio-playback"
-        ))]
-        if let Some((sound, vol)) = dispatch.click_sound {
-            self.player.play_with_volume(sound, vol);
-            dispatched = true;
-        }
-        if let Some(msg) = dispatch.on_pointer {
-            self.inbox.push_back(msg);
-            dispatched = true;
-        }
-        if let Some(msg) = dispatch.on_surface {
-            self.inbox.push_back(msg);
-            dispatched = true;
-        }
-        dispatched
+    fn surface_key_match(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<RetainedSurfaceKey> {
+        let skey = surface_key.into_surface_key();
+        self.core
+            .reconciler
+            .surfaces
+            .keys()
+            .find(|rk| rk.surface_key == skey)
+            .copied()
     }
 
     fn surface_by_key(
         &self,
         surface_key: impl crate::surface::IntoSurfaceKey,
     ) -> Option<&crate::reconcile::surface::RetainedSurface<A::Message>> {
-        let skey = surface_key.into_surface_key();
-        self.reconciler
-            .surfaces
-            .iter()
-            .find(|(rk, _)| rk.surface_key == skey)
-            .map(|(_, s)| s)
+        let rk = self.surface_key_match(surface_key)?;
+        self.core.reconciler.surfaces.get(&rk)
     }
 
     fn surface_by_key_mut(
         &mut self,
         surface_key: impl crate::surface::IntoSurfaceKey,
     ) -> Option<&mut crate::reconcile::surface::RetainedSurface<A::Message>> {
-        let skey = surface_key.into_surface_key();
-        self.reconciler
-            .surfaces
-            .iter_mut()
-            .find(|(rk, _)| rk.surface_key == skey)
-            .map(|(_, s)| s)
+        let rk = self.surface_key_match(surface_key)?;
+        self.core.reconciler.surfaces.get_mut(&rk)
     }
 
     pub fn click_surface_point(
@@ -430,7 +251,7 @@ impl<A: Application> HeadlessRuntime<A> {
         let dispatch = self
             .surface_by_key(surface_key)
             .map(|surf| surf.dispatch_click_at(pos));
-        dispatch.is_some_and(|d| self.enqueue_pointer_dispatch(d))
+        dispatch.is_some_and(|d| self.core.dispatch_pointer_result(d, &mut self.inbox))
     }
 
     /// Simulates a pointer press on a surface point, triggering matching node `on_pointer_down`,
@@ -446,7 +267,7 @@ impl<A: Application> HeadlessRuntime<A> {
         let dispatch = self
             .surface_by_key(surface_key)
             .map(|surf| surf.dispatch_pointer_down_at(pos, button, Modifiers::empty()));
-        dispatch.is_some_and(|d| self.enqueue_pointer_dispatch(d))
+        dispatch.is_some_and(|d| self.core.dispatch_pointer_result(d, &mut self.inbox))
     }
 
     /// Simulates pointer motion on a surface point, triggering hover transitions (`on_leave`,
@@ -457,41 +278,12 @@ impl<A: Application> HeadlessRuntime<A> {
         x: f32,
         y: f32,
     ) -> bool {
-        let pos = Point::new(LogicalPx(x), LogicalPx(y));
-        let Some(surf) = self.surface_by_key_mut(surface_key) else {
+        let Some(rk) = self.surface_key_match(surface_key) else {
             return false;
         };
-        let move_dispatch = surf.dispatch_pointer_move_at(pos, Modifiers::empty(), true);
-        let mut dispatched = false;
-        if let Some(tr) = move_dispatch.hover {
-            if let Some(msg) = tr.on_leave {
-                self.inbox.push_back(msg);
-                dispatched = true;
-            }
-            if let Some(msg) = tr.on_hover {
-                self.inbox.push_back(msg);
-                dispatched = true;
-            }
-            #[cfg(any(
-                feature = "pipewire",
-                feature = "pulseaudio",
-                feature = "alsa",
-                feature = "audio-playback"
-            ))]
-            if let Some((sound, vol)) = tr.on_hover_sound {
-                self.player.play_with_volume(sound, vol);
-                dispatched = true;
-            }
-        }
-        if let Some(msg) = move_dispatch.on_node_move {
-            self.inbox.push_back(msg);
-            dispatched = true;
-        }
-        if let Some(msg) = move_dispatch.on_surface_move {
-            self.inbox.push_back(msg);
-            dispatched = true;
-        }
-        dispatched
+        let pos = Point::new(LogicalPx(x), LogicalPx(y));
+        self.core
+            .dispatch_pointer_move(rk, pos, Modifiers::empty(), true, &mut self.inbox)
     }
 
     /// Simulates the pointer leaving a surface, firing `on_leave` for the currently hovered node.
@@ -523,7 +315,7 @@ impl<A: Application> HeadlessRuntime<A> {
         let dispatch = self
             .surface_by_key(surface_key)
             .map(|surf| surf.dispatch_pointer_up_at(pos, button, Modifiers::empty()));
-        dispatch.is_some_and(|d| self.enqueue_pointer_dispatch(d))
+        dispatch.is_some_and(|d| self.core.dispatch_pointer_result(d, &mut self.inbox))
     }
 
     /// Simulates a pointer scroll/wheel event on a surface point with `(delta_x, delta_y)` and
@@ -604,7 +396,12 @@ impl<A: Application> HeadlessRuntime<A> {
 
     #[must_use]
     pub fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
+        &self.core.capabilities
+    }
+
+    #[must_use]
+    pub fn memory_config(&self) -> &MemoryConfig {
+        &self.core.memory
     }
 
     #[must_use]
@@ -614,12 +411,12 @@ impl<A: Application> HeadlessRuntime<A> {
 
     #[must_use]
     pub fn quit_requested(&self) -> bool {
-        self.quit_requested
+        self.core.quit_requested
     }
 
     #[must_use]
     pub fn surface_count(&self) -> usize {
-        self.reconciler.surfaces.len()
+        self.core.reconciler.surfaces.len()
     }
 
     #[must_use]
@@ -651,10 +448,11 @@ impl<A: Application> HeadlessRuntime<A> {
         }
     }
 
-    /// Returns all `(SurfaceKey, token)` pairs recorded via [`EffectCtx::activate_surface`] when
-    /// [`Capability::XdgActivation`](crate::capabilities::Capability::XdgActivation) is enabled.
+    /// Returns all `(SurfaceKey, token)` pairs recorded via
+    /// [`EffectCtx::activate_surface`](crate::effect::EffectCtx::activate_surface) when
+    /// [`Capability::XdgActivation`] is enabled.
     #[must_use]
-    pub fn activated_surfaces(&self) -> &[(crate::surface::SurfaceKey, String)] {
+    pub fn activated_surfaces(&self) -> &[(SurfaceKey, String)] {
         &self.activated_surfaces
     }
 
@@ -666,6 +464,7 @@ impl<A: Application> HeadlessRuntime<A> {
     ) -> bool {
         let skey = surface_key.into_surface_key();
         let keys: Vec<RetainedSurfaceKey> = self
+            .core
             .reconciler
             .surfaces
             .keys()
@@ -676,26 +475,26 @@ impl<A: Application> HeadlessRuntime<A> {
             return false;
         }
         for rk in keys {
-            self.configured_sizes.insert(rk, size);
+            self.core.configured_sizes.insert(rk, size);
         }
         true
     }
 
     #[must_use]
     pub fn arena_heap_fallbacks(&self) -> usize {
-        self.arena.last_stats().heap_fallbacks
+        self.core.arena.last_stats().heap_fallbacks
     }
 
     /// Returns `true` if `asset`'s decoded RGBA8 pixel buffer is currently resident in RAM.
     #[must_use]
     pub fn asset_pixels_resident(&self, asset: crate::image::ImageAsset) -> bool {
-        self.assets.is_decoded(asset.id)
+        self.core.assets.is_decoded(asset.id)
     }
 
     /// Returns total decoded RGBA8 pixel bytes currently resident in the internal asset cache.
     #[must_use]
     pub fn decoded_asset_bytes(&self) -> usize {
-        self.assets.decoded_pixel_bytes()
+        self.core.assets.decoded_pixel_bytes()
     }
 
     #[must_use]
@@ -716,7 +515,7 @@ impl<A: Application> HeadlessRuntime<A> {
     pub fn accessibility_tree(&mut self) -> crate::accessibility::AccessibleTreeUpdate {
         crate::accessibility::build_tree_update(
             &mut self.a11y_tree_state,
-            &self.reconciler.surfaces,
+            &self.core.reconciler.surfaces,
             None,
             "waywi-headless",
         )
@@ -730,7 +529,7 @@ impl<A: Application> HeadlessRuntime<A> {
     ) -> bool {
         crate::accessibility::apply_accessibility_action(
             &mut self.a11y_tree_state,
-            &self.reconciler.surfaces,
+            &self.core.reconciler.surfaces,
             request.action,
             request.target_node,
             &mut self.inbox,

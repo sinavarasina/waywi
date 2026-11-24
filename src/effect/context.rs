@@ -1,17 +1,16 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::app::MemoryConfig;
 use crate::asset::{AssetCache, AssetId, AssetRetention};
 use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
 use crate::error::{Result, WaywiError};
 use crate::image::ImageAsset;
 use crate::surface::{IntoSurfaceKey, SurfaceKey};
-use crate::system::{PrivacySnapshot, SystemProviders};
+use crate::system::SystemProviders;
 
-use super::worker::{
-    AsyncAssetWorker, BoxedActivationCallback, BoxedAssetCallback, BoxedMsgFactory,
-};
+use super::worker::{ActivationCallback, AssetCallback};
 
 #[cfg(feature = "clipboard")]
 pub(crate) type ClipboardSetter<'a> =
@@ -26,19 +25,22 @@ pub(crate) type TextCursorMeasurer<'a> = &'a mut dyn FnMut(
 
 /// Runtime context passed into `Application::init` and `Application::update`.
 ///
-/// Gives controlled, feature- and capability-honest access to app shutdown, output discovery,
-/// image/sound asset loading and playback, brightness/privacy helpers, clipboard writes,
-/// imperative one-shot delays, system samplers, and desktop IPC backends.
-pub struct EffectCtx<'a> {
+/// Gives controlled, feature- and capability-honest access to app shutdown, memory trimming,
+/// output discovery, image asset lifecycle, brightness control, clipboard writes, imperative
+/// one-shot delays, system samplers, audio/player clients, and desktop IPC backends.
+pub struct EffectCtx<'a, M> {
     pub(crate) quit_requested: &'a mut bool,
+    pub(crate) trim_requested: &'a mut bool,
     pub(crate) capabilities: &'a Capabilities,
     pub(crate) outputs: &'a [OutputInfo],
+    pub(crate) memory_config: &'a MemoryConfig,
     pub(crate) assets: &'a mut AssetCache,
-    pub(crate) asset_worker: &'a AsyncAssetWorker,
+    pub(crate) pending_asset_jobs: &'a mut Vec<(PathBuf, AssetCallback<M>)>,
     pub(crate) system: &'a mut SystemProviders,
-    pub(crate) pending_after: &'a mut Vec<(Duration, BoxedMsgFactory)>,
+    pub(crate) pending_after: &'a mut Vec<(Duration, M)>,
     pub(crate) reloaded_assets: &'a mut Vec<(AssetId, u64)>,
-    pub(crate) pending_activation_requests: &'a mut Vec<(Option<String>, BoxedActivationCallback)>,
+    pub(crate) evicted_assets: &'a mut Vec<AssetId>,
+    pub(crate) pending_activation_requests: &'a mut Vec<(Option<String>, ActivationCallback<M>)>,
     pub(crate) pending_surface_activations: &'a mut Vec<(SurfaceKey, String)>,
 
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
@@ -51,9 +53,9 @@ pub struct EffectCtx<'a> {
     ))]
     pub(crate) player: &'a crate::audio::AudioPlayer,
     #[cfg(feature = "hyprland-ipc")]
-    pub(crate) hyprland: Option<&'a crate::hyprland::HyprlandClient>,
+    pub(crate) hyprland: Option<&'a crate::compositor::hyprland::HyprlandClient>,
     #[cfg(feature = "sway-ipc")]
-    pub(crate) sway: Option<&'a crate::sway::SwayClient>,
+    pub(crate) sway: Option<&'a crate::compositor::sway::SwayClient>,
     #[cfg(feature = "dbus")]
     pub(crate) dbus: &'a crate::dbus::DbusClient,
     #[cfg(feature = "clipboard")]
@@ -62,7 +64,7 @@ pub struct EffectCtx<'a> {
     pub(crate) text_cursor_measurer: TextCursorMeasurer<'a>,
 }
 
-impl<'a> EffectCtx<'a> {
+impl<'a, M: 'static> EffectCtx<'a, M> {
     /// Requests clean application shutdown at the end of the current update cycle.
     pub fn quit(&mut self) {
         *self.quit_requested = true;
@@ -80,13 +82,26 @@ impl<'a> EffectCtx<'a> {
         self.outputs
     }
 
-    /// Returns a mutable handle to shared Linux system metrics/hardware providers.
+    /// Returns the active [`MemoryConfig`] governing cache budgets and retention defaults.
+    #[must_use]
+    pub fn memory_config(&self) -> &MemoryConfig {
+        self.memory_config
+    }
+
+    /// Requests an immediate best-effort trim of reclaimable caches and idle buffers at the end
+    /// of this effect cycle (reclaimable image pixels, text/canvas/GPU/scratch renderer caches,
+    /// `FrameArenaPool`, `MemoStore`, system/D-Bus caches, sound cache, and idle `wl_shm` pools).
+    pub fn trim_memory(&mut self) {
+        *self.trim_requested = true;
+    }
+
+    /// Returns a mutable handle to shared Linux system metrics and hardware providers.
     pub fn system(&mut self) -> &mut SystemProviders {
         self.system
     }
 
-    /// Loads and caches an image asset (`PNG` / `SVG` / `GIF` per enabled Cargo features) from
-    /// disk synchronously, deduplicating by canonical path and content hash.
+    /// Loads and caches an image asset (`PNG` / `SVG` / `GIF` / `WebP` per enabled Cargo features)
+    /// from disk synchronously, deduplicating by canonical path and content hash.
     pub fn load_image(&mut self, path: impl AsRef<Path>) -> Result<ImageAsset> {
         self.assets.load_file(path)
     }
@@ -101,8 +116,7 @@ impl<'a> EffectCtx<'a> {
         self.assets.load_file_sized(path, min_svg_px)
     }
 
-    /// Loads and caches an image asset from encoded bytes (for `include_bytes!`, embedded icons,
-    /// etc.).
+    /// Loads and caches an image asset from encoded bytes.
     pub fn load_image_bytes(&mut self, bytes: &[u8]) -> Result<ImageAsset> {
         self.assets.load_bytes(bytes)
     }
@@ -111,6 +125,23 @@ impl<'a> EffectCtx<'a> {
     /// at least `min_svg_px` pixels on the longest edge.
     pub fn load_image_bytes_sized(&mut self, bytes: &[u8], min_svg_px: u32) -> Result<ImageAsset> {
         self.assets.load_bytes_sized(bytes, min_svg_px)
+    }
+
+    /// Loads and caches an image asset from `'static` encoded bytes (such as `include_bytes!`),
+    /// avoiding a heap copy of the compressed bytes when [`AssetRetention::ReclaimAfterPresent`]
+    /// is used.
+    pub fn load_image_static(&mut self, bytes: &'static [u8]) -> Result<ImageAsset> {
+        self.assets.load_static_bytes(bytes)
+    }
+
+    /// Loads and caches an image asset from `'static` encoded bytes, rasterizing vector (`SVG`)
+    /// sources to at least `min_svg_px` pixels on the longest edge.
+    pub fn load_image_static_sized(
+        &mut self,
+        bytes: &'static [u8],
+        min_svg_px: u32,
+    ) -> Result<ImageAsset> {
+        self.assets.load_static_bytes_sized(bytes, min_svg_px)
     }
 
     /// Loads and caches a raw straight RGB/RGBA pixel buffer (such as XDG desktop notification
@@ -129,102 +160,86 @@ impl<'a> EffectCtx<'a> {
 
     /// Dispatches image reading and decoding to WayWi's background asset worker thread and delivers
     /// the constructed message when ready.
-    pub fn load_image_async<M: Send + 'static>(
+    pub fn load_image_async(
         &mut self,
         path: impl AsRef<Path>,
-        map: impl FnOnce(Result<ImageAsset>) -> M + Send + 'static,
+        map: impl FnOnce(Result<ImageAsset>) -> M + 'static,
     ) {
-        let path = path.as_ref().to_path_buf();
-        let boxed: BoxedAssetCallback = Box::new(move |res| Box::new(map(res)));
-        self.asset_worker.submit(path, boxed);
+        self.pending_asset_jobs
+            .push((path.as_ref().to_path_buf(), Box::new(map)));
     }
 
     /// Reloads `asset` from `path`, updating its revision counter so dependent surfaces invalidate
     /// and redraw cleanly.
-    pub fn reload_asset(&mut self, asset: ImageAsset, path: impl AsRef<Path>) -> Result<()> {
+    pub fn reload_image(&mut self, asset: ImageAsset, path: impl AsRef<Path>) -> Result<()> {
         let updated = self.assets.reload(asset, path)?;
         let rev = self.assets.revision_of(updated.id);
         self.reloaded_assets.push((updated.id, rev));
+        self.evicted_assets.push(updated.id);
         Ok(())
     }
 
     /// Configures the decoded pixel memory retention policy for `asset`.
     ///
-    /// - [`AssetRetention::KeepDecoded`] (default): keeps decoded premultiplied RGBA8 pixels
-    ///   resident in RAM for immediate redraws.
-    /// - [`AssetRetention::ReclaimAfterPresent`]: releases the decoded RGBA8 pixel buffer after
-    ///   presenting frames that reference `asset` (e.g., static 4K wallpapers), while retaining
-    ///   the [`ImageAsset`] handle, dimensions, revision, and backing disk path or compressed
-    ///   bytes so future redraws (output resize, hotplug, scale change) transparently re-decode
-    ///   on demand.
-    ///
     /// Returns `false` if `asset` is unknown/unloaded, or if
     /// [`AssetRetention::ReclaimAfterPresent`] is requested for a raw pixel asset created via
-    /// [`Self::load_rgba_image`] (which has no compressed or disk backing source).
-    pub fn set_asset_retention(&mut self, asset: ImageAsset, retention: AssetRetention) -> bool {
+    /// [`Self::load_rgba_image`].
+    pub fn set_image_retention(&mut self, asset: ImageAsset, retention: AssetRetention) -> bool {
         self.assets.set_retention(asset.id, retention)
     }
 
     /// Returns the active [`AssetRetention`] policy for `asset`, or `None` if unloaded.
     #[must_use]
-    pub fn asset_retention(&self, asset: ImageAsset) -> Option<AssetRetention> {
+    pub fn image_retention(&self, asset: ImageAsset) -> Option<AssetRetention> {
         self.assets.retention(asset.id)
     }
 
-    /// Immediately frees the decoded RGBA8 pixel buffer for `asset` while keeping its
-    /// [`ImageAsset`] handle, dimensions, revision, and backing disk path or compressed bytes
-    /// intact.
-    ///
-    /// Unlike [`Self::unload_asset`], any future redraw referencing `asset` (such as a sprite
-    /// sheet or popup becoming visible again, or a surface resizing) transparently re-decodes the
-    /// pixels on demand.
-    ///
-    /// Returns `true` if decoded pixels were resident and freed; returns `false` if `asset` is
-    /// unknown, already evicted, or backed only by raw pixels ([`Self::load_rgba_image`]).
-    pub fn evict_asset_pixels(&mut self, asset: ImageAsset) -> bool {
-        self.assets.evict_decoded_pixels(asset.id)
+    /// Immediately frees the decoded RGBA8 pixel buffer (and any cached GPU texture) for `asset`
+    /// while keeping its [`ImageAsset`] handle, dimensions, revision, and backing source intact.
+    pub fn evict_image_pixels(&mut self, asset: ImageAsset) -> bool {
+        let evicted = self.assets.evict_decoded_pixels(asset.id);
+        if evicted {
+            self.evicted_assets.push(asset.id);
+        }
+        evicted
     }
 
-    /// Removes `asset` permanently from the internal asset cache to reclaim all associated memory.
-    ///
-    /// Once unloaded, the handle can no longer be rendered unless reloaded into a fresh asset.
-    /// Prefer [`Self::set_asset_retention`] or [`Self::evict_asset_pixels`] when the asset may
-    /// still need to redraw later.
-    pub fn unload_asset(&mut self, asset: ImageAsset) -> bool {
-        self.assets.unload(asset.id)
+    /// Removes `asset` permanently from the internal asset cache (and any cached GPU texture) to
+    /// reclaim all associated memory.
+    pub fn unload_image(&mut self, asset: ImageAsset) -> bool {
+        let unloaded = self.assets.unload(asset.id);
+        if unloaded {
+            self.evicted_assets.push(asset.id);
+        }
+        unloaded
     }
 
     /// Schedules an imperative one-shot message to be delivered after `delay`.
     ///
     /// Prefer [`Timer::once`](crate::timer::Timer::once) in `subscriptions` when cancellation or
     /// reset-on-rekey semantics are needed.
-    pub fn after<M: Send + 'static>(
-        &mut self,
-        delay: Duration,
-        make_msg: impl FnOnce() -> M + Send + 'static,
-    ) {
-        self.pending_after
-            .push((delay, Box::new(move || Box::new(make_msg()))));
+    pub fn after(&mut self, delay: Duration, msg: M) {
+        self.pending_after.push((delay, msg));
     }
 
     /// Requests a Wayland `xdg_activation_v1` focus-handoff token asynchronously (non-blocking).
     ///
     /// When the compositor issues the token, `map(Ok(token))` is delivered to
     /// [`Application::update`](crate::app::Application::update), where it can be passed to
-    /// [`DesktopEntry::launch_with_token`](crate::desktop::DesktopEntry::launch_with_token) or
+    /// [`DesktopEntry::launch_with`](crate::desktop::DesktopEntry::launch_with) or
     /// [`Self::activate_surface`]. If the compositor does not advertise `xdg_activation_v1`,
     /// `map(Err(WaywiError::UnsupportedCapability(Capability::XdgActivation)))` is delivered.
-    pub fn request_activation_token<M: Send + 'static>(
+    pub fn request_activation_token(
         &mut self,
         app_id: Option<&str>,
-        map: impl FnOnce(Result<String>) -> M + Send + 'static,
+        map: impl FnOnce(Result<String>) -> M + 'static,
     ) {
         let app_id = app_id
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         self.pending_activation_requests
-            .push((app_id, Box::new(move |res| Box::new(map(res)))));
+            .push((app_id, Box::new(map)));
     }
 
     /// Requests compositor activation/focus for a live WayWi surface using a Wayland
@@ -247,7 +262,7 @@ impl<'a> EffectCtx<'a> {
         Ok(())
     }
 
-    /// Accesses the active audio control handle (`set_volume_linear`, `toggle_mute`, etc.).
+    /// Accesses the active audio control handle (`set_volume`, `set_mute`, `set_port`, etc.).
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     pub fn audio(&self) -> Result<&crate::audio::AudioClient> {
         if self.capabilities.has(Capability::PipeWire)
@@ -276,7 +291,7 @@ impl<'a> EffectCtx<'a> {
 
     /// Accesses the Hyprland IPC client when running under Hyprland.
     #[cfg(feature = "hyprland-ipc")]
-    pub fn hyprland(&self) -> Result<&crate::hyprland::HyprlandClient> {
+    pub fn hyprland(&self) -> Result<&crate::compositor::hyprland::HyprlandClient> {
         self.capabilities.require(Capability::HyprlandIpc)?;
         self.hyprland
             .ok_or(WaywiError::UnsupportedCapability(Capability::HyprlandIpc))
@@ -284,7 +299,7 @@ impl<'a> EffectCtx<'a> {
 
     /// Accesses the Sway IPC client when running under Sway / i3-compatible socket.
     #[cfg(feature = "sway-ipc")]
-    pub fn sway(&self) -> Result<&crate::sway::SwayClient> {
+    pub fn sway(&self) -> Result<&crate::compositor::sway::SwayClient> {
         self.capabilities.require(Capability::SwayIpc)?;
         self.sway
             .ok_or(WaywiError::UnsupportedCapability(Capability::SwayIpc))
@@ -298,23 +313,13 @@ impl<'a> EffectCtx<'a> {
         if let Some(h) = self.hyprland
             && self.capabilities.has(Capability::HyprlandIpc)
         {
-            return Ok(crate::compositor::CompositorClient {
-                hyprland: Some(h),
-                #[cfg(feature = "sway-ipc")]
-                sway: self.sway,
-                _marker: std::marker::PhantomData,
-            });
+            return Ok(crate::compositor::CompositorClient::Hyprland(h));
         }
         #[cfg(feature = "sway-ipc")]
         if let Some(s) = self.sway
             && self.capabilities.has(Capability::SwayIpc)
         {
-            return Ok(crate::compositor::CompositorClient {
-                #[cfg(feature = "hyprland-ipc")]
-                hyprland: None,
-                sway: Some(s),
-                _marker: std::marker::PhantomData,
-            });
+            return Ok(crate::compositor::CompositorClient::Sway(s));
         }
         #[cfg(feature = "hyprland-ipc")]
         {
@@ -326,16 +331,17 @@ impl<'a> EffectCtx<'a> {
         }
     }
 
-    /// Accesses the D-Bus session/system query and desktop service client (MPRIS, notifications,
-    /// system tray, NetworkManager, PowerProfiles, UPower, logind, BlueZ, ModemManager, and raw
-    /// queries/calls).
+    /// Accesses the D-Bus session/system client (`.mpris()`, `.nm()`, `.bluetooth()`, `.udisks()`,
+    /// `.logind()`, `.tray()`, `.notifications()`, `.power_profiles()`, `.upower()`, `.modem()`,
+    /// `.portal()`, `.screensaver()`, `.geoclue()`, and raw queries/calls).
     #[cfg(feature = "dbus")]
     pub fn dbus(&self) -> Result<&crate::dbus::DbusClient> {
         self.capabilities.require(Capability::Dbus)?;
         Ok(self.dbus)
     }
 
-    /// Accesses the audio player when playback support is compiled in and enabled.
+    /// Accesses the audio SFX player (`load_file`, `load_bytes`, `load_preset`, `load_system_sound`,
+    /// `play`, `play_at`, `play_trigger`, `stop_all`, `unload`, `clear_cache`).
     #[cfg(any(
         feature = "pipewire",
         feature = "pulseaudio",
@@ -347,140 +353,36 @@ impl<'a> EffectCtx<'a> {
         Ok(self.player)
     }
 
-    /// Loads and caches a sound asset from disk (WAV always; OGG/MP3/FLAC with `audio-playback`).
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn load_sound(&self, path: impl AsRef<Path>) -> Result<crate::audio::SoundAsset> {
-        self.player.load_file(path)
-    }
-
-    /// Loads and caches an encoded sound buffer from memory.
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn load_sound_bytes(&self, bytes: &[u8]) -> Result<crate::audio::SoundAsset> {
-        self.player.load_bytes(bytes)
-    }
-
-    /// Loads and caches a procedural UI sound preset without external files.
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    #[must_use]
-    pub fn load_sound_preset(&self, preset: crate::audio::SoundPreset) -> crate::audio::SoundAsset {
-        self.player.load_preset(preset)
-    }
-
-    /// Resolves and caches a freedesktop XDG Sound Theme event sound (e.g. `"message-new-instant"`).
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn load_system_sound(&self, name: &str) -> Result<crate::audio::SoundAsset> {
-        self.player.load_system_sound(name)
-    }
-
-    /// Plays a cached [`SoundAsset`](crate::audio::SoundAsset) asynchronously on the SFX worker.
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn play_sound(&self, sound: crate::audio::SoundAsset) {
-        self.player.play(sound);
-    }
-
-    /// Plays a cached [`SoundAsset`](crate::audio::SoundAsset) scaled by `volume` (`0.0..=2.0`).
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn play_sound_volume(&self, sound: crate::audio::SoundAsset, volume: f32) {
-        self.player.play_with_volume(sound, volume);
-    }
-
-    /// Plays a built-in synthesized UI sound effect preset at `volume` (`0.0..=2.0`).
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn play_sound_preset(&self, preset: crate::audio::SoundPreset, volume: f32) {
-        self.player.play_preset(preset, volume);
-    }
-
-    /// Resolves and plays an XDG Sound Theme event sound at `volume`.
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn play_system_sound(&self, name: &str, volume: f32) -> Result<()> {
-        self.player.play_system_sound(name, volume)
-    }
-
-    /// Stops all currently active SFX voices immediately.
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    pub fn stop_sounds(&self) {
-        self.player.stop_all();
-    }
-
-    /// Sets laptop backlight brightness (`0.0..=100.0` %) via the cached `systemd-logind`
-    /// D-Bus client (if available) or `/sys/class/backlight`.
+    /// Sets laptop backlight brightness (`0.0..=100.0` %), trying direct `/sys/class/backlight`
+    /// first and falling back to the shared non-blocking `systemd-logind` D-Bus client when
+    /// `dbus` is enabled and available.
     pub fn set_backlight_percent(&self, device_name: &str, percent: f32) -> Result<()> {
         let raw = crate::system::hardware::backlight_percent_to_raw(device_name, percent)?;
-        #[cfg(feature = "dbus")]
-        if let Ok(val32) = u32::try_from(raw)
-            && self
-                .dbus
-                .set_backlight_brightness("backlight", device_name, val32)
-                .is_ok()
-        {
-            return Ok(());
+        match crate::system::hardware::write_backlight_sysfs_raw(device_name, raw) {
+            Ok(()) => Ok(()),
+            Err(sysfs_err) => {
+                #[cfg(feature = "dbus")]
+                if self.capabilities.has(Capability::Dbus)
+                    && let Ok(val32) = u32::try_from(raw)
+                    && self
+                        .dbus
+                        .logind()
+                        .set_brightness("backlight", device_name, val32)
+                        .is_ok()
+                {
+                    return Ok(());
+                }
+                Err(sysfs_err)
+            }
         }
-        crate::system::hardware::write_backlight_sysfs_raw(device_name, raw)
-    }
-
-    /// Schedules a non-blocking DDC/CI VCP `0x10` Luminance write (`0.0..=100.0` %) for an external
-    /// monitor I2C bus.
-    pub fn set_ddc_brightness(&mut self, i2c_bus: u32, percent: f32) {
-        self.system.set_ddc_brightness(i2c_bus, percent);
-    }
-
-    /// Samples currently active camera, microphone, audio-capture, screen-share, and location
-    /// hardware access consumers.
-    pub fn privacy_snapshot(&mut self) -> PrivacySnapshot {
-        self.system.privacy_snapshot()
     }
 
     /// Publishes UTF-8 text to the Wayland standard clipboard (`ClipboardSelection::Clipboard`).
+    #[cfg(feature = "clipboard")]
     pub fn set_clipboard_text(&mut self, text: impl Into<String>) -> Result<()> {
-        let s = text.into();
-        let bytes = s.into_bytes();
-        self.write_clipboard_entries(
-            true,
+        let bytes = text.into().into_bytes();
+        self.set_clipboard(
+            crate::clipboard::ClipboardSelection::Clipboard,
             vec![
                 ("text/plain;charset=utf-8".to_owned(), bytes.clone()),
                 ("UTF8_STRING".to_owned(), bytes.clone()),
@@ -490,11 +392,11 @@ impl<'a> EffectCtx<'a> {
     }
 
     /// Publishes UTF-8 text to the Wayland primary selection (`ClipboardSelection::Primary`).
+    #[cfg(feature = "clipboard")]
     pub fn set_clipboard_primary_text(&mut self, text: impl Into<String>) -> Result<()> {
-        let s = text.into();
-        let bytes = s.into_bytes();
-        self.write_clipboard_entries(
-            false,
+        let bytes = text.into().into_bytes();
+        self.set_clipboard(
+            crate::clipboard::ClipboardSelection::Primary,
             vec![
                 ("text/plain;charset=utf-8".to_owned(), bytes.clone()),
                 ("UTF8_STRING".to_owned(), bytes.clone()),
@@ -518,9 +420,9 @@ impl<'a> EffectCtx<'a> {
         writer(selection, entries)
     }
 
-    #[cfg(feature = "text")]
     /// Measures shaped text bounds and exact cursor `(x, y)` coordinates at `cursor_byte`
     /// using the default typography line height (`1.25`) and left alignment matching [`crate::text::Text::new`].
+    #[cfg(feature = "text")]
     pub fn measure_text_cursor(
         &mut self,
         text: &str,
@@ -551,26 +453,5 @@ impl<'a> EffectCtx<'a> {
         let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
         let style = crate::text::TextMeasureStyle::from_options(options);
         (self.text_cursor_measurer)(&shared, style, cursor_byte)
-    }
-
-    fn write_clipboard_entries(
-        &mut self,
-        primary_clipboard: bool,
-        entries: Vec<(String, Vec<u8>)>,
-    ) -> Result<()> {
-        #[cfg(feature = "clipboard")]
-        {
-            let selection = if primary_clipboard {
-                crate::clipboard::ClipboardSelection::Clipboard
-            } else {
-                crate::clipboard::ClipboardSelection::Primary
-            };
-            self.set_clipboard(selection, entries)
-        }
-        #[cfg(not(feature = "clipboard"))]
-        {
-            let _ = (primary_clipboard, entries);
-            Err(WaywiError::UnsupportedCapability(Capability::Clipboard))
-        }
     }
 }

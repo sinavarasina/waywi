@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::error::Result;
-use crate::system::units::ByteSize;
+use crate::system::units::{ByteSize, DataRate};
 
 use super::mounts::read_disk_mounts;
 use super::types::{DiskDeviceIo, DiskMount, DiskSnapshot};
@@ -88,6 +88,7 @@ impl DiskSampler {
 
     pub fn reset(&mut self) {
         self.prev.clear();
+        self.prev.shrink_to_fit();
         self.prev_time = None;
     }
 
@@ -152,8 +153,8 @@ impl DiskSampler {
                 writes_completed: cur.writes_completed,
                 read_bytes: ByteSize::from_bytes(cur.sectors_read.saturating_mul(SECTOR_BYTES)),
                 write_bytes: ByteSize::from_bytes(cur.sectors_written.saturating_mul(SECTOR_BYTES)),
-                read_bytes_per_sec: read_bps,
-                write_bytes_per_sec: write_bps,
+                read_rate: DataRate::from_bytes_per_sec(read_bps),
+                write_rate: DataRate::from_bytes_per_sec(write_bps),
                 read_iops,
                 write_iops,
             });
@@ -166,9 +167,43 @@ impl DiskSampler {
         DiskSnapshot {
             mounts,
             io,
-            total_read_bytes_per_sec,
-            total_write_bytes_per_sec,
+            total_read_rate: DataRate::from_bytes_per_sec(total_read_bytes_per_sec),
+            total_write_rate: DataRate::from_bytes_per_sec(total_write_bytes_per_sec),
             timestamp: now,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn disk_sampler_computes_typed_data_rates_without_double_counting_partitions() {
+        let s0 = "\
+   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0
+ 259       0 nvme0n1 100 0 2000 10 50 0 1000 5 0 0 0
+ 259       1 nvme0n1p1 100 0 2000 10 50 0 1000 5 0 0 0
+";
+        let s1 = "\
+   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0
+ 259       0 nvme0n1 300 0 6000 20 150 0 5000 15 0 0 0
+ 259       1 nvme0n1p1 300 0 6000 20 150 0 5000 15 0 0 0
+";
+        let mut sampler = DiskSampler::new();
+        let t0 = Instant::now();
+        let snap0 = sampler.feed_snapshot(Vec::new(), s0, t0);
+        assert_eq!(snap0.total_read_rate, DataRate::ZERO);
+        assert_eq!(snap0.total_write_rate, DataRate::ZERO);
+        assert_eq!(snap0.io[0].read_rate, DataRate::ZERO);
+        assert_eq!(snap0.io[0].write_rate, DataRate::ZERO);
+
+        let snap1 = sampler.feed_snapshot(Vec::new(), s1, t0 + Duration::from_secs(2));
+        assert!((snap1.total_read_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
+        assert!((snap1.total_write_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
+        assert!((snap1.io[0].read_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
+        assert!((snap1.io[0].write_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
     }
 }

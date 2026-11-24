@@ -2,10 +2,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::app::subscription_mgr::LoopInbox;
+use crate::app::subscription_mgr::{LoopInbox, fanout_event};
 use crate::geometry::{LogicalPx, Point};
 use crate::input::{Key, KeyEvent, Modifiers, MouseButton, ScrollEvent};
-use crate::reconcile::{PointerDispatch, RetainedSurfaceKey};
+use crate::reconcile::RetainedSurfaceKey;
 use crate::render::RenderBackend;
 use crate::wayland::{WaylandEvent, WaylandState};
 
@@ -15,27 +15,6 @@ fn push_message<M: Clone + 'static>(inbox: &Rc<RefCell<LoopInbox<M>>>, msg: M) {
     inbox.borrow_mut().messages.push_back(msg);
 }
 
-fn enqueue_pointer_dispatch<M: Clone + 'static>(rt: &LoopRuntime<M>, d: PointerDispatch<M>) {
-    if let Some(msg) = d.on_click {
-        push_message(&rt.inbox, msg);
-    }
-    #[cfg(any(
-        feature = "pipewire",
-        feature = "pulseaudio",
-        feature = "alsa",
-        feature = "audio-playback"
-    ))]
-    if let Some((sound, vol)) = d.click_sound {
-        rt.player.play_with_volume(sound, vol);
-    }
-    if let Some(msg) = d.on_pointer {
-        push_message(&rt.inbox, msg);
-    }
-    if let Some(msg) = d.on_surface {
-        push_message(&rt.inbox, msg);
-    }
-}
-
 fn dispatch_pointer_hover_and_move<M: Clone + 'static>(
     rt: &mut LoopRuntime<M>,
     key: RetainedSurfaceKey,
@@ -43,37 +22,13 @@ fn dispatch_pointer_hover_and_move<M: Clone + 'static>(
     modifiers: Modifiers,
     emit_move: bool,
 ) {
-    let Some(surf) = rt.reconciler.surfaces.get_mut(&key) else {
-        return;
-    };
-    let move_dispatch = surf.dispatch_pointer_move_at(pos, modifiers, emit_move);
-    if let Some(tr) = move_dispatch.hover {
-        if let Some(msg) = tr.on_leave {
-            push_message(&rt.inbox, msg);
-        }
-        if let Some(msg) = tr.on_hover {
-            push_message(&rt.inbox, msg);
-        }
-        #[cfg(any(
-            feature = "pipewire",
-            feature = "pulseaudio",
-            feature = "alsa",
-            feature = "audio-playback"
-        ))]
-        if let Some((sound, vol)) = tr.on_hover_sound {
-            rt.player.play_with_volume(sound, vol);
-        }
-    }
-    if let Some(msg) = move_dispatch.on_node_move {
-        push_message(&rt.inbox, msg);
-    }
-    if let Some(msg) = move_dispatch.on_surface_move {
-        push_message(&rt.inbox, msg);
-    }
+    let mut guard = rt.inbox.borrow_mut();
+    rt.core
+        .dispatch_pointer_move(key, pos, modifiers, emit_move, &mut guard.messages);
 }
 
 fn dispatch_pointer_leave<M: Clone + 'static>(rt: &mut LoopRuntime<M>, key: RetainedSurfaceKey) {
-    if let Some(surf) = rt.reconciler.surfaces.get_mut(&key)
+    if let Some(surf) = rt.core.reconciler.surfaces.get_mut(&key)
         && let Some(tr) = surf.update_hover(None)
         && let Some(on_leave) = tr.on_leave
     {
@@ -89,7 +44,7 @@ fn dispatch_pointer_button<M: Clone + 'static>(
     pressed: bool,
     modifiers: Modifiers,
 ) {
-    let Some(surf) = rt.reconciler.surfaces.get(&key) else {
+    let Some(surf) = rt.core.reconciler.surfaces.get(&key) else {
         return;
     };
     let dispatch = if pressed {
@@ -97,7 +52,8 @@ fn dispatch_pointer_button<M: Clone + 'static>(
     } else {
         surf.dispatch_pointer_up_at(pos, button, modifiers)
     };
-    enqueue_pointer_dispatch(rt, dispatch);
+    rt.core
+        .dispatch_pointer_result(dispatch, &mut rt.inbox.borrow_mut().messages);
 }
 
 fn dispatch_touch_tap<M: Clone + 'static>(
@@ -105,8 +61,10 @@ fn dispatch_touch_tap<M: Clone + 'static>(
     key: RetainedSurfaceKey,
     pos: Point,
 ) {
-    if let Some(surf) = rt.reconciler.surfaces.get(&key) {
-        enqueue_pointer_dispatch(rt, surf.dispatch_click_at(pos));
+    if let Some(surf) = rt.core.reconciler.surfaces.get(&key) {
+        let dispatch = surf.dispatch_click_at(pos);
+        rt.core
+            .dispatch_pointer_result(dispatch, &mut rt.inbox.borrow_mut().messages);
     }
 }
 
@@ -115,7 +73,7 @@ fn dispatch_scroll<M: Clone + 'static>(
     key: RetainedSurfaceKey,
     event: ScrollEvent,
 ) {
-    if let Some(surf) = rt.reconciler.surfaces.get(&key)
+    if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
         && let Some(msg) = surf.dispatch_scroll_at(event)
     {
         push_message(&rt.inbox, msg);
@@ -130,7 +88,7 @@ fn dispatch_keyboard_key<M: Clone + 'static>(
     modifiers: Modifiers,
     text: Option<String>,
 ) {
-    if let Some(surf) = rt.reconciler.surfaces.get(&key)
+    if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
         && let Some(ref on_key) = surf.on_key
     {
         let kev = KeyEvent {
@@ -153,71 +111,56 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
     while let Some(ev) = wl.events.pop_front() {
         match ev {
             WaylandEvent::OutputsChanged => {
-                rt.capabilities = wl.capabilities();
-                rt.capabilities.set(
-                    crate::capabilities::Capability::GpuRenderer,
-                    rt.renderer.is_gpu_active(),
-                );
-                #[cfg(feature = "global-shortcuts")]
-                rt.capabilities.set(
-                    crate::capabilities::Capability::GlobalShortcuts,
-                    rt.dbus_client.has_global_shortcuts_portal(),
-                );
-                #[cfg(feature = "accessibility")]
-                rt.capabilities.set(
-                    crate::capabilities::Capability::Accessibility,
-                    crate::accessibility::atspi_runtime_available(),
-                );
+                wl.refresh_wayland_capabilities(&mut rt.core.capabilities);
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceConfigured { key, size } => {
-                rt.configured_sizes.insert(key, size);
+                rt.core.configured_sizes.insert(key, size);
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceScaleChanged { key, scale } => {
-                rt.surface_scales.insert(key, scale);
+                rt.core.surface_scales.insert(key, scale);
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceClosed { key } => {
                 let is_popup = rt
+                    .core
                     .reconciler
                     .surfaces
                     .get(&key)
                     .is_some_and(|s| s.spec.kind == crate::surface::SurfaceKind::Popup);
                 if is_popup {
                     wl.destroy_surface(key);
-                    rt.renderer.drop_surface_target(key);
-                    rt.configured_sizes.remove(&key);
-                    rt.surface_scales.remove(&key);
+                    rt.core.renderer.drop_surface_target(key);
+                    rt.core.configured_sizes.remove(&key);
+                    rt.core.surface_scales.remove(&key);
                 }
-                if let Some(surf) = rt.reconciler.surfaces.get(&key)
+                if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
                     && let Some(msg) = &surf.on_close
                 {
                     push_message(&rt.inbox, msg.clone());
                 } else if !is_popup {
-                    rt.quit_requested = true;
+                    rt.core.quit_requested = true;
                 }
             }
             WaylandEvent::ActivationToken { request_id, token } => {
-                if let Some(cb) = rt.pending_activation_callbacks.remove(&request_id)
-                    && let Ok(msg) = cb(Ok(token)).downcast::<M>()
-                {
-                    push_message(&rt.inbox, *msg);
+                if let Some(cb) = rt.pending_activation_callbacks.remove(&request_id) {
+                    push_message(&rt.inbox, cb(Ok(token)));
                 }
             }
             WaylandEvent::SurfaceFrame { key } => {
-                let (_, _, anim_msgs) = rt.reconciler.tick_animations(Instant::now());
+                let (_, _, anim_msgs) = rt.core.reconciler.tick_animations(Instant::now());
                 if !anim_msgs.is_empty() {
                     rt.inbox.borrow_mut().messages.extend(anim_msgs);
                 }
-                if let Some(s) = rt.reconciler.surfaces.get(&key)
+                if let Some(s) = rt.core.reconciler.surfaces.get(&key)
                     && s.needs_redraw
                 {
                     wl.notify_surface_damage(key, &s.dirty_buffer_rects(), s.full_redraw);
                 }
             }
             WaylandEvent::BufferReleased { key } => {
-                if let Some(s) = rt.reconciler.surfaces.get_mut(&key)
+                if let Some(s) = rt.core.reconciler.surfaces.get_mut(&key)
                     && s.needs_redraw
                 {
                     wl.notify_surface_damage(key, &s.dirty_buffer_rects(), s.full_redraw);
@@ -318,10 +261,11 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 }
             }
             WaylandEvent::KeyboardLayoutChanged(info) => {
-                let mut guard = rt.inbox.borrow_mut();
-                for map in &rt.sub_mgr.keyboard_layout_subs {
-                    guard.messages.push_back(map.call(info.clone()));
-                }
+                fanout_event(
+                    info,
+                    &rt.sub_mgr.keyboard_layout_subs,
+                    &mut rt.inbox.borrow_mut().messages,
+                );
             }
             #[cfg(feature = "idle-notify")]
             WaylandEvent::Idle {
@@ -348,11 +292,11 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
             #[cfg(feature = "ime")]
             WaylandEvent::Ime { key, event } => {
                 if matches!(event, crate::input::ImeEvent::Enter)
-                    && let Some(surf) = rt.reconciler.surfaces.get(&key)
+                    && let Some(surf) = rt.core.reconciler.surfaces.get(&key)
                 {
                     wl.sync_ime_for_surface(key, &surf.spec.ime);
                 }
-                if let Some(surf) = rt.reconciler.surfaces.get(&key)
+                if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
                     && let Some(ref on_ime) = surf.on_ime
                     && let Some(msg) = on_ime.call(event)
                 {
@@ -371,7 +315,7 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
     if rt.last_a11y_focused_surface != wl.focused_keyboard_surface {
         rt.last_a11y_focused_surface = wl.focused_keyboard_surface;
         rt.a11y_bridge
-            .sync(&rt.reconciler.surfaces, wl.focused_keyboard_surface);
+            .sync(&rt.core.reconciler.surfaces, wl.focused_keyboard_surface);
     }
 }
 

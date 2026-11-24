@@ -3,7 +3,7 @@ pub(crate) mod node;
 use std::collections::HashMap;
 
 use crate::asset::AssetCache;
-use crate::geometry::{Affine2D, Edges, LogicalPx, LogicalSize, Rect as GeoRect};
+use crate::geometry::{Affine2D, Bounds, Edges, LogicalPx, LogicalSize, ScaleFactor};
 use crate::input::{ElementKey, NodeId};
 use crate::render::{Align, Element, ElementKind, RenderBackend, RetainedNode};
 
@@ -13,13 +13,13 @@ use super::layout::{LayoutFlow, element_kind_tag};
 
 #[derive(Clone, Copy)]
 pub(super) struct ParentScope {
-    pub(super) rect: GeoRect,
+    pub(super) rect: Bounds,
     pub(super) affine: Affine2D,
-    pub(super) clip_rect: Option<GeoRect>,
+    pub(super) clip_rect: Option<Bounds>,
 }
 
 impl ParentScope {
-    pub(super) fn new(rect: GeoRect, affine: Affine2D, clip_rect: Option<GeoRect>) -> Self {
+    pub(super) fn new(rect: Bounds, affine: Affine2D, clip_rect: Option<Bounds>) -> Self {
         Self {
             rect,
             affine,
@@ -52,8 +52,9 @@ pub(super) struct TreePass<'a, R: RenderBackend> {
     pub(super) assets: &'a AssetCache,
     pub(super) now: std::time::Instant,
     pub(super) frame_seq: u64,
+    pub(super) scale: ScaleFactor,
     pub(super) surface_size: LogicalSize,
-    pub(super) dirty_rects: &'a mut Vec<GeoRect>,
+    pub(super) dirty_rects: &'a mut Vec<Bounds>,
     pub(super) skipped_memo: &'a mut usize,
     pub(super) retired_ids: &'a mut Vec<NodeId>,
     pub(super) anim_deadline: &'a mut Option<std::time::Instant>,
@@ -79,7 +80,7 @@ impl<M: Clone + 'static> Reconciler<M> {
         }
 
         let padding = flow.padding;
-        let inner_rect = GeoRect::new(
+        let inner_rect = Bounds::new(
             parent.rect.x + padding.left,
             parent.rect.y + padding.top,
             (parent.rect.width - padding.left - padding.right).max(LogicalPx::ZERO),
@@ -87,12 +88,13 @@ impl<M: Clone + 'static> Reconciler<M> {
         );
         let child_scope = ParentScope::new(inner_rect, parent.affine, parent.clip_rect);
 
-        let items: Vec<Element<M>> = declared.into_iter().collect();
-        let mut out = Vec::with_capacity(items.len());
+        let iter = declared.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut out = Vec::with_capacity(lower);
         let mut cursor_main = LogicalPx::ZERO;
         let mut unkeyed_cursor = 0usize;
 
-        for el in items {
+        for el in iter {
             // Handle $O(1)$ memo hit first!
             if let ElementKind::MemoHit { key } = el.kind {
                 if let Some(&idx) = keyed_map.get(&key)

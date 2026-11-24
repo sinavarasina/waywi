@@ -26,6 +26,9 @@ pub struct BatteryInfo {
     pub energy_full_uwh: Option<u64>,
 }
 
+/// Snapshot of battery devices read from `/sys/class/power_supply`.
+pub type BatterySnapshot = Vec<BatteryInfo>;
+
 /// Enumerates battery devices under `/sys/class/power_supply`.
 pub fn read_batteries() -> Result<Vec<BatteryInfo>> {
     read_batteries_from(Path::new("/sys/class/power_supply"))

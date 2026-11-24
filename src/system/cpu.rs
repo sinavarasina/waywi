@@ -130,11 +130,46 @@ impl CpuSampler {
     pub fn reset(&mut self) {
         self.prev_total = None;
         self.prev_cores.clear();
+        self.prev_cores.shrink_to_fit();
     }
 
     #[must_use]
     pub const fn sample_reads(&self) -> u64 {
         self.sample_reads
+    }
+
+    /// Reads `/proc/stat`, `/proc/loadavg`, and `cpufreq` sysfs once, always returning a
+    /// [`CpuSnapshot`] (with `0.0` utilization on the initial baseline read or if `/proc/stat`
+    /// cannot be read).
+    pub fn sample_snapshot(&mut self) -> CpuSnapshot {
+        let now = Instant::now();
+        let Ok(contents) = std::fs::read_to_string("/proc/stat") else {
+            return CpuSnapshot {
+                total_percent: 0.0,
+                per_core_percent: Vec::new(),
+                per_core_freq_khz: Vec::new(),
+                load_avg: read_load_average().unwrap_or_default(),
+                logical_cores: 0,
+                timestamp: now,
+            };
+        };
+        let mut snap = match self.feed_proc_stat(&contents, now) {
+            Some(snap) => snap,
+            None => {
+                let logical_cores = self.prev_cores.len();
+                CpuSnapshot {
+                    total_percent: 0.0,
+                    per_core_percent: vec![0.0; logical_cores],
+                    per_core_freq_khz: Vec::new(),
+                    load_avg: LoadAverage::default(),
+                    logical_cores,
+                    timestamp: now,
+                }
+            }
+        };
+        snap.per_core_freq_khz = read_per_core_freq_khz(snap.logical_cores);
+        snap.load_avg = read_load_average().unwrap_or_default();
+        snap
     }
 
     /// Reads `/proc/stat`, `/proc/loadavg`, and `cpufreq` sysfs once, returning `Some(CpuSnapshot)`

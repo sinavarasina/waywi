@@ -2,16 +2,22 @@ use std::time::Instant;
 
 use crate::wayland::WaylandState;
 
-use super::LoopRuntime;
-
 #[cfg(any(
     feature = "pipewire",
     feature = "pulseaudio",
     feature = "alsa",
     feature = "hyprland-ipc",
     feature = "sway-ipc",
+))]
+use super::super::subscription_mgr::fanout_event;
+use super::LoopRuntime;
+
+#[cfg(any(
+    feature = "hyprland-ipc",
+    feature = "sway-ipc",
     feature = "dbus",
-    feature = "control-ipc"
+    feature = "global-shortcuts",
+    feature = "control-ipc",
 ))]
 fn push_mapped<M: Clone + 'static, E, F>(
     inbox: &std::rc::Rc<std::cell::RefCell<crate::app::subscription_mgr::LoopInbox<M>>>,
@@ -29,167 +35,99 @@ fn push_mapped<M: Clone + 'static, E, F>(
     }
 }
 
-#[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc", feature = "dbus"))]
-fn fanout_broadcast<M: Clone + 'static, E: Clone>(
-    inbox: &std::rc::Rc<std::cell::RefCell<crate::app::subscription_mgr::LoopInbox<M>>>,
-    drain: impl FnOnce(&mut crate::app::subscription_mgr::LoopInbox<M>) -> Vec<E>,
-    subs: &[crate::arena::FrameSharedFn<E, M>],
-) {
-    let events = drain(&mut inbox.borrow_mut());
-    push_mapped(inbox, events, |ev, messages| {
-        for map in subs {
-            messages.push_back(map.call(ev.clone()));
-        }
-    });
-}
-
 /// Phase 1: collect due timers, provider samples, animation frames, async assets, and IPC inputs.
 pub(crate) fn collect_sources<M: Clone + 'static>(
     rt: &mut LoopRuntime<M>,
     wl: &mut WaylandState,
     now: Instant,
 ) {
-    {
+    let anim_dirty = {
         let mut guard = rt.inbox.borrow_mut();
-        guard.messages.extend(rt.timers.collect_due(now));
-        guard.messages.extend(rt.system.collect_due::<M>(now));
-    }
-
-    let (anim_dirty, _, anim_msgs) = rt.reconciler.tick_animations(now);
-    if !anim_msgs.is_empty() {
-        rt.inbox.borrow_mut().messages.extend(anim_msgs);
-    }
+        rt.core.collect_core_due(now, &mut guard.messages)
+    };
     for rk in anim_dirty {
-        if let Some(s) = rt.reconciler.surfaces.get(&rk) {
+        if let Some(s) = rt.core.reconciler.surfaces.get(&rk) {
             let buf_rects = s.dirty_buffer_rects();
             wl.notify_surface_damage(rk, &buf_rects, s.full_redraw);
         }
     }
 
-    for done in rt.asset_worker.drain_completed() {
-        let asset_res = done.decoded.map(|dec| {
-            rt.assets
-                .commit_worker_decoded(Some(done.path), done.format, done.content_hash, dec)
-        });
-        if let Ok(msg) = (done.map)(asset_res).downcast::<M>() {
-            rt.inbox.borrow_mut().messages.push_back(*msg);
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    if rt.core.audio_client.has_pending() {
+        let (snap_opt, events) = rt.core.audio_client.drain_updates();
+        if snap_opt.is_some() || !events.is_empty() {
+            let mut guard = rt.inbox.borrow_mut();
+            if let Some(snap) = snap_opt {
+                fanout_event(snap, &rt.sub_mgr.audio_snapshot_subs, &mut guard.messages);
+            }
+            for ev in events {
+                fanout_event(ev, &rt.sub_mgr.audio_event_subs, &mut guard.messages);
+            }
         }
     }
 
-    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    #[cfg(feature = "hyprland-ipc")]
     {
-        let events = rt.audio_client.drain_events();
-        push_mapped(&rt.inbox, events, |ev, messages| {
-            if let crate::audio::AudioEvent::Updated(ref snap) = ev {
-                for map in &rt.sub_mgr.audio_snapshot_subs {
-                    messages.push_back(map.call(snap.clone()));
-                }
+        let evs: Vec<_> = rt.inbox.borrow_mut().hyprland_events.drain(..).collect();
+        let emit_compositor =
+            rt.core.hyprland_client.is_some() && !rt.sub_mgr.compositor_subs.is_empty();
+        push_mapped(&rt.inbox, evs, |ev, messages| {
+            if emit_compositor
+                && let Some(ce) = crate::compositor::CompositorEvent::from_hyprland(&ev)
+            {
+                fanout_event(ce, &rt.sub_mgr.compositor_subs, messages);
             }
-            for map in &rt.sub_mgr.audio_event_subs {
-                messages.push_back(map.call(ev.clone()));
-            }
+            fanout_event(ev, &rt.sub_mgr.hyprland_subs, messages);
         });
     }
 
-    #[cfg(feature = "hyprland-ipc")]
-    fanout_broadcast(
-        &rt.inbox,
-        |inbox| inbox.hyprland_events.drain(..).collect(),
-        &rt.sub_mgr.hyprland_subs,
-    );
-
     #[cfg(feature = "sway-ipc")]
-    fanout_broadcast(
-        &rt.inbox,
-        |inbox| inbox.sway_events.drain(..).collect(),
-        &rt.sub_mgr.sway_subs,
-    );
+    {
+        let evs: Vec<_> = rt.inbox.borrow_mut().sway_events.drain(..).collect();
+        #[cfg(feature = "hyprland-ipc")]
+        let hyprland_primary = rt.core.hyprland_client.is_some();
+        #[cfg(not(feature = "hyprland-ipc"))]
+        let hyprland_primary = false;
+        let emit_compositor = !hyprland_primary
+            && rt.core.sway_client.is_some()
+            && !rt.sub_mgr.compositor_subs.is_empty();
+        push_mapped(&rt.inbox, evs, |ev, messages| {
+            if emit_compositor && let Some(ce) = crate::compositor::CompositorEvent::from_sway(&ev)
+            {
+                fanout_event(ce, &rt.sub_mgr.compositor_subs, messages);
+            }
+            fanout_event(ev, &rt.sub_mgr.sway_subs, messages);
+        });
+    }
 
     #[cfg(feature = "dbus")]
     {
-        let evs: Vec<_> = rt.inbox.borrow_mut().dbus_signal_events.drain(..).collect();
-        push_mapped(&rt.inbox, evs, |(filter_key, ev), messages| {
+        let sig_evs: Vec<_> = rt.inbox.borrow_mut().dbus_signal_events.drain(..).collect();
+        push_mapped(&rt.inbox, sig_evs, |(filter_key, ev), messages| {
             for (sub_k, map) in &rt.sub_mgr.dbus_signal_subs {
                 if *sub_k == filter_key {
                     messages.push_back(map.call(ev.clone()));
                 }
             }
         });
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_notifications.drain(..).collect(),
-            &rt.sub_mgr.dbus_notification_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_tray.drain(..).collect(),
-            &rt.sub_mgr.dbus_tray_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_power_profiles.drain(..).collect(),
-            &rt.sub_mgr.dbus_power_profile_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_network_manager.drain(..).collect(),
-            &rt.sub_mgr.dbus_network_manager_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_upower.drain(..).collect(),
-            &rt.sub_mgr.dbus_upower_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_udisks.drain(..).collect(),
-            &rt.sub_mgr.dbus_udisks_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_logind.drain(..).collect(),
-            &rt.sub_mgr.dbus_logind_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_bluetooth.drain(..).collect(),
-            &rt.sub_mgr.dbus_bluetooth_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_bluetooth_agent.drain(..).collect(),
-            &rt.sub_mgr.dbus_bluetooth_agent_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_modem.drain(..).collect(),
-            &rt.sub_mgr.dbus_modem_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_screensaver.drain(..).collect(),
-            &rt.sub_mgr.dbus_screensaver_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_geoclue.drain(..).collect(),
-            &rt.sub_mgr.dbus_geoclue_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_portal_settings.drain(..).collect(),
-            &rt.sub_mgr.dbus_portal_settings_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_mpris.drain(..).collect(),
-            &rt.sub_mgr.dbus_mpris_subs,
-        );
-        fanout_broadcast(
-            &rt.inbox,
-            |inbox| inbox.dbus_action_results.drain(..).collect(),
-            &rt.sub_mgr.dbus_action_result_subs,
-        );
+
+        let mut guard = rt.inbox.borrow_mut();
+        let msgs = &mut guard.messages;
+        rt.sub_mgr.dbus_notifications.drain_into(msgs);
+        rt.sub_mgr.dbus_tray.drain_into(msgs);
+        rt.sub_mgr.dbus_power_profiles.drain_into(msgs);
+        rt.sub_mgr.dbus_network_manager.drain_into(msgs);
+        rt.sub_mgr.dbus_upower.drain_into(msgs);
+        rt.sub_mgr.dbus_udisks.drain_into(msgs);
+        rt.sub_mgr.dbus_logind.drain_into(msgs);
+        rt.sub_mgr.dbus_bluetooth.drain_into(msgs);
+        rt.sub_mgr.dbus_bluetooth_agent.drain_into(msgs);
+        rt.sub_mgr.dbus_modem.drain_into(msgs);
+        rt.sub_mgr.dbus_screensaver.drain_into(msgs);
+        rt.sub_mgr.dbus_geoclue.drain_into(msgs);
+        rt.sub_mgr.dbus_portal_settings.drain_into(msgs);
+        rt.sub_mgr.dbus_mpris.drain_into(msgs);
+        rt.sub_mgr.dbus_action_results.drain_into(msgs);
     }
 
     #[cfg(feature = "global-shortcuts")]
@@ -220,15 +158,10 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
             }
         });
         let cmds: Vec<_> = rt.inbox.borrow_mut().control_commands.drain(..).collect();
-        push_mapped(&rt.inbox, cmds, |req, messages| {
-            for (_, map) in &rt.sub_mgr.control_socket_subs {
-                if let Some(msg) = map.call(req.command().to_owned()) {
-                    messages.push_back(msg);
-                }
-            }
-            for (_, map) in &rt.sub_mgr.control_request_subs {
-                if let Some(msg) = map.call(req.clone()) {
-                    messages.push_back(msg);
+        push_mapped(&rt.inbox, cmds, |(sock_path, req), messages| {
+            for (sub_path, map) in &rt.sub_mgr.control_socket_subs {
+                if *sub_path == sock_path {
+                    messages.push_back(map.call(req.clone()));
                 }
             }
         });
@@ -239,7 +172,7 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         let mut guard = rt.inbox.borrow_mut();
         if rt
             .a11y_bridge
-            .drain_and_dispatch(&rt.reconciler.surfaces, &mut guard.messages)
+            .drain_and_dispatch(&rt.core.reconciler.surfaces, &mut guard.messages)
         {
             rt.a11y_dirty = true;
         }

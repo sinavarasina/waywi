@@ -1,42 +1,42 @@
 use std::collections::HashMap;
 
 use crate::error::{Result, WaywiError};
-#[cfg(not(feature = "text"))]
-use crate::geometry::LogicalPx;
-use crate::geometry::{BufferPx, BufferRect, LogicalSize};
+use crate::geometry::{BufferPx, BufferRect};
 use crate::input::NodeId;
-use crate::render::backend::{FrameScene, RenderBackend};
+use crate::render::backend::FrameScene;
 use crate::render::retained::PaintPayload;
 use crate::render::software::fast_path::PixelTarget;
 use crate::render::software::raster::TileTarget;
 #[cfg(feature = "text")]
 use crate::text::TextEngine;
-use crate::text::{SharedStr, TextMeasureStyle};
 
 pub(crate) mod bitmap;
 pub(crate) mod fast_path;
 pub(crate) mod path;
 pub(crate) mod raster;
 
-/// Upper bound retained on reusable software rasterization scratch buffers between frames
-/// (2 MiB keeps panels/popups allocation-free while releasing temporary full-screen tiles).
-const SCRATCH_RETAIN_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Default upper bound retained on reusable software rasterization scratch buffers between frames.
+const DEFAULT_SCRATCH_RETAIN_MAX_BYTES: usize = 512 * 1024;
+const DEFAULT_CANVAS_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// Cached rasterized `Canvas` output keyed by `(NodeId, render_key, pixel_w, pixel_h)`.
+/// Cached rasterized `Canvas` output keyed by `(NodeId, cache_key, pixel_w, pixel_h)`.
 pub(crate) struct CachedCanvasPixmap {
-    pub(crate) render_key: u64,
+    pub(crate) cache_key: u64,
     pub(crate) width_px: u32,
     pub(crate) height_px: u32,
+    pub(crate) last_used_frame: u64,
     pub(crate) rgba_pixels: Vec<u8>,
 }
 
-/// Software CPU renderer powered by `tiny-skia` + axis-aligned fast paths + shared `TextEngine`.
+/// Software CPU renderer powered by `tiny-skia` + axis-aligned fast paths.
 pub(crate) struct SoftwareRenderer {
-    #[cfg(feature = "text")]
-    pub(crate) text_engine: TextEngine,
     pub(crate) canvas_cache: HashMap<NodeId, CachedCanvasPixmap>,
+    pub(crate) canvas_bytes: usize,
+    pub(crate) canvas_max_bytes: usize,
     pub(crate) scratch_rgba: Vec<u8>,
     pub(crate) scratch_sprite_cell: Vec<u8>,
+    pub(crate) scratch_canvas: Vec<u8>,
+    pub(crate) scratch_max_bytes: usize,
 }
 
 impl Default for SoftwareRenderer {
@@ -47,67 +47,60 @@ impl Default for SoftwareRenderer {
 
 impl SoftwareRenderer {
     pub(crate) fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_SCRATCH_RETAIN_MAX_BYTES,
+            DEFAULT_CANVAS_CACHE_MAX_BYTES,
+        )
+    }
+
+    pub(crate) fn with_limits(scratch_max_bytes: usize, canvas_max_bytes: usize) -> Self {
         Self {
-            #[cfg(feature = "text")]
-            text_engine: TextEngine::new(),
             canvas_cache: HashMap::new(),
+            canvas_bytes: 0,
+            canvas_max_bytes,
             scratch_rgba: Vec::new(),
             scratch_sprite_cell: Vec::new(),
+            scratch_canvas: Vec::new(),
+            scratch_max_bytes,
         }
     }
-}
 
-impl RenderBackend for SoftwareRenderer {
-    fn drop_canvas_cache_for(&mut self, node_ids: &[NodeId]) {
+    pub(crate) fn drop_canvas_cache_for(&mut self, node_ids: &[NodeId]) {
         for id in node_ids {
-            self.canvas_cache.remove(id);
+            if let Some(old) = self.canvas_cache.remove(id) {
+                self.canvas_bytes = self.canvas_bytes.saturating_sub(old.rgba_pixels.len());
+            }
         }
     }
 
-    fn measure_text(
-        &mut self,
-        content: &SharedStr,
-        style: TextMeasureStyle<'_>,
-        frame_seq: u64,
-    ) -> LogicalSize {
-        #[cfg(feature = "text")]
-        {
-            self.text_engine.measure_text(content, style, frame_seq)
-        }
-        #[cfg(not(feature = "text"))]
-        {
-            let _ = (
-                style.line_height_multiplier,
-                style.max_width,
-                style.font,
-                style.align,
-                style.bounds_mode,
-                frame_seq,
-            );
-            let char_w = style.font_size.0 * 0.6;
-            LogicalSize::new(
-                LogicalPx((content.len() as f32 * char_w).ceil()),
-                LogicalPx((style.font_size.0 * 1.25).ceil()),
-            )
-        }
+    pub(crate) fn trim_memory(&mut self) {
+        self.scratch_rgba = Vec::new();
+        self.scratch_sprite_cell = Vec::new();
+        self.scratch_canvas = Vec::new();
+        self.canvas_cache.clear();
+        self.canvas_cache.shrink_to_fit();
+        self.canvas_bytes = 0;
     }
 
-    #[cfg(feature = "text")]
-    fn measure_text_cursor(
-        &mut self,
-        content: &SharedStr,
-        style: TextMeasureStyle<'_>,
-        cursor_byte: usize,
-        frame_seq: u64,
-    ) -> crate::text::TextCursorMetrics {
-        self.text_engine
-            .measure_text_cursor(content, style, cursor_byte, frame_seq)
+    fn shrink_scratch(&mut self) {
+        let cap = self.scratch_max_bytes;
+        for buf in [
+            &mut self.scratch_rgba,
+            &mut self.scratch_sprite_cell,
+            &mut self.scratch_canvas,
+        ] {
+            if buf.capacity() > cap {
+                buf.clear();
+                buf.shrink_to(cap);
+            }
+        }
     }
 
     /// Renders `scene` across `dirty_rects` into a `wl_shm` little-endian `Argb8888`
     /// (`[B, G, R, A]`) buffer.
-    fn render_argb8888(
+    pub(crate) fn render_argb8888(
         &mut self,
+        #[cfg(feature = "text")] text_engine: &mut TextEngine,
         dst_argb: &mut [u8],
         buf_w: BufferPx,
         buf_h: BufferPx,
@@ -225,7 +218,15 @@ impl RenderBackend for SoftwareRenderer {
                                 origin_x: clipped.x,
                                 origin_y: clipped.y,
                             };
-                            self.render_command_into_tile(&mut tile, scale, cmd, assets, frame_seq);
+                            self.render_command_into_tile(
+                                &mut tile,
+                                #[cfg(feature = "text")]
+                                text_engine,
+                                scale,
+                                cmd,
+                                assets,
+                                frame_seq,
+                            );
                         }
                     }
                 }
@@ -254,14 +255,7 @@ impl RenderBackend for SoftwareRenderer {
             }
         }
 
-        if self.scratch_rgba.capacity() > SCRATCH_RETAIN_MAX_BYTES {
-            self.scratch_rgba.clear();
-            self.scratch_rgba.shrink_to(SCRATCH_RETAIN_MAX_BYTES);
-        }
-        if self.scratch_sprite_cell.capacity() > SCRATCH_RETAIN_MAX_BYTES {
-            self.scratch_sprite_cell.clear();
-            self.scratch_sprite_cell.shrink_to(SCRATCH_RETAIN_MAX_BYTES);
-        }
+        self.shrink_scratch();
 
         Ok(())
     }
@@ -277,12 +271,16 @@ mod tests {
     #[test]
     fn software_scratch_buffer_shrinks_after_large_fullscreen_tile() {
         let mut renderer = SoftwareRenderer::new();
+        #[cfg(feature = "text")]
+        let mut text_engine = TextEngine::with_config(64, 60, false);
         let assets = AssetCache::new();
-        // 1920x400 RGBA = ~3.07 MiB (> 2 MiB retain cap).
+        // 1920x400 RGBA = ~3.07 MiB (> configured retain cap).
         let (w, h) = (1920_i32, 400_i32);
         let mut dst = vec![0u8; (w as usize) * (h as usize) * 4];
         renderer
             .render_argb8888(
+                #[cfg(feature = "text")]
+                &mut text_engine,
                 &mut dst,
                 BufferPx(w),
                 BufferPx(h),
@@ -297,8 +295,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            renderer.scratch_rgba.capacity() <= SCRATCH_RETAIN_MAX_BYTES,
-            "expected scratch_rgba capacity <= {SCRATCH_RETAIN_MAX_BYTES}, got {}",
+            renderer.scratch_rgba.capacity() <= DEFAULT_SCRATCH_RETAIN_MAX_BYTES,
+            "expected scratch_rgba capacity <= {DEFAULT_SCRATCH_RETAIN_MAX_BYTES}, got {}",
             renderer.scratch_rgba.capacity()
         );
     }

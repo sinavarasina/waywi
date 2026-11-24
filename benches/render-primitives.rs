@@ -29,14 +29,18 @@ impl<const ROWS: usize, const COLS: usize, const TILE_PX: u32> Application
     type State = BenchState;
     type Message = BenchMsg;
 
-    fn init(_ctx: &mut EffectCtx<'_>) -> Result<Self::State> {
+    fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
         Ok(BenchState {
             tick: 0,
             mode: BenchMode::UnmemoizedCards,
         })
     }
 
-    fn update(state: &mut Self::State, msg: Self::Message, _ctx: &mut EffectCtx<'_>) -> Result<()> {
+    fn update(
+        state: &mut Self::State,
+        msg: Self::Message,
+        _ctx: &mut EffectCtx<'_, Self::Message>,
+    ) -> Result<()> {
         match msg {
             BenchMsg::MutateOne => state.tick = state.tick.wrapping_add(1),
             BenchMsg::SetMode(mode) => state.mode = mode,
@@ -61,7 +65,7 @@ impl<const ROWS: usize, const COLS: usize, const TILE_PX: u32> Application
         let mut surfaces = Surfaces::new();
         surfaces.push(
             Surface::floating("bench-surface", Output::Primary)
-                .size(Size::px(surf_w.logical_px(), surf_h.logical_px()))
+                .size((surf_w.logical_px(), surf_h.logical_px()))
                 .child(body),
         );
         surfaces
@@ -85,7 +89,7 @@ fn build_grid(active_tick: u64, rows: usize, cols: usize, tile_px: f32) -> Colum
             row = row.child(
                 Rect::new()
                     .key(("tile", idx))
-                    .size(Size::px(tile_px.logical_px(), tile_px.logical_px()))
+                    .size((tile_px.logical_px(), tile_px.logical_px()))
                     .fill(fill)
                     .corner_radius(6.logical_px())
                     .border(1.logical_px(), Color::rgb(76, 86, 106)),

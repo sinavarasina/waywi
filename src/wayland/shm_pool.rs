@@ -106,6 +106,15 @@ impl SurfaceShmPool {
         self.slots.iter().flatten().all(|s| !s.busy)
     }
 
+    /// Drops an unused secondary double-buffer slot when all slots are idle.
+    pub(crate) fn trim_idle_slots(&mut self) {
+        if self.all_idle()
+            && let Some(s) = self.slots[1].take()
+        {
+            s.buffer.destroy();
+        }
+    }
+
     /// Destroys pool/buffers, drops mappings, and closes the memfd when hidden/removed. The file is
     /// never truncated: a compositor may still map/use released buffers, and shrinking it under
     /// that mapping causes SIGBUS in the compositor.
@@ -143,12 +152,16 @@ impl SurfaceShmPool {
     ) -> Result<AcquireSlot<'_>> {
         let width = width.max(1);
         let height = height.max(1);
-        let stride = width.checked_mul(4).ok_or_else(|| {
-            WaywiError::WaylandConnection("surface buffer stride overflow".into())
-        })?;
-        let slot_bytes = align_64((stride as usize).checked_mul(height as usize).ok_or_else(
-            || WaywiError::WaylandConnection("surface buffer byte size overflow".into()),
-        )?);
+        let stride = width
+            .checked_mul(4)
+            .ok_or_else(|| WaywiError::SurfaceError("surface buffer stride overflow".into()))?;
+        let slot_bytes = align_64(
+            (stride as usize)
+                .checked_mul(height as usize)
+                .ok_or_else(|| {
+                    WaywiError::SurfaceError("surface buffer byte size overflow".into())
+                })?,
+        );
 
         let slot0_busy = self.slots[0].as_ref().is_some_and(|s| s.busy);
         let slot1_busy = self.slots[1].as_ref().is_some_and(|s| s.busy);
@@ -203,7 +216,7 @@ impl SurfaceShmPool {
 
         if self.slots[target_idx].is_none() {
             let pool = self.wl_pool.as_ref().ok_or_else(|| {
-                WaywiError::WaylandConnection("wl_shm_pool missing after resize".into())
+                WaywiError::SurfaceError("wl_shm_pool missing after resize".into())
             })?;
             self.next_generation += 1;
             let generation = self.next_generation;
@@ -248,9 +261,10 @@ impl SurfaceShmPool {
         let byte_len = (slot.stride as usize) * (slot.height as usize);
         let slice_start = slot.offset;
         let slice_end = slice_start + byte_len;
-        let mmap = self.mmap.as_mut().ok_or_else(|| {
-            WaywiError::WaylandConnection("shm mmap missing after acquire".into())
-        })?;
+        let mmap = self
+            .mmap
+            .as_mut()
+            .ok_or_else(|| WaywiError::SurfaceError("shm mmap missing after acquire".into()))?;
 
         Ok(AcquireSlot::Ready {
             slot: target_idx,
@@ -271,20 +285,19 @@ impl SurfaceShmPool {
         if self.fd.is_none() {
             let name = CString::new("waywi-shm").unwrap();
             let fd = memfd_create(&name, MemfdFlags::CLOEXEC)
-                .map_err(|e| WaywiError::WaylandConnection(format!("memfd_create failed: {e}")))?;
+                .map_err(|e| WaywiError::SurfaceError(format!("memfd_create failed: {e}")))?;
             self.fd = Some(fd);
         }
         let fd = self.fd.as_ref().unwrap();
 
         if required_bytes > self.pool_bytes || self.mmap.is_none() {
             let new_bytes = required_bytes.max(self.pool_bytes).max(4096);
-            ftruncate(fd, new_bytes as u64).map_err(|e| {
-                WaywiError::WaylandConnection(format!("memfd ftruncate failed: {e}"))
-            })?;
+            ftruncate(fd, new_bytes as u64)
+                .map_err(|e| WaywiError::SurfaceError(format!("memfd ftruncate failed: {e}")))?;
             // Safety: file descriptor stays valid as OwnedFd owned by `self.fd` and is mapped
             // exclusively into this process and the compositor's shared SHM mapping.
             let mmap = unsafe { MmapMut::map_mut(fd) }
-                .map_err(|e| WaywiError::WaylandConnection(format!("mmap failed: {e}")))?;
+                .map_err(|e| WaywiError::SurfaceError(format!("mmap failed: {e}")))?;
             if let Some(pool) = &self.wl_pool {
                 if new_bytes > self.pool_bytes {
                     pool.resize(new_bytes as i32);

@@ -1,6 +1,6 @@
 //! Hardware access / privacy indicator aggregator (camera, microphone, audio capture,
-//! screen sharing, and location) combining PipeWire graph monitoring, `/proc/<pid>/fd` scanning,
-//! and D-Bus GeoClue2 state.
+//! screen sharing, and location) combining stateless `/proc/<pid>/fd` scanning with opt-in
+//! background PipeWire graph monitoring and D-Bus GeoClue2 state.
 
 use std::collections::BTreeSet;
 #[cfg(feature = "pipewire")]
@@ -61,6 +61,35 @@ impl PrivacySnapshot {
     pub fn any_active(&self) -> bool {
         !self.active.is_empty()
     }
+}
+
+fn build_snapshot(entries: BTreeSet<PrivacyAccessEntry>) -> PrivacySnapshot {
+    let active: Vec<PrivacyAccessEntry> = entries.into_iter().collect();
+    let has = |k: PrivacyAccessKind| active.iter().any(|e| e.kind == k);
+    PrivacySnapshot {
+        camera_in_use: has(PrivacyAccessKind::Camera),
+        microphone_in_use: has(PrivacyAccessKind::Microphone),
+        audio_capture_in_use: has(PrivacyAccessKind::AudioCapture),
+        screen_share_in_use: has(PrivacyAccessKind::ScreenShare),
+        location_in_use: has(PrivacyAccessKind::Location),
+        active,
+    }
+}
+
+/// Performs a stateless one-shot privacy scan of `/proc/<pid>/fd` for open `/dev/video*`
+/// cameras and ALSA capture (`/dev/snd/pcm*c*`) devices without spawning or joining any
+/// PipeWire or D-Bus background threads.
+#[must_use]
+pub fn sample_privacy_oneshot() -> PrivacySnapshot {
+    sample_privacy_oneshot_from(Path::new("/proc"), std::process::id())
+}
+
+/// Performs a stateless one-shot privacy scan against an explicit procfs root (for unit tests).
+#[must_use]
+pub fn sample_privacy_oneshot_from(proc_root: &Path, self_pid: u32) -> PrivacySnapshot {
+    let entries: BTreeSet<PrivacyAccessEntry> =
+        scan_proc_fd_from(proc_root, self_pid).into_iter().collect();
+    build_snapshot(entries)
 }
 
 /// Classifies a live PipeWire node record into an active [`PrivacyAccessEntry`].
@@ -286,7 +315,7 @@ mod pw_monitor {
         shared: Arc<Mutex<Vec<PrivacyAccessEntry>>>,
         stop_rx: pw::channel::Receiver<()>,
     ) {
-        pw::init();
+        crate::audio::pipewire::ensure_pw_init();
         let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else {
             return;
         };
@@ -420,8 +449,138 @@ mod pw_monitor {
     }
 }
 
+#[cfg(feature = "dbus")]
+mod geoclue_monitor {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    use futures_lite::StreamExt;
+
+    #[derive(Clone, Default)]
+    pub(super) struct GeoClueStopSignal {
+        stopped: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl GeoClueStopSignal {
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(super) fn is_stopped(&self) -> bool {
+            self.stopped.load(Ordering::Acquire)
+        }
+
+        pub(super) fn trigger(&self) {
+            self.stopped.store(true, Ordering::Release);
+            if let Ok(mut guard) = self.waker.lock()
+                && let Some(w) = guard.take()
+            {
+                w.wake();
+            }
+        }
+
+        fn wait_stopped(&self) -> StopFuture {
+            StopFuture {
+                stopped: Arc::clone(&self.stopped),
+                waker: Arc::clone(&self.waker),
+            }
+        }
+    }
+
+    struct StopFuture {
+        stopped: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl Future for StopFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.stopped.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            if let Ok(mut guard) = self.waker.lock() {
+                *guard = Some(cx.waker().clone());
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn cancellable<T>(stop: &GeoClueStopSignal, fut: impl Future<Output = T>) -> Option<T> {
+        futures_lite::future::or(async { Some(fut.await) }, async {
+            stop.wait_stopped().await;
+            None
+        })
+        .await
+    }
+
+    async fn query_in_use(conn: &zbus::Connection) -> Option<bool> {
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.GeoClue2"),
+                "/org/freedesktop/GeoClue2/Manager",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.GeoClue2.Manager", "InUse"),
+            )
+            .await
+            .ok()?;
+        let val: zbus::zvariant::OwnedValue = reply.body().deserialize().ok()?;
+        Some(matches!(&*val, zbus::zvariant::Value::Bool(true)))
+    }
+
+    pub(super) fn run_geoclue_privacy_thread(in_use: Arc<AtomicBool>, stop: GeoClueStopSignal) {
+        futures_lite::future::block_on(async move {
+            let Some(Ok(conn)) = cancellable(&stop, zbus::Connection::system()).await else {
+                return;
+            };
+            if let Some(Some(v)) = cancellable(&stop, query_in_use(&conn)).await {
+                in_use.store(v, Ordering::Release);
+            }
+            if stop.is_stopped() {
+                return;
+            }
+            let Ok(rule) = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.GeoClue2")
+            else {
+                return;
+            };
+            let Some(Ok(mut stream)) = cancellable(
+                &stop,
+                zbus::MessageStream::for_match_rule(rule.build(), &conn, Some(32)),
+            )
+            .await
+            else {
+                return;
+            };
+            while !stop.is_stopped() {
+                let Some(Some(Ok(_))) = cancellable(&stop, stream.next()).await else {
+                    break;
+                };
+                if let Some(Some(v)) = cancellable(&stop, query_in_use(&conn)).await {
+                    in_use.store(v, Ordering::Release);
+                }
+            }
+        });
+    }
+}
+
 /// Stateful privacy monitor aggregating PipeWire active nodes, `/proc/<pid>/fd`, and GeoClue2.
+///
+/// Background PipeWire and GeoClue2 threads are only started while subscribed via
+/// [`Self::set_subscribed`]. For stateless one-shot scanning without threads, call
+/// [`sample_privacy_oneshot`].
 pub struct PrivacyMonitor {
+    subscribed: bool,
     #[cfg(feature = "pipewire")]
     pw_entries: Arc<Mutex<Vec<PrivacyAccessEntry>>>,
     #[cfg(feature = "pipewire")]
@@ -431,9 +590,7 @@ pub struct PrivacyMonitor {
     #[cfg(feature = "dbus")]
     geoclue_in_use: Arc<AtomicBool>,
     #[cfg(feature = "dbus")]
-    geoclue_started: bool,
-    #[cfg(feature = "dbus")]
-    geoclue_stop: Option<crate::dbus::worker::AsyncStopSignal>,
+    geoclue_stop: Option<geoclue_monitor::GeoClueStopSignal>,
     #[cfg(feature = "dbus")]
     geoclue_join: Option<JoinHandle<()>>,
 }
@@ -454,6 +611,7 @@ impl PrivacyMonitor {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            subscribed: false,
             #[cfg(feature = "pipewire")]
             pw_entries: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "pipewire")]
@@ -463,40 +621,64 @@ impl PrivacyMonitor {
             #[cfg(feature = "dbus")]
             geoclue_in_use: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "dbus")]
-            geoclue_started: false,
-            #[cfg(feature = "dbus")]
             geoclue_stop: None,
             #[cfg(feature = "dbus")]
             geoclue_join: None,
         }
     }
 
+    /// Returns `true` while background PipeWire/GeoClue2 subscription monitoring is active.
+    #[must_use]
+    pub const fn is_subscribed(&self) -> bool {
+        self.subscribed
+    }
+
+    /// Enables or disables background PipeWire and GeoClue2 monitoring.
+    ///
+    /// Background threads are spawned only when `active` transitions to `true` and stopped
+    /// cleanly when `active` transitions to `false`.
+    pub fn set_subscribed(&mut self, active: bool) {
+        if self.subscribed == active {
+            return;
+        }
+        if active {
+            self.ensure_started();
+        } else {
+            self.stop_background();
+        }
+    }
+
     pub fn ensure_started(&mut self) {
+        self.subscribed = true;
         #[cfg(feature = "pipewire")]
         if self.pw_join.is_none() {
             let shared = Arc::clone(&self.pw_entries);
             let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
-            self.pw_stop = Some(stop_tx);
-            self.pw_join = std::thread::Builder::new()
+            if let Ok(join) = std::thread::Builder::new()
                 .name("waywi-privacy-pw".to_owned())
                 .spawn(move || pw_monitor::run_pipewire_privacy_thread(shared, stop_rx))
-                .ok();
+            {
+                self.pw_stop = Some(stop_tx);
+                self.pw_join = Some(join);
+            }
         }
         #[cfg(feature = "dbus")]
-        if !self.geoclue_started {
-            self.geoclue_started = true;
+        if self.geoclue_join.is_none() {
             let active_flag = Arc::clone(&self.geoclue_in_use);
-            let stop_flag = crate::dbus::worker::AsyncStopSignal::new();
+            let stop_flag = geoclue_monitor::GeoClueStopSignal::new();
             let stop_cl = stop_flag.clone();
-            self.geoclue_stop = Some(stop_flag);
-            self.geoclue_join = std::thread::Builder::new()
+            if let Ok(join) = std::thread::Builder::new()
                 .name("waywi-privacy-geo".to_owned())
-                .spawn(move || run_geoclue_privacy_thread(active_flag, stop_cl))
-                .ok();
+                .spawn(move || geoclue_monitor::run_geoclue_privacy_thread(active_flag, stop_cl))
+            {
+                self.geoclue_stop = Some(stop_flag);
+                self.geoclue_join = Some(join);
+            }
         }
     }
 
     pub fn stop_background(&mut self) {
+        self.subscribed = false;
         #[cfg(feature = "pipewire")]
         {
             if let Some(tx) = self.pw_stop.take() {
@@ -511,21 +693,25 @@ impl PrivacyMonitor {
         }
         #[cfg(feature = "dbus")]
         {
-            if let Some(ref s) = self.geoclue_stop {
+            if let Some(s) = self.geoclue_stop.take() {
                 s.trigger();
             }
             if let Some(j) = self.geoclue_join.take() {
                 let _ = j.join();
             }
-            self.geoclue_stop = None;
             self.geoclue_in_use.store(false, Ordering::Release);
-            self.geoclue_started = false;
         }
     }
 
     /// Collects the latest aggregated [`PrivacySnapshot`].
-    pub fn sample(&mut self) -> PrivacySnapshot {
-        self.ensure_started();
+    ///
+    /// Includes PipeWire and GeoClue2 state when subscribed via [`Self::set_subscribed`], or
+    /// performs a stateless `/proc/<pid>/fd` scan without spawning threads when unsubscribed.
+    #[must_use]
+    pub fn sample(&self) -> PrivacySnapshot {
+        if !self.subscribed {
+            return sample_privacy_oneshot();
+        }
         let mut combined: BTreeSet<PrivacyAccessEntry> = BTreeSet::new();
         #[cfg(feature = "pipewire")]
         let mut seen_pw: HashSet<(PrivacyAccessKind, Option<u32>)> = HashSet::new();
@@ -558,71 +744,8 @@ impl PrivacyMonitor {
             });
         }
 
-        let active: Vec<PrivacyAccessEntry> = combined.into_iter().collect();
-        let has = |k: PrivacyAccessKind| active.iter().any(|e| e.kind == k);
-        PrivacySnapshot {
-            camera_in_use: has(PrivacyAccessKind::Camera),
-            microphone_in_use: has(PrivacyAccessKind::Microphone),
-            audio_capture_in_use: has(PrivacyAccessKind::AudioCapture),
-            screen_share_in_use: has(PrivacyAccessKind::ScreenShare),
-            location_in_use: has(PrivacyAccessKind::Location),
-            active,
-        }
+        build_snapshot(combined)
     }
-}
-
-#[cfg(feature = "dbus")]
-fn run_geoclue_privacy_thread(in_use: Arc<AtomicBool>, stop: crate::dbus::worker::AsyncStopSignal) {
-    use futures_lite::StreamExt;
-    futures_lite::future::block_on(async move {
-        let Ok(conn) = zbus::Connection::system().await else {
-            return;
-        };
-        let query = |c: &zbus::Connection| {
-            let c = c.clone();
-            async move {
-                let reply = c
-                    .call_method(
-                        Some("org.freedesktop.GeoClue2"),
-                        "/org/freedesktop/GeoClue2/Manager",
-                        Some("org.freedesktop.DBus.Properties"),
-                        "Get",
-                        &("org.freedesktop.GeoClue2.Manager", "InUse"),
-                    )
-                    .await
-                    .ok()?;
-                let val: zbus::zvariant::OwnedValue = reply.body().deserialize().ok()?;
-                Some(matches!(&*val, zbus::zvariant::Value::Bool(true)))
-            }
-        };
-        if let Some(v) = query(&conn).await {
-            in_use.store(v, Ordering::Release);
-        }
-        let Ok(rule) = zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .sender("org.freedesktop.GeoClue2")
-        else {
-            return;
-        };
-        let Ok(mut stream) =
-            zbus::MessageStream::for_match_rule(rule.build(), &conn, Some(32)).await
-        else {
-            return;
-        };
-        while !stop.is_stopped() {
-            let next_msg = futures_lite::future::or(async { Some(stream.next().await) }, async {
-                stop.wait_stopped().await;
-                None
-            })
-            .await;
-            let Some(Some(Ok(_))) = next_msg else {
-                break;
-            };
-            if let Some(v) = query(&conn).await {
-                in_use.store(v, Ordering::Release);
-            }
-        }
-    });
 }
 
 #[cfg(test)]
@@ -694,19 +817,32 @@ mod tests {
         std::os::unix::fs::symlink("/dev/snd/pcmC0D0c", fd_dir.join("4")).unwrap();
         std::os::unix::fs::symlink("/dev/snd/pcmC0D0p", fd_dir.join("5")).unwrap(); // playback only, ignored
 
-        let entries = scan_proc_fd_from(&root, 1);
-        assert_eq!(entries.len(), 2);
+        let snap = sample_privacy_oneshot_from(&root, 1);
+        assert!(snap.any_active());
+        assert!(snap.camera_in_use);
+        assert!(snap.microphone_in_use);
+        assert!(!snap.screen_share_in_use);
+        assert!(!snap.location_in_use);
+        assert_eq!(snap.active.len(), 2);
         assert!(
-            entries
+            snap.active
                 .iter()
                 .any(|e| e.kind == PrivacyAccessKind::Camera && e.app_name == "cheese")
         );
         assert!(
-            entries
+            snap.active
                 .iter()
                 .any(|e| e.kind == PrivacyAccessKind::Microphone && e.app_name == "cheese")
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsubscribed_privacy_monitor_stays_stateless() {
+        let monitor = PrivacyMonitor::new();
+        assert!(!monitor.is_subscribed());
+        let _snap = monitor.sample();
+        assert!(!monitor.is_subscribed());
     }
 }

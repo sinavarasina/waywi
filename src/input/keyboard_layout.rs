@@ -1,5 +1,5 @@
 use crate::arena::FrameSharedFn;
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 /// Snapshot of XKB keyboard layouts and the currently active layout on the Wayland seat.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,7 +68,6 @@ impl KeyboardLayout {
     {
         Subscription {
             spec: SubscriptionSpec::KeyboardLayout {
-                key: "input:keyboard-layout".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }

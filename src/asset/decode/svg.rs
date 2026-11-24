@@ -46,7 +46,6 @@ pub(super) fn decode_min_size(bytes: &[u8], min_dim: u32, revision: u64) -> Resu
         height,
         pixels: Arc::from(pixmap.take()),
         revision,
-        animated_frames: None,
     })
 }
 

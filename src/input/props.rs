@@ -132,11 +132,6 @@ macro_rules! impl_common_builders {
             self
         }
 
-        pub fn element_key(mut self, key: $crate::input::ElementKey) -> Self {
-            self.common.key = Some(key);
-            self
-        }
-
         pub fn position(mut self, position: $crate::geometry::Position) -> Self {
             self.common.position = position;
             self
@@ -196,8 +191,8 @@ macro_rules! impl_common_builders {
             feature = "alsa",
             feature = "audio-playback"
         ))]
-        pub fn on_click_sound(mut self, sound: $crate::audio::SoundAsset) -> Self {
-            self.common.handlers.on_click_sound = Some((sound, 1.0));
+        pub fn on_click_sound(mut self, sound: impl Into<$crate::audio::SoundPlay>) -> Self {
+            self.common.handlers.on_click_sound = Some(sound.into());
             self
         }
 
@@ -207,38 +202,8 @@ macro_rules! impl_common_builders {
             feature = "alsa",
             feature = "audio-playback"
         ))]
-        pub fn on_click_sound_volume(
-            mut self,
-            sound: $crate::audio::SoundAsset,
-            volume: f32,
-        ) -> Self {
-            self.common.handlers.on_click_sound = Some((sound, volume));
-            self
-        }
-
-        #[cfg(any(
-            feature = "pipewire",
-            feature = "pulseaudio",
-            feature = "alsa",
-            feature = "audio-playback"
-        ))]
-        pub fn on_hover_sound(mut self, sound: $crate::audio::SoundAsset) -> Self {
-            self.common.handlers.on_hover_sound = Some((sound, 1.0));
-            self
-        }
-
-        #[cfg(any(
-            feature = "pipewire",
-            feature = "pulseaudio",
-            feature = "alsa",
-            feature = "audio-playback"
-        ))]
-        pub fn on_hover_sound_volume(
-            mut self,
-            sound: $crate::audio::SoundAsset,
-            volume: f32,
-        ) -> Self {
-            self.common.handlers.on_hover_sound = Some((sound, volume));
+        pub fn on_hover_sound(mut self, sound: impl Into<$crate::audio::SoundPlay>) -> Self {
+            self.common.handlers.on_hover_sound = Some(sound.into());
             self
         }
 
@@ -252,14 +217,6 @@ macro_rules! impl_common_builders {
             F: Fn($crate::input::ScrollEvent) -> M + 'static,
         {
             self.common.handlers.set_on_scroll(handler);
-            self
-        }
-
-        pub fn on_key<F>(mut self, handler: F) -> Self
-        where
-            F: Fn($crate::input::KeyEvent) -> Option<M> + 'static,
-        {
-            self.common.handlers.set_on_key(handler);
             self
         }
     };

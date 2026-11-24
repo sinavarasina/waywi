@@ -141,10 +141,6 @@ impl std::error::Error for WaywiError {
 
 impl From<std::io::Error> for WaywiError {
     fn from(value: std::io::Error) -> Self {
-        match value.kind() {
-            std::io::ErrorKind::TimedOut => Self::Timeout(value.to_string()),
-            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied(value.to_string()),
-            _ => Self::Io(value),
-        }
+        Self::Io(value)
     }
 }

@@ -1,8 +1,8 @@
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use bitflags::bitflags;
 
-use crate::geometry::{LogicalPx, Rect as GeoRect};
+use crate::geometry::{Bounds, LogicalPx};
 
 /// Stable key identifying a declared Wayland surface across `view(state)` updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,11 +11,7 @@ pub struct SurfaceKey(pub u64);
 impl SurfaceKey {
     #[must_use]
     pub fn from_hashable<T: Hash + 'static>(value: &T) -> Self {
-        use std::any::TypeId;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        TypeId::of::<T>().hash(&mut hasher);
-        value.hash(&mut hasher);
-        Self(hasher.finish())
+        Self(crate::arena::hash_typed_key::<T, Self>(value, |k| k.0))
     }
 }
 
@@ -49,17 +45,6 @@ bitflags! {
         const LEFT   = 1 << 2;
         const RIGHT  = 1 << 3;
     }
-}
-
-impl Anchor {
-    #[allow(non_upper_case_globals)]
-    pub const Top: Self = Self::TOP;
-    #[allow(non_upper_case_globals)]
-    pub const Bottom: Self = Self::BOTTOM;
-    #[allow(non_upper_case_globals)]
-    pub const Left: Self = Self::LEFT;
-    #[allow(non_upper_case_globals)]
-    pub const Right: Self = Self::RIGHT;
 }
 
 /// Keyboard focus policy requested from the Wayland compositor.
@@ -119,11 +104,11 @@ pub enum SurfaceKind {
 pub enum PopupAnchor {
     None,
     Top,
-    #[default]
     Bottom,
     Left,
     Right,
     TopLeft,
+    #[default]
     BottomLeft,
     TopRight,
     BottomRight,
@@ -134,13 +119,13 @@ pub enum PopupAnchor {
 pub enum PopupGravity {
     None,
     Top,
-    #[default]
     Bottom,
     Left,
     Right,
     TopLeft,
     BottomLeft,
     TopRight,
+    #[default]
     BottomRight,
 }
 
@@ -169,7 +154,7 @@ impl Default for PopupConstraintAdjustment {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PopupPositioner {
     /// Rectangle in the parent surface's logical coordinates that the popup anchors to.
-    pub anchor_rect: GeoRect,
+    pub anchor_rect: Bounds,
     /// Point on `anchor_rect` where the popup attaches.
     pub anchor: PopupAnchor,
     /// Direction in which the popup extends from the anchor point.
@@ -186,9 +171,9 @@ pub struct PopupPositioner {
 impl Default for PopupPositioner {
     fn default() -> Self {
         Self {
-            anchor_rect: GeoRect::from_xywh(0.0, 0.0, 1.0, 1.0),
-            anchor: PopupAnchor::BottomLeft,
-            gravity: PopupGravity::BottomRight,
+            anchor_rect: Bounds::from_xywh(0.0, 0.0, 1.0, 1.0),
+            anchor: PopupAnchor::default(),
+            gravity: PopupGravity::default(),
             offset_x: LogicalPx::ZERO,
             offset_y: LogicalPx::ZERO,
             constraint_adjustment: PopupConstraintAdjustment::default(),
@@ -200,7 +185,7 @@ impl Default for PopupPositioner {
 impl PopupPositioner {
     /// Creates a positioner anchored to `anchor_rect` in the parent surface's logical coordinates.
     #[must_use]
-    pub fn new(anchor_rect: GeoRect) -> Self {
+    pub fn new(anchor_rect: Bounds) -> Self {
         Self {
             anchor_rect,
             ..Self::default()

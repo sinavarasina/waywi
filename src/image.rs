@@ -1,4 +1,4 @@
-pub use crate::asset::{AssetRetention, ImageAsset};
+pub use crate::asset::{AssetId, AssetRetention, ImageAsset};
 use crate::input::CommonProps;
 
 /// Pixel-space sub-rectangle `(x, y, width, height)` inside an [`ImageAsset`] texture atlas.
@@ -26,6 +26,13 @@ impl SourceRect {
     #[must_use]
     pub const fn as_tuple(self) -> (u32, u32, u32, u32) {
         (self.x, self.y, self.width, self.height)
+    }
+}
+
+impl From<(u32, u32, u32, u32)> for SourceRect {
+    #[inline]
+    fn from((x, y, width, height): (u32, u32, u32, u32)) -> Self {
+        Self::new(x, y, width, height)
     }
 }
 
@@ -125,16 +132,10 @@ impl<M: 'static> Image<M> {
         self
     }
 
-    /// Crops this image to a pixel-space sub-rectangle `(x, y, width, height)` inside the
-    /// underlying [`ImageAsset`] texture atlas.
-    pub fn source_rect(mut self, x: u32, y: u32, width: u32, height: u32) -> Self {
-        self.source_rect = Some(SourceRect::new(x, y, width, height));
-        self
-    }
-
-    /// Crops this image to an explicit [`SourceRect`] region inside the underlying [`ImageAsset`].
-    pub fn region(mut self, rect: SourceRect) -> Self {
-        self.source_rect = Some(rect);
+    /// Crops this image to a [`SourceRect`] or `(x, y, width, height)` region inside the
+    /// underlying [`ImageAsset`].
+    pub fn region(mut self, rect: impl Into<SourceRect>) -> Self {
+        self.source_rect = Some(rect.into());
         self
     }
 

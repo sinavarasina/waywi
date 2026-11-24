@@ -1,5 +1,4 @@
-use std::any::TypeId;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 /// Stable key identifying a subscription across `subscriptions(state)` updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8,10 +7,7 @@ pub struct SubscriptionKey(pub u64);
 impl SubscriptionKey {
     #[must_use]
     pub fn from_hashable<T: Hash + 'static>(value: &T) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        TypeId::of::<T>().hash(&mut hasher);
-        value.hash(&mut hasher);
-        Self(hasher.finish())
+        Self(crate::arena::hash_typed_key::<T, Self>(value, |k| k.0))
     }
 }
 

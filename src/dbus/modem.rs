@@ -5,7 +5,7 @@ use zbus::zvariant::Value;
 
 use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
-use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+use crate::subscription::{Subscription, SubscriptionSpec};
 
 use super::client::{
     DBUS_SLOW_TIMEOUT, DbusActionLane, DbusClient, DbusSharedBus, LaneActionSpec,
@@ -14,8 +14,7 @@ use super::client::{
 use super::types::{Dbus, DbusBus};
 use super::worker::ServiceWatchWorker;
 use super::zvariant_helpers::{
-    ManagedObjects, dict_i32, dict_str, dict_u32, get_all_async, get_all_blocking,
-    get_managed_objects_async, get_managed_objects_blocking,
+    ManagedObjects, dict_i32, dict_str, dict_u32, get_all, get_managed_objects, unwrap_value,
 };
 
 const MM_DEST: &str = "org.freedesktop.ModemManager1";
@@ -150,41 +149,35 @@ impl Dbus {
     pub fn modem<M: 'static>(map: impl Fn(ModemSnapshot) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusModem {
-                key: "dbus:modem".into_subscription_key(),
                 map: FrameSharedFn::new(map),
             },
         }
     }
 }
 
-impl DbusClient {
-    /// Reads the current [`ModemSnapshot`] from the subscription cache (0 ms) or
-    /// `org.freedesktop.ModemManager1`.
-    pub fn modem_snapshot(&self) -> Result<ModemSnapshot> {
-        if let Ok(guard) = self.cache.modem.read()
-            && let Some(ref snap) = *guard
-        {
-            return Ok(snap.clone());
-        }
-        let conn = self.connection(DbusBus::System)?;
-        let objs = get_managed_objects_blocking(&conn, MM_DEST, MM_PATH)?;
-        let mut snap = parse_modem_objects(&objs);
-        for modem in &mut snap.modems {
-            if let Some(ref sim_path) = modem.sim_path
-                && let Ok(sim_props) = get_all_blocking(&conn, MM_DEST, sim_path, MM_SIM_IFACE)
-            {
-                modem.sim_operator_name =
-                    dict_str(&sim_props, "OperatorName").filter(|s| !s.is_empty());
-            }
-        }
-        Ok(snap)
+/// Zero-cost domain handle for ModemManager cellular modem inspection and enable/disable control.
+#[derive(Clone, Copy)]
+pub struct ModemClient<'a>(pub(super) &'a DbusClient);
+
+impl ModemClient<'_> {
+    /// Returns the latest cached [`ModemSnapshot`] from an active [`Dbus::modem`] subscription
+    /// without issuing any D-Bus calls (0 ms).
+    #[must_use]
+    pub fn cached_snapshot(&self) -> Option<ModemSnapshot> {
+        self.0.cache.modem.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Queries `org.freedesktop.ModemManager1` synchronously on the system bus.
+    pub fn snapshot_blocking(&self) -> Result<ModemSnapshot> {
+        let conn = self.0.async_connection(DbusBus::System)?;
+        futures_lite::future::block_on(read_modem_snapshot(&conn))
     }
 
     /// Enables or disables a cellular modem via `org.freedesktop.ModemManager1.Modem.Enable`.
-    pub fn enable_modem(&self, modem_path: &str, enabled: bool) -> Result<()> {
+    pub fn set_enabled(&self, modem_path: &str, enabled: bool) -> Result<()> {
         let path = validate_object_path(modem_path, "modem object path")?;
         let target = path.clone();
-        self.submit_lane_action(
+        self.0.submit_lane_action(
             LaneActionSpec::fast(
                 DbusActionLane::NetworkManager,
                 DbusBus::System,
@@ -209,6 +202,20 @@ impl DbusClient {
     }
 }
 
+async fn read_modem_snapshot(conn: &zbus::Connection) -> Result<ModemSnapshot> {
+    let objs = get_managed_objects(conn, MM_DEST, MM_PATH).await?;
+    let mut snap = parse_modem_objects(&objs);
+    for modem in &mut snap.modems {
+        if let Some(ref sim_path) = modem.sim_path
+            && let Ok(sim_props) = get_all(conn, MM_DEST, sim_path, MM_SIM_IFACE).await
+        {
+            modem.sim_operator_name =
+                dict_str(&sim_props, "OperatorName").filter(|s| !s.is_empty());
+        }
+    }
+    Ok(snap)
+}
+
 pub(crate) fn spawn_modem_worker(
     sender: calloop::channel::Sender<ModemSnapshot>,
     shared: DbusSharedBus,
@@ -220,20 +227,7 @@ pub(crate) fn spawn_modem_worker(
         None,
         sender,
         shared,
-        |conn| async move {
-            let objs = get_managed_objects_async(&conn, MM_DEST, MM_PATH).await?;
-            let mut snap = parse_modem_objects(&objs);
-            for modem in &mut snap.modems {
-                if let Some(ref sim_path) = modem.sim_path
-                    && let Some(sim_props) =
-                        get_all_async(&conn, MM_DEST, sim_path, MM_SIM_IFACE).await
-                {
-                    modem.sim_operator_name =
-                        dict_str(&sim_props, "OperatorName").filter(|s| !s.is_empty());
-                }
-            }
-            Some(snap)
-        },
+        |conn| async move { read_modem_snapshot(&conn).await.ok() },
     )
 }
 
@@ -272,14 +266,17 @@ pub(crate) fn parse_modem_objects(objects: &ManagedObjects) -> ModemSnapshot {
         };
         let (signal_quality_percent, signal_recent) = props
             .get("SignalQuality")
-            .and_then(|v| match &**v {
+            .and_then(|v| match unwrap_value(v) {
                 Value::Structure(st) => {
                     let fields = st.fields();
-                    let pct = fields.first().and_then(|f| match f {
+                    let pct = fields.first().and_then(|f| match unwrap_value(f) {
                         Value::U32(u) => Some(*u),
                         _ => None,
                     });
-                    let recent = matches!(fields.get(1), Some(Value::Bool(true)));
+                    let recent = matches!(
+                        fields.get(1).map(|f| unwrap_value(f)),
+                        Some(Value::Bool(true))
+                    );
                     pct.map(|p| (Some(p.min(100)), recent))
                 }
                 _ => None,
