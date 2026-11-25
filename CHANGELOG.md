@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-11-25
+
+### Fixed
+- **Wayland layer-shell close, output hotplug & safe teardown (`wayland`, `app`, `reconcile`)**:
+  - Split `WaylandEvent::SurfaceClosed` into `WindowCloseRequested`, `PopupDismissed`, and `LayerClosed` so `zwlr_layer_surface_v1.closed` (e.g. monitor OSD HDR/VRR mode switch, DisplayPort re-train, or DPMS deep sleep) tears down the layer surface and its child popups without setting `quit_requested = true`.
+  - Moved `WaylandState::refresh_outputs()` into `WaylandEvent::OutputsChanged` dispatch so destroyed `wl_output`s are refreshed after `smithay-client-toolkit` removes them from `output_state` instead of leaving released proxies behind.
+  - Enforced GPU-before-Wayland teardown ordering (`drop_surface_target` before `destroy_surface`) across surface removal, dismissal, and shutdown; dismissed orphan `xdg_popup`s cleanly when their parent layer surface is unmapped; and tracked `wl_seat` identity in `WaylandIdleState` so idle notifications rebind on seat replacement.
+- **Memoization invalidation on output, resize, and scale changes (`render`, `app`)**: Added `MemoStore::{invalidate_all, invalidate_surface}` and invoked them on `OutputsChanged`, `SurfaceConfigured` size changes, `SurfaceScaleChanged`, and `LayerClosed` (plus `HeadlessRuntime::simulate_surface_configure`), preventing `Surface::memo(Output::All)` and nested `Element::memo` entries from disappearing or keeping stale layouts on newly created or resized outputs.
+- **GPU Wayland presentation, `wl_shm` isolation & frame pacing (`render`, `wayland`, `app`)**:
+  - Replaced ambiguous `bool` GPU present results with `WaylandPresentOutcome { Committed, Deferred, FallbackToShm }` and `WaylandPresentTarget`.
+  - Switched `GpuRenderer::present_wayland_surface` to acquire swapchain textures *before* encoding `femtovg::Canvas` commands, recreate `WaylandGpuTarget` on `CurrentSurfaceTexture::Lost`, and never fall back to `wl_shm` on a `wl_surface` already bound to a GPU swapchain.
+  - Gated redraws and reclaimable image re-decodes on `wl_surface.frame` pacing (arming the frame callback only right before commit) while clearing `frame_pending` on every compositor `configure`, integer/fractional scale change, and `OutputsChanged` so surfaces stay at zero idle redraws during DPMS off/fullscreen occlusion without stalling across mode transitions.
+- **Reclaimable `SoundAsset` cache & self-healing audio playback (`audio`, `app`)**:
+  - Added `SoundSource` (`File`, `EncodedBytes`, `Preset`) and `SoundAssetStore::trim_reclaimable()` so `CoreEngine::trim_memory()` and LRU cache eviction release decoded PCM buffers while keeping live `SoundAsset` handles valid for transparent on-demand re-decoding (matching `AssetCache`).
+  - Added `PlaybackDriver::is_alive()` with automatic lazy driver respawn on `AudioPlayer::enqueue_play`, a `.state_changed(...)` listener on PipeWire SFX streams, clean exit on PulseAudio `Failed`/`Terminated` states, and immediate dead-handle reset on unrecoverable ALSA `writei` failures.
+
 ## [0.2.1] - 2026-11-24
 
 ### Breaking Changes
