@@ -116,6 +116,18 @@ impl MemoStore {
     pub(crate) fn trim(&mut self) {
         self.entries.shrink_to_fit();
     }
+
+    /// Invalidates every memo entry across all surfaces (e.g. when `wl_output` topology changes
+    /// so `Surface::memo` and `Element::memo` rebuild cleanly for newly added or replaced outputs).
+    pub(crate) fn invalidate_all(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Invalidates all memo entries belonging to `surface_hash` (both the `Surface::memo` shell
+    /// and any nested `Element::memo` subtrees, e.g. on resize, scale change, or layer teardown).
+    pub(crate) fn invalidate_surface(&mut self, surface_hash: u64) {
+        self.entries.retain(|id, _| id.surface_hash != surface_hash);
+    }
 }
 
 struct ActiveMemoContext {

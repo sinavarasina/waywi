@@ -72,6 +72,9 @@ pub(crate) struct LiveWaylandSurface {
     pub(crate) scale: ScaleFactor,
     pub(crate) frame_pending: bool,
     pub(crate) pending_redraw: bool,
+    /// `true` once a GPU swapchain (`wgpu::Surface`) has bound to this `wl_surface`; prevents
+    /// mixing `wl_shm` buffer attaches onto the same `wl_surface` under Vulkan/EGL WSI.
+    pub(crate) gpu_bound: bool,
     pub(crate) reposition_token: u32,
     pub(crate) spec: SurfaceSpec,
 }
@@ -102,7 +105,13 @@ pub(crate) enum WaylandEvent {
         key: RetainedSurfaceKey,
         scale: ScaleFactor,
     },
-    SurfaceClosed {
+    WindowCloseRequested {
+        key: RetainedSurfaceKey,
+    },
+    PopupDismissed {
+        key: RetainedSurfaceKey,
+    },
+    LayerClosed {
         key: RetainedSurfaceKey,
     },
     SurfaceFrame {

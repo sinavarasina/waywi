@@ -474,8 +474,14 @@ impl<A: Application> HeadlessRuntime<A> {
         if keys.is_empty() {
             return false;
         }
+        let mut changed = false;
         for rk in keys {
-            self.core.configured_sizes.insert(rk, size);
+            if self.core.configured_sizes.insert(rk, size) != Some(size) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.core.memo_store.invalidate_surface(skey.0);
         }
         true
     }

@@ -5,14 +5,13 @@ pub(crate) mod context;
 pub(crate) mod textures;
 
 use wayland_client::Connection;
-use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::asset::AssetId;
 use crate::error::{Result, WaywiError};
-use crate::geometry::{BufferPx, LogicalSize};
+use crate::geometry::BufferPx;
 use crate::input::NodeId;
 use crate::reconcile::RetainedSurfaceKey;
-use crate::render::backend::FrameScene;
+use crate::render::backend::{FrameScene, WaylandPresentOutcome, WaylandPresentTarget};
 #[cfg(feature = "text")]
 use crate::text::TextEngine;
 
@@ -89,18 +88,34 @@ impl GpuRenderer {
     pub(crate) fn present_wayland_surface(
         &mut self,
         #[cfg(feature = "text")] text_engine: &mut TextEngine,
-        conn: &Connection,
-        surface: &WlSurface,
-        key: RetainedSurfaceKey,
-        logical_size: LogicalSize,
+        target: WaylandPresentTarget<'_>,
         scene: FrameScene<'_>,
-    ) -> Result<bool> {
-        let (buf_w, buf_h) = logical_size.to_buffer_ceil(scene.scale);
+        on_before_commit: &mut dyn FnMut(),
+    ) -> Result<WaylandPresentOutcome> {
+        let (buf_w, buf_h) = target.logical_size.to_buffer_ceil(scene.scale);
         let w = buf_w.as_u32();
         let h = buf_h.as_u32();
-        if !self.ctx.ensure_wayland_target(conn, surface, key, w, h) {
-            return Ok(false);
+        if w == 0 || h == 0 {
+            return Ok(if self.ctx.has_wayland_target(target.key) {
+                WaylandPresentOutcome::Deferred
+            } else {
+                WaylandPresentOutcome::FallbackToShm
+            });
         }
+        if !self
+            .ctx
+            .ensure_wayland_target(target.conn, target.surface, target.key, w, h)
+        {
+            return Ok(WaylandPresentOutcome::FallbackToShm);
+        }
+        let Some(frame) =
+            self.ctx
+                .acquire_surface_frame(target.conn, target.surface, target.key, w, h)
+        else {
+            // Once bound to a Vulkan/EGL swapchain, never fall back to `wl_shm` on the same
+            // `wl_surface`; defer until the compositor resumes presenting (e.g. DPMS wake).
+            return Ok(WaylandPresentOutcome::Deferred);
+        };
         self.ctx
             .begin_frame(w, h, commands::to_femto_color(scene.background, 1.0));
         commands::encode_commands(
@@ -110,7 +125,9 @@ impl GpuRenderer {
             text_engine,
             scene,
         );
-        Ok(self.ctx.present_surface_frame(key))
+        on_before_commit();
+        self.ctx.present_acquired_frame(frame);
+        Ok(WaylandPresentOutcome::Committed)
     }
 
     pub(crate) fn drop_surface_target(&mut self, key: RetainedSurfaceKey) {

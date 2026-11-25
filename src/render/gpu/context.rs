@@ -321,23 +321,56 @@ impl GpuContext {
         true
     }
 
-    pub(crate) fn present_surface_frame(&mut self, key: RetainedSurfaceKey) -> bool {
-        let Some(target) = self.surfaces.get_mut(&key) else {
-            return false;
+    pub(crate) fn has_wayland_target(&self, key: RetainedSurfaceKey) -> bool {
+        self.surfaces.contains_key(&key)
+    }
+
+    /// Acquires the next swapchain texture BEFORE encoding any `femtovg::Canvas` draw commands.
+    ///
+    /// Handles `Outdated` via reconfigure and `Lost` via full `wgpu::Surface` recreation; returns
+    /// `None` on transient `Timeout`/`Occluded` (e.g. DPMS off) without leaving dirty commands
+    /// queued in `self.canvas`.
+    pub(crate) fn acquire_surface_frame(
+        &mut self,
+        conn: &Connection,
+        wl_surface: &WlSurface,
+        key: RetainedSurfaceKey,
+        width: u32,
+        height: u32,
+    ) -> Option<wgpu::SurfaceTexture> {
+        let state = {
+            let target = self.surfaces.get_mut(&key)?;
+            target.surface.get_current_texture()
         };
-        let frame = match target.surface.get_current_texture() {
+        match state {
             wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let target = self.surfaces.get_mut(&key)?;
                 target.surface.configure(&self.device, &target.config);
                 match target.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                    _ => return false,
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+                    _ => None,
                 }
             }
-            _ => return false,
-        };
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surfaces.remove(&key);
+                if !self.ensure_wayland_target(conn, wl_surface, key, width, height) {
+                    return None;
+                }
+                let target = self.surfaces.get_mut(&key)?;
+                match target.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(f)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn present_acquired_frame(&mut self, frame: wgpu::SurfaceTexture) {
         if let Some(cmd_buf) = self
             .canvas
             .flush_to_output(WGPURenderOutput::from(&frame.texture))
@@ -345,7 +378,6 @@ impl GpuContext {
             self.queue.submit([cmd_buf]);
         }
         self.queue.present(frame);
-        true
     }
 
     pub(crate) fn drop_surface(&mut self, key: RetainedSurfaceKey) {

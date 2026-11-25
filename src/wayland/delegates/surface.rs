@@ -41,6 +41,9 @@ fn handle_surface_configure(
         surf.configured = true;
         surf.configured_size = Some(size);
         if !was_configured || size_changed {
+            // Allow immediate commit for compositor-requested initial configure or resize even if
+            // a previous `wl_surface.frame` callback is still pending (e.g. occluded/DPMS wake).
+            surf.frame_pending = false;
             surf.pending_redraw = true;
         }
         state
@@ -148,7 +151,9 @@ impl OutputHandler for WaylandState {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        self.refresh_outputs();
+        // NOTE: SCTK invokes `output_destroyed` BEFORE removing the output from
+        // `self.output_state.outputs`, so `WaylandEvent::OutputsChanged` refreshes
+        // `wl.outputs` during event-loop dispatch once SCTK has finished mutating `output_state`.
         self.events.push_back(WaylandEvent::OutputsChanged);
     }
 }
@@ -156,7 +161,7 @@ impl OutputHandler for WaylandState {
 impl LayerShellHandler for WaylandState {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
         if let Some(&key) = self.surface_by_obj.get(&layer.wl_surface().id()) {
-            self.events.push_back(WaylandEvent::SurfaceClosed { key });
+            self.events.push_back(WaylandEvent::LayerClosed { key });
         }
     }
 
@@ -180,7 +185,8 @@ impl LayerShellHandler for WaylandState {
 impl WindowHandler for WaylandState {
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
         if let Some(&key) = self.surface_by_obj.get(&window.wl_surface().id()) {
-            self.events.push_back(WaylandEvent::SurfaceClosed { key });
+            self.events
+                .push_back(WaylandEvent::WindowCloseRequested { key });
         }
     }
 
@@ -219,7 +225,7 @@ impl PopupHandler for WaylandState {
 
     fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
         if let Some(&key) = self.surface_by_obj.get(&popup.wl_surface().id()) {
-            self.events.push_back(WaylandEvent::SurfaceClosed { key });
+            self.events.push_back(WaylandEvent::PopupDismissed { key });
         }
     }
 }

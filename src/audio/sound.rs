@@ -603,15 +603,32 @@ pub(crate) enum SoundCacheKey {
     Preset(SoundPreset),
 }
 
+/// Re-decodable backing source for a [`SoundAsset`] so decoded PCM buffers can be evicted or
+/// trimmed without invalidating live handles held by applications.
+#[derive(Debug, Clone)]
+pub(crate) enum SoundSource {
+    File {
+        path: PathBuf,
+        ext_hint: Option<String>,
+    },
+    EncodedBytes(Arc<[u8]>),
+    Preset(SoundPreset),
+}
+
 struct CachedSoundEntry {
     key: SoundCacheKey,
     asset: SoundAsset,
-    stereo_48k: Arc<[f32]>,
+    source: SoundSource,
+    stereo_48k: Option<Arc<[f32]>>,
     byte_len: usize,
     last_used: u64,
 }
 
 /// Shared asset store tracking decoded 48 kHz stereo PCM buffers with LRU byte-budget eviction.
+///
+/// Mirrors [`crate::asset::AssetCache`]: trimming and LRU eviction release decoded PCM buffers
+/// while preserving [`SoundId`] handles and backing [`SoundSource`]s for transparent re-decoding.
+/// Only explicit [`Self::remove`] or [`Self::clear`] invalidates handles.
 pub(crate) struct SoundAssetStore {
     next_id: u64,
     access_clock: u64,
@@ -639,12 +656,27 @@ impl SoundAssetStore {
         }
     }
 
-    pub(crate) fn insert_sound_data(&mut self, key: SoundCacheKey, data: &SoundData) -> SoundAsset {
+    pub(crate) fn insert_sound_data(
+        &mut self,
+        key: SoundCacheKey,
+        source: SoundSource,
+        data: &SoundData,
+    ) -> SoundAsset {
         if let Some(&existing_id) = self.by_key.get(&key)
             && let Some(entry) = self.entries.get_mut(&existing_id)
         {
             self.access_clock += 1;
             entry.last_used = self.access_clock;
+            if entry.stereo_48k.is_none() {
+                let stereo_48k = data.to_stereo_48k_arc();
+                let byte_len = stereo_48k.len() * std::mem::size_of::<f32>();
+                entry.stereo_48k = Some(stereo_48k);
+                entry.byte_len = byte_len;
+                self.cached_bytes = self.cached_bytes.saturating_add(byte_len);
+                let asset = entry.asset;
+                self.evict_over_budget(existing_id);
+                return asset;
+            }
             return entry.asset;
         }
         self.next_id += 1;
@@ -664,7 +696,8 @@ impl SoundAssetStore {
             CachedSoundEntry {
                 key,
                 asset,
-                stereo_48k,
+                source,
+                stereo_48k: Some(stereo_48k),
                 byte_len,
                 last_used,
             },
@@ -686,7 +719,41 @@ impl SoundAssetStore {
         let entry = self.entries.get_mut(&id)?;
         self.access_clock += 1;
         entry.last_used = self.access_clock;
-        Some(Arc::clone(&entry.stereo_48k))
+        entry.stereo_48k.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn source_for(&self, id: SoundId) -> Option<SoundSource> {
+        self.entries.get(&id).map(|e| e.source.clone())
+    }
+
+    /// Re-populates a previously trimmed/evicted entry's decoded PCM buffer if `id` is still live.
+    pub(crate) fn restore_stereo(
+        &mut self,
+        id: SoundId,
+        stereo_48k: Arc<[f32]>,
+    ) -> Option<Arc<[f32]>> {
+        let entry = self.entries.get_mut(&id)?;
+        self.access_clock += 1;
+        entry.last_used = self.access_clock;
+        if let Some(existing) = &entry.stereo_48k {
+            return Some(Arc::clone(existing));
+        }
+        let byte_len = stereo_48k.len() * std::mem::size_of::<f32>();
+        entry.stereo_48k = Some(Arc::clone(&stereo_48k));
+        entry.byte_len = byte_len;
+        self.cached_bytes = self.cached_bytes.saturating_add(byte_len);
+        self.evict_over_budget(id);
+        Some(stereo_48k)
+    }
+
+    /// Releases all resident decoded PCM buffers while keeping every [`SoundId`] handle and its
+    /// [`SoundSource`] intact for transparent on-demand re-decoding.
+    pub(crate) fn trim_reclaimable(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.stereo_48k = None;
+            entry.byte_len = 0;
+        }
+        self.cached_bytes = 0;
     }
 
     pub(crate) fn remove(&mut self, id: SoundId) -> bool {
@@ -710,17 +777,21 @@ impl SoundAssetStore {
     }
 
     fn evict_over_budget(&mut self, keep_id: SoundId) {
-        while self.cached_bytes > self.max_cache_bytes && self.entries.len() > 1 {
+        while self.cached_bytes > self.max_cache_bytes {
             let victim = self
                 .entries
                 .iter()
-                .filter(|&(&id, _)| id != keep_id)
+                .filter(|&(&id, entry)| id != keep_id && entry.stereo_48k.is_some())
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(&id, _)| id);
             let Some(victim_id) = victim else {
                 break;
             };
-            self.remove(victim_id);
+            if let Some(entry) = self.entries.get_mut(&victim_id) {
+                entry.stereo_48k = None;
+                self.cached_bytes = self.cached_bytes.saturating_sub(entry.byte_len);
+                entry.byte_len = 0;
+            }
         }
     }
 }
@@ -831,21 +902,51 @@ mod tests {
         let c_data = SoundData::from_pcm_f32(MIXER_SAMPLE_RATE, 2, vec![0.3_f32; 20]).unwrap();
         // Each buffer is 20 * 4 = 80 bytes; allow at most 160 bytes (2 entries).
         let mut store = SoundAssetStore::with_cache_limit(160);
-        let a = store.insert_sound_data(SoundCacheKey::ContentHash(1), &a_data);
-        let b = store.insert_sound_data(SoundCacheKey::ContentHash(2), &b_data);
+        let a = store.insert_sound_data(
+            SoundCacheKey::ContentHash(1),
+            SoundSource::Preset(SoundPreset::Click),
+            &a_data,
+        );
+        let b = store.insert_sound_data(
+            SoundCacheKey::ContentHash(2),
+            SoundSource::Preset(SoundPreset::Hover),
+            &b_data,
+        );
         // Touch `a` so `b` becomes least-recently-used.
         assert!(store.get_stereo(a.id).is_some());
-        let c = store.insert_sound_data(SoundCacheKey::ContentHash(3), &c_data);
+        let c = store.insert_sound_data(
+            SoundCacheKey::ContentHash(3),
+            SoundSource::Preset(SoundPreset::Notification),
+            &c_data,
+        );
         assert!(store.get_stereo(a.id).is_some());
+        // `b`'s decoded PCM was evicted for byte budget, but its handle + source remain valid.
         assert!(store.get_stereo(b.id).is_none());
+        assert!(store.source_for(b.id).is_some());
         assert!(store.get_stereo(c.id).is_some());
         assert_eq!(store.cached_bytes(), 160);
+
+        // Trimming releases all resident PCM buffers while preserving handles + sources.
+        store.trim_reclaimable();
+        assert_eq!(store.cached_bytes(), 0);
+        assert!(store.get_stereo(a.id).is_none());
+        assert!(store.source_for(a.id).is_some());
+        assert!(
+            store
+                .restore_stereo(a.id, a_data.to_stereo_48k_arc())
+                .is_some()
+        );
+        assert_eq!(store.cached_bytes(), 80);
+
+        // Explicit remove / clear invalidate handles permanently.
         assert!(store.remove(a.id));
         assert!(!store.remove(a.id));
-        assert_eq!(store.cached_bytes(), 80);
+        assert!(store.source_for(a.id).is_none());
+        assert_eq!(store.cached_bytes(), 0);
         store.clear();
         assert_eq!(store.cached_bytes(), 0);
         assert!(store.get_stereo(c.id).is_none());
+        assert!(store.source_for(c.id).is_none());
     }
 
     #[test]

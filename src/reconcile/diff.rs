@@ -469,6 +469,19 @@ impl<M: Clone + 'static> Reconciler<M> {
         }
     }
 
+    /// Removes a retained surface directly (e.g. compositor-initiated layer close or popup
+    /// dismiss), retiring its node IDs and returning its `on_close` message (if any) plus retired
+    /// node IDs for renderer canvas cache cleanup.
+    pub(crate) fn remove_surface(
+        &mut self,
+        rk: RetainedSurfaceKey,
+    ) -> Option<(Option<M>, Vec<NodeId>)> {
+        let removed = self.surfaces.remove(&rk)?;
+        let mut retired = Vec::new();
+        self.retire_tree(&removed.roots, &mut retired);
+        Some((removed.on_close, retired))
+    }
+
     pub(super) fn retire_tree(&mut self, nodes: &[RetainedNode<M>], out: &mut Vec<NodeId>) {
         for n in nodes {
             out.push(n.node_id);

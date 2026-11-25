@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_seat;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -25,6 +26,7 @@ pub(crate) struct IdleNotificationData {
 #[derive(Default)]
 pub(crate) struct WaylandIdleState {
     notifier: Option<ExtIdleNotifierV1>,
+    bound_seat_id: Option<ObjectId>,
     notifications: HashMap<(Duration, bool), ExtIdleNotificationV1>,
 }
 
@@ -33,6 +35,7 @@ impl WaylandIdleState {
         let notifier = globals.bind::<ExtIdleNotifierV1, _, _>(qh, 1..=2, ()).ok();
         Self {
             notifier,
+            bound_seat_id: None,
             notifications: HashMap::new(),
         }
     }
@@ -48,6 +51,14 @@ impl WaylandIdleState {
         desired: &[(Duration, bool)],
         qh: &QueueHandle<WaylandState>,
     ) {
+        let seat_id = seat.map(Proxy::id);
+        if seat_id != self.bound_seat_id {
+            for (_, notif) in self.notifications.drain() {
+                notif.destroy();
+            }
+            self.bound_seat_id = seat_id;
+        }
+
         let desired_set: HashSet<(Duration, bool)> = desired.iter().copied().collect();
 
         let removed: Vec<(Duration, bool)> = self

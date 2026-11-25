@@ -1201,3 +1201,77 @@ fn memory_config_presets_trim_memory_and_headless_async_image_delivery() {
     assert!(rt.state().trimmed);
     rt.trim_memory();
 }
+
+#[test]
+fn surface_memo_and_nested_element_memo_invalidate_on_configure_resize() {
+    thread_local! {
+        static SHELL_BUILDS: Cell<usize> = const { Cell::new(0) };
+        static CHILD_BUILDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct ResizeMemoApp;
+
+    impl Application for ResizeMemoApp {
+        type State = ();
+        type Message = ();
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(())
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            _msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(Surface::memo("memo-win", &1u32, |_| {
+                SHELL_BUILDS.with(|c| c.set(c.get() + 1));
+                Surface::window("memo-win")
+                    .size((200.logical_px(), 100.logical_px()))
+                    .child(Element::memo("inner-rect", &1u32, |_| {
+                        CHILD_BUILDS.with(|c| c.set(c.get() + 1));
+                        Rect::new().size(Size::fill()).fill(Color::BLUE).into()
+                    }))
+            }));
+            s
+        }
+    }
+
+    SHELL_BUILDS.with(|c| c.set(0));
+    CHILD_BUILDS.with(|c| c.set(0));
+
+    let mut rt = HeadlessRuntime::<ResizeMemoApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+    assert_eq!(SHELL_BUILDS.with(|c| c.get()), 1);
+    assert_eq!(CHILD_BUILDS.with(|c| c.get()), 1);
+    assert_eq!(
+        rt.surface_logical_size("memo-win"),
+        Some(LogicalSize::new(200.logical_px(), 100.logical_px()))
+    );
+
+    // Steady-state frame hits both memos cleanly.
+    rt.step().unwrap();
+    assert_eq!(SHELL_BUILDS.with(|c| c.get()), 1);
+    assert_eq!(CHILD_BUILDS.with(|c| c.get()), 1);
+
+    // Compositor resize invalidates the surface memo + nested Element::memo so layout updates.
+    assert!(rt.simulate_surface_configure(
+        "memo-win",
+        LogicalSize::new(640.logical_px(), 480.logical_px()),
+    ));
+    rt.step().unwrap();
+    assert_eq!(SHELL_BUILDS.with(|c| c.get()), 2);
+    assert_eq!(CHILD_BUILDS.with(|c| c.get()), 2);
+    assert_eq!(
+        rt.surface_logical_size("memo-win"),
+        Some(LogicalSize::new(640.logical_px(), 480.logical_px()))
+    );
+}

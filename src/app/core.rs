@@ -275,7 +275,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
             feature = "alsa",
             feature = "audio-playback"
         ))]
-        self.player.clear_cache();
+        self.player.trim_memory();
         #[cfg(feature = "dbus")]
         self.dbus_client.trim_cache();
     }

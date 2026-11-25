@@ -66,6 +66,10 @@ struct MockXdgTrace {
     popup_reposition_offsets: Vec<Option<(i32, i32)>>,
     popup_destroyed: bool,
     popup_null_buffer_attached: bool,
+    layer_surfaces_created: usize,
+    layer_closed_sent: usize,
+    buffer_commits: usize,
+    frame_callbacks_created: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -73,6 +77,7 @@ struct MockServerConfig {
     enable_xdg_shell: bool,
     enable_layer_shell: bool,
     enable_xdg_activation: bool,
+    simulate_output_hotplug_on_two_layers: bool,
     #[cfg(feature = "ime")]
     enable_ime: bool,
 }
@@ -96,6 +101,10 @@ struct MockCompositor {
     popup_xdg_surface: Option<xdg_surface::XdgSurface>,
     popup_resource: Option<xdg_popup::XdgPopup>,
     popup_done_sent: bool,
+    layer_surfaces: Vec<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    output_global: Option<wayland_server::backend::GlobalId>,
+    hotplug_triggered: bool,
+    simulate_output_hotplug_on_two_layers: bool,
     current_positioner: MockPositionerSnapshot,
     positioners:
         std::collections::HashMap<wayland_server::backend::ObjectId, MockPositionerSnapshot>,
@@ -169,6 +178,12 @@ impl Dispatch<wl_surface::WlSurface, ()> for MockCompositor {
         match request {
             wl_surface::Request::Frame { callback } => {
                 data_init.init(callback, ());
+                state.xdg_trace.lock().unwrap().frame_callbacks_created += 1;
+            }
+            wl_surface::Request::Attach {
+                buffer: Some(_), ..
+            } => {
+                state.xdg_trace.lock().unwrap().buffer_commits += 1;
             }
             wl_surface::Request::Attach { buffer: None, .. }
                 if state.popup_wl_surface_id.as_ref() == Some(&resource.id()) =>
@@ -620,7 +635,7 @@ impl GlobalDispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for MockComposito
 
 impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for MockCompositor {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         request: zwlr_layer_shell_v1::Request,
@@ -631,6 +646,8 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for MockCompositor {
         if let zwlr_layer_shell_v1::Request::GetLayerSurface { id, .. } = request {
             let layer = data_init.init(id, ());
             layer.configure(1, 1920, 32);
+            state.layer_surfaces.push(layer);
+            state.xdg_trace.lock().unwrap().layer_surfaces_created += 1;
         }
     }
 }
@@ -879,7 +896,8 @@ fn spawn_mock_compositor_configured(
         let mut dh = display.handle();
         dh.create_global::<MockCompositor, wl_compositor::WlCompositor, _>(6, ());
         dh.create_global::<MockCompositor, wl_shm::WlShm, _>(1, ());
-        dh.create_global::<MockCompositor, wl_output::WlOutput, _>(4, ());
+        let initial_output_global =
+            dh.create_global::<MockCompositor, wl_output::WlOutput, _>(4, ());
         dh.create_global::<MockCompositor, wl_seat::WlSeat, _>(7, ());
         if cfg.enable_xdg_shell {
             dh.create_global::<MockCompositor, xdg_wm_base::XdgWmBase, _>(5, ());
@@ -908,6 +926,10 @@ fn spawn_mock_compositor_configured(
             popup_xdg_surface: None,
             popup_resource: None,
             popup_done_sent: false,
+            layer_surfaces: Vec::new(),
+            output_global: Some(initial_output_global),
+            hotplug_triggered: false,
+            simulate_output_hotplug_on_two_layers: cfg.simulate_output_hotplug_on_two_layers,
             current_positioner: MockPositionerSnapshot::default(),
             positioners: std::collections::HashMap::new(),
             xdg_surface_to_wl: std::collections::HashMap::new(),
@@ -929,6 +951,25 @@ fn spawn_mock_compositor_configured(
         };
         while !stop_srv.load(Ordering::Relaxed) {
             let _ = display.dispatch_clients(&mut state);
+            if state.simulate_output_hotplug_on_two_layers
+                && !state.hotplug_triggered
+                && state.layer_surfaces.len() >= 2
+                && state.popup_resource.is_some()
+            {
+                state.hotplug_triggered = true;
+                let closing = std::mem::take(&mut state.layer_surfaces);
+                for layer in closing {
+                    layer.closed();
+                    state.xdg_trace.lock().unwrap().layer_closed_sent += 1;
+                }
+                if let Some(old_out) = state.output_global.take() {
+                    dh.remove_global::<MockCompositor>(old_out);
+                }
+                let _ = display.flush_clients();
+                std::thread::sleep(Duration::from_millis(15));
+                let new_out = dh.create_global::<MockCompositor, wl_output::WlOutput, _>(4, ());
+                state.output_global = Some(new_out);
+            }
             let _ = display.flush_clients();
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1416,5 +1457,162 @@ fn socketpair_layer_xdg_popup_positioner_reposition_and_done() {
     assert!(
         !trace.popup_null_buffer_attached,
         "xdg_popup must not attach a null buffer before destroy"
+    );
+}
+
+#[test]
+fn socketpair_layer_closed_and_output_hotplug_recreates_memo_surfaces_without_quitting() {
+    use std::sync::atomic::AtomicUsize;
+    use waywi::render::{Color, Element, Rect};
+
+    #[derive(Clone)]
+    enum HotplugMsg {
+        PopupClosed,
+        Tick,
+        Quit,
+    }
+
+    struct HotplugState {
+        popup_open: bool,
+        ticks: usize,
+    }
+
+    static POPUP_DISMISSED: AtomicBool = AtomicBool::new(false);
+    static MEMO_SHELL_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static MEMO_INNER_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static SURVIVED_AFTER_HOTPLUG: AtomicBool = AtomicBool::new(false);
+
+    struct HotplugApp;
+
+    impl Application for HotplugApp {
+        type State = HotplugState;
+        type Message = HotplugMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            // Multiple ticks after hotplug verify the app stayed alive and frame_pending pacing
+            // did not spam redundant commits while frame callbacks are unacknowledged.
+            ctx.after(Duration::from_millis(80), HotplugMsg::Tick);
+            ctx.after(Duration::from_millis(140), HotplugMsg::Tick);
+            ctx.after(Duration::from_millis(220), HotplugMsg::Quit);
+            Ok(HotplugState {
+                popup_open: true,
+                ticks: 0,
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                HotplugMsg::PopupClosed => {
+                    state.popup_open = false;
+                    POPUP_DISMISSED.store(true, Ordering::Relaxed);
+                }
+                HotplugMsg::Tick => {
+                    state.ticks += 1;
+                    if state.ticks >= 2 {
+                        SURVIVED_AFTER_HOTPLUG.store(true, Ordering::Relaxed);
+                    }
+                }
+                HotplugMsg::Quit => ctx.quit(),
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            // Intentionally no `.on_close(...)` on layer surfaces: `zwlr_layer_surface_v1.closed`
+            // must NOT set `quit_requested = true`.
+            s.push(
+                Surface::panel("bar", Output::Primary)
+                    .anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT)
+                    .size((1920.logical_px(), 32.logical_px()))
+                    .child(Rect::new().size((40.logical_px(), 20.logical_px())).fill(
+                        if state.ticks % 2 == 0 {
+                            Color::RED
+                        } else {
+                            Color::GREEN
+                        },
+                    )),
+            );
+            s.push(Surface::memo("wallpaper", &1u32, |_| {
+                MEMO_SHELL_BUILDS.fetch_add(1, Ordering::Relaxed);
+                Surface::panel("wallpaper", Output::All)
+                    .size((1920.logical_px(), 1080.logical_px()))
+                    .child(Element::memo("wp-inner", &1u32, |_| {
+                        MEMO_INNER_BUILDS.fetch_add(1, Ordering::Relaxed);
+                        Rect::new()
+                            .size((100.logical_px(), 100.logical_px()))
+                            .fill(Color::BLUE)
+                            .into()
+                    }))
+            }));
+            if state.popup_open {
+                s.push(
+                    Surface::popup("menu", "bar")
+                        .size((160.logical_px(), 90.logical_px()))
+                        .positioner(PopupPositioner::new(Bounds::from_xywh(
+                            10.0, 0.0, 60.0, 32.0,
+                        )))
+                        .on_close(HotplugMsg::PopupClosed),
+                );
+            }
+            s
+        }
+    }
+
+    POPUP_DISMISSED.store(false, Ordering::Relaxed);
+    MEMO_SHELL_BUILDS.store(0, Ordering::Relaxed);
+    MEMO_INNER_BUILDS.store(0, Ordering::Relaxed);
+    SURVIVED_AFTER_HOTPLUG.store(false, Ordering::Relaxed);
+
+    let (conn, stop, srv, _, xdg_trace) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_layer_shell: true,
+        simulate_output_hotplug_on_two_layers: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<HotplugApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "HotplugApp failed: {res:?}");
+
+    assert!(
+        SURVIVED_AFTER_HOTPLUG.load(Ordering::Relaxed),
+        "app must stay alive after zwlr_layer_surface_v1.closed (monitor OSD/hotplug)"
+    );
+    assert!(
+        POPUP_DISMISSED.load(Ordering::Relaxed),
+        "child xdg_popup must receive on_close when parent layer surface closes"
+    );
+    assert!(
+        MEMO_SHELL_BUILDS.load(Ordering::Relaxed) >= 2,
+        "Surface::memo(Output::All) must rebuild after OutputsChanged"
+    );
+    assert!(
+        MEMO_INNER_BUILDS.load(Ordering::Relaxed) >= 2,
+        "nested Element::memo inside Surface::memo must rebuild for recreated output"
+    );
+
+    let trace = xdg_trace.lock().unwrap();
+    assert!(
+        trace.layer_closed_sent >= 2,
+        "expected mock compositor to send closed to both layer surfaces, got {}",
+        trace.layer_closed_sent
+    );
+    assert!(
+        trace.layer_surfaces_created >= 4,
+        "expected both panel and memo wallpaper to be recreated on new wl_output, got {}",
+        trace.layer_surfaces_created
+    );
+    // While MockCompositor never answers `wl_surface.frame`, pacing must prevent spamming
+    // extra commits on the recreated `bar` across multiple ticks.
+    assert!(
+        trace.buffer_commits <= trace.frame_callbacks_created + 1,
+        "frame_pending pacing violated: commits={} frame_callbacks={}",
+        trace.buffer_commits,
+        trace.frame_callbacks_created
     );
 }

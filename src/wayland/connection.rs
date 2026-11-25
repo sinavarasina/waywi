@@ -457,6 +457,7 @@ impl WaylandState {
                 scale: initial_scale,
                 frame_pending: false,
                 pending_redraw: true,
+                gpu_bound: false,
                 reposition_token: 0,
                 spec: spec.clone(),
             },
@@ -519,7 +520,7 @@ impl WaylandState {
         Ok(())
     }
 
-    pub(crate) fn destroy_surface(&mut self, key: RetainedSurfaceKey) {
+    pub(crate) fn destroy_surface(&mut self, key: RetainedSurfaceKey, detach_null_buffer: bool) {
         if let Some(mut surf) = self.surfaces.remove(&key) {
             self.surface_by_obj.remove(&surf.wl_surface_id);
             #[cfg(feature = "ime")]
@@ -535,9 +536,11 @@ impl WaylandState {
                 self.last_input_serial = None;
             }
             self.active_touches.retain(|_, v| *v != key);
-            // Detach buffer for toplevel/layer surfaces before dropping; xdg_popup must be
-            // destroyed directly without attaching a null buffer per xdg-shell protocol rules.
-            if !matches!(surf.role, SurfaceRole::Popup(_)) {
+            // Detach buffer for SHM toplevel/layer surfaces before dropping; skip null-buffer
+            // commits for xdg_popup (xdg-shell rule), compositor-closed layers, or GPU-bound
+            // surfaces (whose swapchain has already been torn down).
+            if detach_null_buffer && !surf.gpu_bound && !matches!(surf.role, SurfaceRole::Popup(_))
+            {
                 let wl = surf.role.wl_surface();
                 wl.attach(None, 0, 0);
                 wl.commit();
@@ -706,28 +709,60 @@ impl WaylandState {
         key: RetainedSurfaceKey,
         logical_size: LogicalSize,
         present_fn: F,
-    ) -> Result<bool>
+    ) -> Result<crate::render::WaylandPresentOutcome>
     where
-        F: FnOnce(&wayland_client::protocol::wl_surface::WlSurface) -> Result<bool>,
+        F: FnOnce(
+            &wayland_client::protocol::wl_surface::WlSurface,
+            &mut dyn FnMut(),
+        ) -> Result<crate::render::WaylandPresentOutcome>,
     {
+        use crate::render::WaylandPresentOutcome;
+
         self.configure_surface_scale(key, logical_size);
         let Some(surf) = self.surfaces.get_mut(&key) else {
-            return Ok(false);
+            return Ok(WaylandPresentOutcome::Deferred);
         };
-        if !surf.configured {
+        if !surf.configured || surf.frame_pending {
             surf.pending_redraw = true;
-            return Ok(false);
+            return Ok(WaylandPresentOutcome::Deferred);
         }
         let wl_surface = surf.role.wl_surface().clone();
-        if !surf.frame_pending {
-            wl_surface.frame(qh, wl_surface.clone());
-            surf.frame_pending = true;
-        }
-        if present_fn(&wl_surface)? {
-            surf.pending_redraw = false;
-            Ok(true)
-        } else {
-            Ok(false)
+        let was_gpu_bound = surf.gpu_bound;
+        let mut armed_frame = false;
+        let mut arm_frame_callback = || {
+            if !armed_frame {
+                wl_surface.frame(qh, wl_surface.clone());
+                armed_frame = true;
+            }
+        };
+        let outcome = present_fn(&wl_surface, &mut arm_frame_callback)?;
+        let Some(surf) = self.surfaces.get_mut(&key) else {
+            return Ok(outcome);
+        };
+        match outcome {
+            WaylandPresentOutcome::Committed => {
+                surf.gpu_bound = true;
+                surf.pending_redraw = false;
+                if armed_frame {
+                    surf.frame_pending = true;
+                }
+                Ok(WaylandPresentOutcome::Committed)
+            }
+            WaylandPresentOutcome::Deferred => {
+                surf.gpu_bound = true;
+                surf.pending_redraw = true;
+                Ok(WaylandPresentOutcome::Deferred)
+            }
+            WaylandPresentOutcome::FallbackToShm => {
+                if was_gpu_bound {
+                    // Never fall back to `wl_shm` on a `wl_surface` that already bound a GPU
+                    // swapchain; keep waiting until swapchain recovery or surface recreation.
+                    surf.pending_redraw = true;
+                    Ok(WaylandPresentOutcome::Deferred)
+                } else {
+                    Ok(WaylandPresentOutcome::FallbackToShm)
+                }
+            }
         }
     }
 }

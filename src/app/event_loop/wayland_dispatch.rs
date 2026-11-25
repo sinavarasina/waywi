@@ -6,7 +6,6 @@ use crate::app::subscription_mgr::{LoopInbox, fanout_event};
 use crate::geometry::{LogicalPx, Point};
 use crate::input::{Key, KeyEvent, Modifiers, MouseButton, ScrollEvent};
 use crate::reconcile::RetainedSurfaceKey;
-use crate::render::RenderBackend;
 use crate::wayland::{WaylandEvent, WaylandState};
 
 use super::LoopRuntime;
@@ -111,36 +110,43 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
     while let Some(ev) = wl.events.pop_front() {
         match ev {
             WaylandEvent::OutputsChanged => {
+                wl.refresh_outputs();
                 wl.refresh_wayland_capabilities(&mut rt.core.capabilities);
+                rt.core.memo_store.invalidate_all();
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceConfigured { key, size } => {
-                rt.core.configured_sizes.insert(key, size);
+                if rt.core.configured_sizes.insert(key, size) != Some(size) {
+                    rt.core.memo_store.invalidate_surface(key.surface_key.0);
+                }
                 rt.needs_view_sync = true;
             }
             WaylandEvent::SurfaceScaleChanged { key, scale } => {
-                rt.core.surface_scales.insert(key, scale);
+                if rt.core.surface_scales.insert(key, scale) != Some(scale) {
+                    rt.core.memo_store.invalidate_surface(key.surface_key.0);
+                }
                 rt.needs_view_sync = true;
             }
-            WaylandEvent::SurfaceClosed { key } => {
-                let is_popup = rt
-                    .core
-                    .reconciler
-                    .surfaces
-                    .get(&key)
-                    .is_some_and(|s| s.spec.kind == crate::surface::SurfaceKind::Popup);
-                if is_popup {
-                    wl.destroy_surface(key);
-                    rt.core.renderer.drop_surface_target(key);
-                    rt.core.configured_sizes.remove(&key);
-                    rt.core.surface_scales.remove(&key);
-                }
+            WaylandEvent::WindowCloseRequested { key } => {
                 if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
                     && let Some(msg) = &surf.on_close
                 {
                     push_message(&rt.inbox, msg.clone());
-                } else if !is_popup {
+                } else {
                     rt.core.quit_requested = true;
+                }
+            }
+            WaylandEvent::PopupDismissed { key } => {
+                if let Some(msg) = super::present::teardown_surface_with_popups(rt, wl, key, false)
+                {
+                    push_message(&rt.inbox, msg);
+                }
+            }
+            WaylandEvent::LayerClosed { key } => {
+                rt.core.memo_store.invalidate_surface(key.surface_key.0);
+                if let Some(msg) = super::present::teardown_surface_with_popups(rt, wl, key, false)
+                {
+                    push_message(&rt.inbox, msg);
                 }
             }
             WaylandEvent::ActivationToken { request_id, token } => {

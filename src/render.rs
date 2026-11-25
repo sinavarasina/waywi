@@ -17,7 +17,6 @@ pub use elements::{Clip, Column, Element, Group, Rect, Row};
 pub use style::{Align, Border, Color, CornerRadius};
 
 use wayland_client::Connection;
-use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::app::MemoryConfig;
 use crate::asset::AssetId;
@@ -32,7 +31,7 @@ use crate::reconcile::RetainedSurfaceKey;
 use crate::text::TextEngine;
 use crate::text::{SharedStr, TextMeasureStyle};
 
-pub(crate) use backend::{FrameScene, RenderBackend};
+pub(crate) use backend::{FrameScene, RenderBackend, WaylandPresentOutcome, WaylandPresentTarget};
 pub(crate) use elements::ElementKind;
 #[cfg(feature = "renderer-gpu")]
 pub(crate) use gpu::GpuRenderer;
@@ -238,23 +237,19 @@ impl RenderBackend for ActiveRenderer {
     #[cfg_attr(not(feature = "renderer-gpu"), allow(unused_variables))]
     fn present_wayland_surface(
         &mut self,
-        conn: &Connection,
-        surface: &WlSurface,
-        key: RetainedSurfaceKey,
-        logical_size: LogicalSize,
+        target: WaylandPresentTarget<'_>,
         scene: backend::FrameScene<'_>,
-    ) -> Result<bool> {
+        on_before_commit: &mut dyn FnMut(),
+    ) -> Result<WaylandPresentOutcome> {
         match &mut self.backend {
-            ActiveBackend::Software(_) => Ok(false),
+            ActiveBackend::Software(_) => Ok(WaylandPresentOutcome::FallbackToShm),
             #[cfg(feature = "renderer-gpu")]
             ActiveBackend::Gpu(r) => r.present_wayland_surface(
                 #[cfg(feature = "text")]
                 &mut self.text_engine,
-                conn,
-                surface,
-                key,
-                logical_size,
+                target,
                 scene,
+                on_before_commit,
             ),
         }
     }

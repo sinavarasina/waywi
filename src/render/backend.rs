@@ -36,6 +36,31 @@ pub(crate) struct FrameScene<'a> {
     pub(crate) frame_seq: u64,
 }
 
+/// Borrowed Wayland surface presentation target passed to [`RenderBackend::present_wayland_surface`].
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "renderer-gpu"), allow(dead_code))]
+pub(crate) struct WaylandPresentTarget<'a> {
+    pub(crate) conn: &'a Connection,
+    pub(crate) surface: &'a WlSurface,
+    pub(crate) key: RetainedSurfaceKey,
+    pub(crate) logical_size: LogicalSize,
+}
+
+/// Outcome of attempting to present a Wayland surface through the active renderer backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "renderer-gpu"), allow(dead_code))]
+pub(crate) enum WaylandPresentOutcome {
+    /// Frame was rendered and committed directly via hardware GPU swapchain.
+    Committed,
+    /// Surface is bound to a GPU swapchain, but presentation is temporarily deferred
+    /// (e.g. DPMS off, occluded, timeout, or awaiting compositor frame callback).
+    /// Callers must NOT fall back to `wl_shm` on this `wl_surface`.
+    Deferred,
+    /// Surface is not bound to a GPU swapchain (software backend, or GPU target cannot be
+    /// created for this surface) and may be presented via `wl_shm`.
+    FallbackToShm,
+}
+
 /// Unified renderer interface consumed by the reconciler and Wayland/headless presentation loops.
 pub(crate) trait RenderBackend {
     /// Drops cached intermediate pixmaps/textures owned by retired canvas/text nodes.
@@ -78,17 +103,16 @@ pub(crate) trait RenderBackend {
 
     /// Presents directly to a live `wl_surface` when supported by a GPU swapchain backend.
     ///
-    /// Returns `Ok(true)` if the frame was committed via hardware swapchain, or `Ok(false)` to
-    /// fall back cleanly to `wl_shm` presentation.
+    /// Invokes `on_before_commit` only after a swapchain frame has been acquired and right before
+    /// presentation commits the `wl_surface`, so callers can attach `wl_surface.frame` callbacks
+    /// without risking a stalled callback when acquisition fails.
     fn present_wayland_surface(
         &mut self,
-        _conn: &Connection,
-        _surface: &WlSurface,
-        _key: RetainedSurfaceKey,
-        _logical_size: LogicalSize,
+        _target: WaylandPresentTarget<'_>,
         _scene: FrameScene<'_>,
-    ) -> Result<bool> {
-        Ok(false)
+        _on_before_commit: &mut dyn FnMut(),
+    ) -> Result<WaylandPresentOutcome> {
+        Ok(WaylandPresentOutcome::FallbackToShm)
     }
 
     /// Releases any GPU swapchain resources associated with a destroyed Wayland surface.

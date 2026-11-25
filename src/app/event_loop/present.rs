@@ -6,7 +6,8 @@ use crate::asset::AssetId;
 use crate::error::Result;
 use crate::geometry::BufferPx;
 use crate::reconcile::RetainedSurfaceKey;
-use crate::render::{FrameScene, RenderBackend};
+use crate::render::{FrameScene, RenderBackend, WaylandPresentOutcome, WaylandPresentTarget};
+use crate::surface::SurfaceKind;
 use crate::wayland::WaylandState;
 
 use super::super::runner::Application;
@@ -49,6 +50,71 @@ fn order_keys_children_first(
     ordered
 }
 
+/// Tears down a single live Wayland surface in the required safety order:
+/// 1. Drop any GPU swapchain target (`VkSurfaceKHR`) while the `wl_surface` is still alive.
+/// 2. Destroy the Wayland surface and release SHM pools.
+/// 3. Clear cached configure size and scale metadata.
+pub(crate) fn teardown_surface<M: Clone + 'static>(
+    rt: &mut LoopRuntime<M>,
+    wl: &mut WaylandState,
+    rk: RetainedSurfaceKey,
+    detach_null_buffer: bool,
+) {
+    rt.core.renderer.drop_surface_target(rk);
+    wl.destroy_surface(rk, detach_null_buffer);
+    rt.core.configured_sizes.remove(&rk);
+    rt.core.surface_scales.remove(&rk);
+}
+
+/// Tears down `rk` and any live transitive child `xdg_popup` surfaces (children first), retiring
+/// them from the reconciler and returning `rk`'s `on_close` message if configured.
+pub(crate) fn teardown_surface_with_popups<M: Clone + 'static>(
+    rt: &mut LoopRuntime<M>,
+    wl: &mut WaylandState,
+    rk: RetainedSurfaceKey,
+    detach_null_buffer: bool,
+) -> Option<M> {
+    let mut closing = vec![rk];
+    loop {
+        let before = closing.len();
+        for (&cand_rk, cand_surf) in &wl.surfaces {
+            if closing.contains(&cand_rk) {
+                continue;
+            }
+            if let Some(p) = &cand_surf.spec.popup
+                && closing.iter().any(|parent| {
+                    parent.surface_key == p.parent
+                        && (parent.output_id == cand_rk.output_id || cand_rk.output_id.is_none())
+                })
+            {
+                closing.push(cand_rk);
+            }
+        }
+        if closing.len() == before {
+            break;
+        }
+    }
+
+    let ordered = order_keys_children_first(wl, &closing);
+    let mut root_on_close = None;
+    for target_rk in ordered {
+        let detach = if target_rk == rk {
+            detach_null_buffer
+        } else {
+            false
+        };
+        teardown_surface(rt, wl, target_rk, detach);
+        if let Some((on_close, retired)) = rt.core.reconciler.remove_surface(target_rk) {
+            rt.core.renderer.drop_canvas_cache_for(&retired);
+            if target_rk == rk {
+                root_on_close = on_close;
+            } else if let Some(msg) = on_close {
+                rt.inbox.borrow_mut().messages.push_back(msg);
+            }
+        }
+    }
+    root_on_close
+}
 /// Phase 4: synchronize the view tree, retained Wayland surfaces, and subscriptions.
 pub(crate) fn sync_view_and_subscriptions<A: Application>(
     rt: &mut LoopRuntime<A::Message>,
@@ -110,12 +176,10 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
             .reconcile_view(&wl.outputs, now_sync, || A::view(state))
     };
 
-    // Destroy xdg_popup surfaces before parent surfaces per Wayland xdg_shell ordering rules.
+    // Destroy xdg_popup surfaces before parent surfaces per Wayland xdg_shell ordering rules,
+    // dropping each GPU swapchain before destroying its `wl_surface`.
     for rk in order_keys_children_first(wl, &report.removed_surfaces) {
-        wl.destroy_surface(rk);
-        rt.core.renderer.drop_surface_target(rk);
-        rt.core.configured_sizes.remove(&rk);
-        rt.core.surface_scales.remove(&rk);
+        teardown_surface(rt, wl, rk, true);
     }
     // Create parent surfaces before child xdg_popup surfaces (supporting nested popups).
     let mut pending_create: Vec<RetainedSurfaceKey> = report.created_surfaces.clone();
@@ -140,6 +204,24 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
         }
         if !progressed {
             for rk in deferred {
+                let is_orphan_popup = rt
+                    .core
+                    .reconciler
+                    .surfaces
+                    .get(&rk)
+                    .is_some_and(|s| s.spec.kind == SurfaceKind::Popup);
+                if is_orphan_popup {
+                    // Parent surface is currently unmapped (e.g. monitor hotplug / DPMS deep sleep
+                    // closed the parent layer surface). Dismiss cleanly instead of terminating the
+                    // event loop with an unhandled SurfaceError.
+                    if let Some((on_close, retired)) = rt.core.reconciler.remove_surface(rk) {
+                        rt.core.renderer.drop_canvas_cache_for(&retired);
+                        if let Some(msg) = on_close {
+                            rt.inbox.borrow_mut().messages.push_back(msg);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(surf) = rt.core.reconciler.surfaces.get(&rk) {
                     wl.create_surface(&rt.qh, rk, &surf.spec)?;
                 }
@@ -194,14 +276,20 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
     let mut reclaim_candidates: Vec<AssetId> = Vec::new();
 
     for (&rk, surf) in &mut rt.core.reconciler.surfaces {
-        let ws = wl.surfaces.get(&rk);
-        let pending = ws.is_some_and(|w| w.pending_redraw);
+        let Some(ws) = wl.surfaces.get(&rk) else {
+            continue;
+        };
+        let pending = ws.pending_redraw;
         if !surf.needs_redraw && !pending {
             continue;
         }
-        if ws.is_some_and(|w| w.configured) {
-            assets.ensure_decoded_for_commands(&surf.commands);
+        if !ws.configured || ws.frame_pending {
+            if let Some(ws_mut) = wl.surfaces.get_mut(&rk) {
+                ws_mut.pending_redraw = true;
+            }
+            continue;
         }
+        assets.ensure_decoded_for_commands(&surf.commands);
         let logical_size = surf.effective_logical_size();
         let scale = surf.scale;
         let scene = FrameScene {
@@ -212,18 +300,32 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
             frame_seq,
         };
 
-        let gpu_committed = if renderer.is_gpu_active() {
-            wl.try_present_external_surface(&rt.qh, rk, logical_size, |wl_surface| {
-                renderer.present_wayland_surface(conn, wl_surface, rk, logical_size, scene)
-            })?
+        let gpu_outcome = if renderer.is_gpu_active() {
+            wl.try_present_external_surface(
+                &rt.qh,
+                rk,
+                logical_size,
+                |wl_surface, on_before_commit| {
+                    renderer.present_wayland_surface(
+                        WaylandPresentTarget {
+                            conn,
+                            surface: wl_surface,
+                            key: rk,
+                            logical_size,
+                        },
+                        scene,
+                        on_before_commit,
+                    )
+                },
+            )?
         } else {
-            false
+            WaylandPresentOutcome::FallbackToShm
         };
 
-        let committed = if gpu_committed {
-            true
-        } else {
-            wl.present_surface_with(
+        let committed = match gpu_outcome {
+            WaylandPresentOutcome::Committed => true,
+            WaylandPresentOutcome::Deferred => false,
+            WaylandPresentOutcome::FallbackToShm => wl.present_surface_with(
                 &rt.qh,
                 rk,
                 logical_size,
@@ -237,7 +339,7 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
                         scene,
                     )
                 },
-            )?
+            )?,
         };
 
         if committed {
@@ -274,7 +376,7 @@ pub(crate) fn shutdown_surfaces<M: Clone + 'static>(
 ) {
     let active_keys: Vec<RetainedSurfaceKey> = wl.surfaces.keys().copied().collect();
     for rk in order_keys_children_first(wl, &active_keys) {
-        wl.destroy_surface(rk);
+        teardown_surface(rt, wl, rk, true);
     }
     rt.sub_mgr.cleanup(&rt.loop_handle);
     rt.core.system.stop_idle_workers();

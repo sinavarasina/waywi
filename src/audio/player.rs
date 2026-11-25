@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(
     feature = "audio-playback",
@@ -17,7 +18,7 @@ use crate::error::{Result, WaywiError};
 
 use super::sound::{
     DEFAULT_SOUND_CACHE_BYTES, MAX_SOUND_FILE_BYTES, SoundAsset, SoundAssetStore, SoundCacheKey,
-    SoundData, SoundPlay, SoundPreset, resolve_sound_theme_path,
+    SoundData, SoundPlay, SoundPreset, SoundSource, resolve_sound_theme_path,
 };
 
 #[cfg(any(
@@ -39,9 +40,31 @@ enum PlayerCommand {
 }
 
 trait PlaybackDriver: Send {
+    fn is_alive(&self) -> bool;
     fn send_play(&mut self, stereo_48k: Arc<[f32]>, volume: f32);
     fn send_stop(&mut self);
     fn shutdown(&mut self);
+}
+
+/// RAII guard marking a background audio playback thread as dead on any exit path.
+#[cfg(any(
+    feature = "audio-playback",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
+struct AliveGuard(Arc<AtomicBool>);
+
+#[cfg(any(
+    feature = "audio-playback",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Audio asset cache and low-latency polyphonic playback engine.
@@ -116,10 +139,17 @@ impl AudioPlayer {
                 return Ok(existing);
             }
         }
-        let hint = canonical.extension().and_then(|e| e.to_str());
-        let data = SoundData::from_vec_with_hint(bytes, hint)?;
+        let hint = canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_owned);
+        let data = SoundData::from_vec_with_hint(bytes, hint.as_deref())?;
+        let source = SoundSource::File {
+            path: canonical,
+            ext_hint: hint,
+        };
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(store.insert_sound_data(key, &data))
+        Ok(store.insert_sound_data(key, source, &data))
     }
 
     /// Decodes and caches an in-memory audio buffer (`WAV` always; `OGG`/`MP3`/`FLAC` with
@@ -133,8 +163,9 @@ impl AudioPlayer {
             }
         }
         let data = SoundData::from_bytes(bytes)?;
+        let source = SoundSource::EncodedBytes(Arc::from(bytes));
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(store.insert_sound_data(key, &data))
+        Ok(store.insert_sound_data(key, source, &data))
     }
 
     /// Resolves and caches a freedesktop XDG Sound Theme event sound (e.g. `"message-new-instant"`).
@@ -159,7 +190,7 @@ impl AudioPlayer {
         }
         let data = SoundData::from_preset(preset);
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-        store.insert_sound_data(key, &data)
+        store.insert_sound_data(key, SoundSource::Preset(preset), &data)
     }
 
     /// Removes a cached [`SoundAsset`] from memory, returning `true` if it was present.
@@ -168,10 +199,44 @@ impl AudioPlayer {
         store.remove(sound.id)
     }
 
-    /// Frees all cached decoded PCM buffers.
+    /// Frees all cached decoded PCM buffers and invalidates all [`SoundAsset`] handles.
     pub fn clear_cache(&self) {
         let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
         store.clear();
+    }
+
+    /// Releases resident decoded PCM buffers while preserving all [`SoundAsset`] handles and
+    /// their backing sources for transparent on-demand re-decoding (called by `trim_memory()`).
+    pub(crate) fn trim_memory(&self) {
+        let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.trim_reclaimable();
+    }
+
+    /// Resolves a live [`SoundId`]'s decoded stereo PCM buffer, transparently re-decoding from
+    /// its [`SoundSource`] without holding the store mutex if it was trimmed or LRU-evicted.
+    fn resolve_stereo(&self, id: super::sound::SoundId) -> Option<Arc<[f32]>> {
+        let source = {
+            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(buf) = store.get_stereo(id) {
+                return Some(buf);
+            }
+            store.source_for(id)?
+        };
+        let decoded = match source {
+            SoundSource::File { path, ext_hint } => {
+                let meta = fs::metadata(&path).ok()?;
+                if meta.len() > MAX_SOUND_FILE_BYTES {
+                    return None;
+                }
+                let bytes = fs::read(&path).ok()?;
+                SoundData::from_vec_with_hint(bytes, ext_hint.as_deref()).ok()?
+            }
+            SoundSource::EncodedBytes(bytes) => SoundData::from_bytes(&bytes).ok()?,
+            SoundSource::Preset(preset) => SoundData::from_preset(preset),
+        };
+        let stereo_48k = decoded.to_stereo_48k_arc();
+        let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.restore_stereo(id, stereo_48k)
     }
 
     /// Plays a cached [`SoundAsset`] at full volume (`1.0`).
@@ -181,11 +246,7 @@ impl AudioPlayer {
 
     /// Plays a cached [`SoundAsset`] scaled by `volume` (`0.0..=2.0`).
     pub fn play_at(&self, sound: SoundAsset, volume: f32) {
-        let stereo = {
-            let mut store = self.inner.store.lock().unwrap_or_else(|e| e.into_inner());
-            store.get_stereo(sound.id)
-        };
-        if let Some(buf) = stereo {
+        if let Some(buf) = self.resolve_stereo(sound.id) {
             self.enqueue_play(buf, volume);
         }
     }
@@ -238,6 +299,11 @@ impl AudioPlayer {
             return;
         }
         let mut guard = self.inner.driver.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|drv| !drv.is_alive())
+            && let Some(mut dead) = guard.take()
+        {
+            dead.shutdown();
+        }
         if guard.is_none() {
             *guard = start_playback_driver();
         }
@@ -340,6 +406,7 @@ impl rodio::Source for ArcSliceSource {
 #[cfg(feature = "audio-playback")]
 struct RodioDriver {
     tx: std::sync::mpsc::Sender<PlayerCommand>,
+    alive: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -348,9 +415,12 @@ impl RodioDriver {
     fn spawn() -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<PlayerCommand>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_worker = Arc::clone(&alive);
         let join = thread::Builder::new()
             .name("waywi-audio-rodio".to_owned())
             .spawn(move || {
+                let _alive_guard = AliveGuard(alive_worker);
                 let Ok(sink) = rodio::DeviceSinkBuilder::open_default_sink() else {
                     let _ = init_tx.send(false);
                     return;
@@ -385,6 +455,7 @@ impl RodioDriver {
         }
         Some(Self {
             tx,
+            alive,
             join: Some(join),
         })
     }
@@ -392,12 +463,24 @@ impl RodioDriver {
 
 #[cfg(feature = "audio-playback")]
 impl PlaybackDriver for RodioDriver {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     fn send_play(&mut self, stereo_48k: Arc<[f32]>, volume: f32) {
-        let _ = self.tx.send(PlayerCommand::Play { stereo_48k, volume });
+        if self
+            .tx
+            .send(PlayerCommand::Play { stereo_48k, volume })
+            .is_err()
+        {
+            self.alive.store(false, Ordering::Release);
+        }
     }
 
     fn send_stop(&mut self) {
-        let _ = self.tx.send(PlayerCommand::StopAll);
+        if self.tx.send(PlayerCommand::StopAll).is_err() {
+            self.alive.store(false, Ordering::Release);
+        }
     }
 
     fn shutdown(&mut self) {
@@ -412,8 +495,6 @@ impl PlaybackDriver for RodioDriver {
 use std::sync::Condvar;
 #[cfg(feature = "pipewire")]
 use std::sync::atomic::AtomicUsize;
-#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Silent frames (~250 ms at 48 kHz) drained after the last voice finishes before corking the
 /// PipeWire stream so short tactile clicks never clip at the tail while idle sinks can suspend.
@@ -444,6 +525,7 @@ type SharedMixer = Arc<(Mutex<PolyphonicMixer>, Condvar)>;
 struct NativeDriver {
     mixer: SharedMixer,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     #[cfg(feature = "pipewire")]
     pw_wake: Option<pipewire::channel::Sender<PwPlaySignal>>,
     #[cfg(feature = "pipewire")]
@@ -508,17 +590,19 @@ impl NativeDriver {
     fn try_spawn_pipewire() -> Option<Self> {
         let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
         let idle_frames = Arc::new(AtomicUsize::new(0));
         let (pw_tx, pw_rx) = pipewire::channel::channel::<PwPlaySignal>();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
 
         let m = Arc::clone(&mixer);
         let s = Arc::clone(&stop);
+        let a = Arc::clone(&alive);
         let idle = Arc::clone(&idle_frames);
         let tx_proc = pw_tx.clone();
         let join = thread::Builder::new()
             .name("waywi-audio-pw".to_owned())
-            .spawn(move || run_pipewire_playback(m, s, idle, tx_proc, pw_rx, init_tx))
+            .spawn(move || run_pipewire_playback(m, s, a, idle, tx_proc, pw_rx, init_tx))
             .ok()?;
 
         if !init_rx.recv().unwrap_or(false) {
@@ -529,6 +613,7 @@ impl NativeDriver {
         Some(Self {
             mixer,
             stop,
+            alive,
             pw_wake: Some(pw_tx),
             idle_frames,
             join: Some(join),
@@ -538,16 +623,18 @@ impl NativeDriver {
     #[cfg(any(feature = "pulseaudio", feature = "alsa"))]
     fn try_spawn_worker(
         name: &'static str,
-        f: fn(SharedMixer, Arc<AtomicBool>, std::sync::mpsc::SyncSender<bool>),
+        f: fn(SharedMixer, Arc<AtomicBool>, Arc<AtomicBool>, std::sync::mpsc::SyncSender<bool>),
     ) -> Option<Self> {
         let mixer = Arc::new((Mutex::new(PolyphonicMixer::default()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
         let m = Arc::clone(&mixer);
         let s = Arc::clone(&stop);
+        let a = Arc::clone(&alive);
         let join = thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || f(m, s, init_tx))
+            .spawn(move || f(m, s, a, init_tx))
             .ok()?;
 
         if !init_rx.recv().unwrap_or(false) {
@@ -558,6 +645,7 @@ impl NativeDriver {
         Some(Self {
             mixer,
             stop,
+            alive,
             #[cfg(feature = "pipewire")]
             pw_wake: None,
             #[cfg(feature = "pipewire")]
@@ -569,6 +657,10 @@ impl NativeDriver {
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 impl PlaybackDriver for NativeDriver {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     fn send_play(&mut self, stereo_48k: Arc<[f32]>, volume: f32) {
         #[cfg(feature = "pipewire")]
         self.idle_frames.store(0, Ordering::Release);
@@ -577,8 +669,10 @@ impl PlaybackDriver for NativeDriver {
             self.mixer.1.notify_one();
         }
         #[cfg(feature = "pipewire")]
-        if let Some(ref tx) = self.pw_wake {
-            let _ = tx.send(PwPlaySignal::EnsureActive);
+        if let Some(ref tx) = self.pw_wake
+            && tx.send(PwPlaySignal::EnsureActive).is_err()
+        {
+            self.alive.store(false, Ordering::Release);
         }
     }
 
@@ -624,6 +718,7 @@ fn mix_next_chunk(mixer: &SharedMixer, stop: &AtomicBool, out: &mut [f32]) -> bo
 fn run_pipewire_playback(
     mixer: SharedMixer,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     idle_frames: Arc<AtomicUsize>,
     pw_tx: pipewire::channel::Sender<PwPlaySignal>,
     pw_rx: pipewire::channel::Receiver<PwPlaySignal>,
@@ -640,6 +735,7 @@ fn run_pipewire_playback(
     use spa::pod::serialize::PodSerializer;
     use spa::utils::{Direction, SpaTypes};
 
+    let _alive_guard = AliveGuard(Arc::clone(&alive));
     super::pipewire::ensure_pw_init();
     let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else {
         let _ = init_tx.send(false);
@@ -666,10 +762,26 @@ fn run_pipewire_playback(
         return;
     };
 
+    let is_active = Rc::new(Cell::new(false));
+    let active_state = Rc::clone(&is_active);
+    let alive_state = Arc::clone(&alive);
+    let mainloop_err = mainloop.clone();
     let m_proc = Arc::clone(&mixer);
     let idle_proc = Arc::clone(&idle_frames);
     let _listener = stream
         .add_local_listener_with_user_data([0.0f32; 2048])
+        .state_changed(move |_stream, _fbuf, _old, new_state| match new_state {
+            pw::stream::StreamState::Streaming => active_state.set(true),
+            pw::stream::StreamState::Paused | pw::stream::StreamState::Unconnected => {
+                active_state.set(false);
+            }
+            pw::stream::StreamState::Error(_) => {
+                active_state.set(false);
+                alive_state.store(false, Ordering::Release);
+                mainloop_err.quit();
+            }
+            pw::stream::StreamState::Connecting => {}
+        })
         .process(move |stream, fbuf| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -741,7 +853,6 @@ fn run_pipewire_playback(
         return;
     }
 
-    let is_active = Rc::new(Cell::new(false));
     let stream_ctl = stream.clone();
     let active_ctl = Rc::clone(&is_active);
     let mixer_ctl = Arc::clone(&mixer);
@@ -793,6 +904,7 @@ fn run_pipewire_playback(
 fn run_pulse_playback(
     mixer: SharedMixer,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
     use libpulse_binding as pa;
@@ -800,6 +912,8 @@ fn run_pulse_playback(
     use pa::proplist::Proplist;
     use pa::sample::{Format, Spec};
     use pa::stream::{FlagSet as StreamFlags, SeekMode, State as StreamState, Stream};
+
+    let _alive_guard = AliveGuard(alive);
 
     let Some(mut ml) = Mainloop::new() else {
         let _ = init_tx.send(false);
@@ -940,6 +1054,18 @@ fn run_pulse_playback(
             *dst = s.to_le_bytes();
         }
         ml.lock();
+        let ctx_dead = matches!(
+            ctx.get_state(),
+            pa::context::State::Failed | pa::context::State::Terminated
+        );
+        let stream_dead = matches!(
+            stream.get_state(),
+            StreamState::Failed | StreamState::Terminated
+        );
+        if ctx_dead || stream_dead {
+            ml.unlock();
+            break;
+        }
         if stream.get_state() == StreamState::Ready {
             if is_corked {
                 let _ = stream.uncork(None);
@@ -981,8 +1107,10 @@ fn open_alsa_pcm() -> Option<alsa::pcm::PCM> {
 fn run_alsa_playback(
     mixer: SharedMixer,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
+    let _alive_guard = AliveGuard(alive);
     let Some(initial_pcm) = open_alsa_pcm() else {
         let _ = init_tx.send(false);
         return;
@@ -1038,10 +1166,19 @@ fn run_alsa_playback(
         for (dst, &src) in ibuf.iter_mut().zip(&fbuf) {
             *dst = (src * 32767.0).clamp(-32768.0, 32767.0) as i16;
         }
-        if let Ok(io) = handle.io_i16()
-            && let Err(err) = io.writei(&ibuf)
-        {
-            let _ = handle.try_recover(err, true);
+        let write_failed = if let Ok(io) = handle.io_i16() {
+            if let Err(err) = io.writei(&ibuf) {
+                handle.try_recover(err, true).is_err()
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if write_failed {
+            // Drop dead hardware handle (e.g. HDMI/USB DAC disconnected on DPMS) so the next
+            // chunk re-opens the default ALSA device cleanly.
+            pcm = None;
         }
     }
     if let Some(handle) = pcm.take() {
@@ -1127,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn with_cache_limit_evicts_oldest_sound() {
+    fn with_cache_limit_evicts_oldest_sound_and_redecodes_lazily() {
         let wav_a = build_wav_16bit(48_000, &[100; 32]);
         let wav_b = build_wav_16bit(48_000, &[200; 32]);
         let wav_c = build_wav_16bit(48_000, &[300; 32]);
@@ -1136,8 +1273,85 @@ mod tests {
         let a = engine.load_bytes(&wav_a).unwrap();
         let b = engine.load_bytes(&wav_b).unwrap();
         let c = engine.load_bytes(&wav_c).unwrap();
+        // `a`'s decoded PCM was evicted to honor the 512-byte budget, while `b` & `c` stay cached.
         assert!(engine.cached_sample_count(a.id).is_none());
         assert!(engine.cached_sample_count(b.id).is_some());
         assert!(engine.cached_sample_count(c.id).is_some());
+        // Playing/resolving `a` transparently re-decodes without invalidating its handle.
+        let redecoded = engine
+            .resolve_stereo(a.id)
+            .expect("lazy re-decode of evicted sound");
+        assert_eq!(redecoded.len(), 64);
+        assert_eq!(engine.cached_sample_count(a.id), Some(64));
+    }
+
+    #[test]
+    fn trim_memory_releases_pcm_but_keeps_file_bytes_and_preset_handles_live() {
+        let engine = AudioPlayer::new();
+        let dir = std::env::temp_dir().join(format!("waywi-player-trim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wav_file = build_wav_16bit(48_000, &[500, -500, 250, -250]);
+        let wav_mem = build_wav_16bit(48_000, &[900, -900, 100, -100]);
+        let path = dir.join("cue.wav");
+        fs::write(&path, &wav_file).unwrap();
+
+        let file_snd = engine.load_file(&path).expect("load file");
+        let mem_snd = engine.load_bytes(&wav_mem).expect("load bytes");
+        let preset_snd = engine.load_preset(SoundPreset::Click);
+
+        assert!(engine.cached_sample_count(file_snd.id).is_some());
+        assert!(engine.cached_sample_count(mem_snd.id).is_some());
+        assert!(engine.cached_sample_count(preset_snd.id).is_some());
+
+        engine.trim_memory();
+        assert!(engine.cached_sample_count(file_snd.id).is_none());
+        assert!(engine.cached_sample_count(mem_snd.id).is_none());
+        assert!(engine.cached_sample_count(preset_snd.id).is_none());
+
+        // All handles survive trim_memory() and transparently re-decode on demand.
+        assert!(engine.resolve_stereo(file_snd.id).is_some());
+        assert!(engine.resolve_stereo(mem_snd.id).is_some());
+        assert!(engine.resolve_stereo(preset_snd.id).is_some());
+
+        // Explicit unload / clear_cache permanently invalidate handles.
+        assert!(engine.unload(file_snd));
+        assert!(engine.resolve_stereo(file_snd.id).is_none());
+        engine.clear_cache();
+        assert!(engine.resolve_stereo(mem_snd.id).is_none());
+        assert!(engine.resolve_stereo(preset_snd.id).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_playback_driver_is_torn_down_before_respawn() {
+        struct DeadDriver {
+            shutdown_called: Arc<AtomicBool>,
+        }
+        impl PlaybackDriver for DeadDriver {
+            fn is_alive(&self) -> bool {
+                false
+            }
+            fn send_play(&mut self, _stereo_48k: Arc<[f32]>, _volume: f32) {
+                panic!("dead driver must not receive play commands");
+            }
+            fn send_stop(&mut self) {}
+            fn shutdown(&mut self) {
+                self.shutdown_called.store(true, Ordering::Release);
+            }
+        }
+
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let engine = AudioPlayer::new();
+        *engine.inner.driver.lock().unwrap() = Some(Box::new(DeadDriver {
+            shutdown_called: Arc::clone(&shutdown_called),
+        }));
+        engine.enqueue_play(Arc::from([0.1_f32, 0.1_f32]), 0.5);
+        assert!(
+            shutdown_called.load(Ordering::Acquire),
+            "dead driver must be shut down and evicted on next play"
+        );
     }
 }
