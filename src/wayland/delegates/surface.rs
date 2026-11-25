@@ -40,10 +40,10 @@ fn handle_surface_configure(
         let size_changed = surf.configured_size != Some(size);
         surf.configured = true;
         surf.configured_size = Some(size);
+        // Any compositor `configure` (including same-size state/HDR/VRR/fullscreen transitions)
+        // expects a fresh commit and clears any stale `frame_pending` gate.
+        surf.frame_pending = false;
         if !was_configured || size_changed {
-            // Allow immediate commit for compositor-requested initial configure or resize even if
-            // a previous `wl_surface.frame` callback is still pending (e.g. occluded/DPMS wake).
-            surf.frame_pending = false;
             surf.pending_redraw = true;
         }
         state
@@ -70,6 +70,7 @@ impl CompositorHandler for WaylandState {
             let scale = ScaleFactor::from_integer(new_factor.max(1));
             if surf.scale != scale {
                 surf.scale = scale;
+                surf.frame_pending = false;
                 surf.pending_redraw = true;
                 self.events
                     .push_back(WaylandEvent::SurfaceScaleChanged { key, scale });

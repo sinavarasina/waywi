@@ -181,6 +181,14 @@ impl WaylandState {
         self.output_handles = map;
     }
 
+    /// Clears `frame_pending` across all live surfaces (used on `OutputsChanged` so output mode,
+    /// HDR/VRR, or hotplug transitions never leave a surface stalled behind a stale frame callback).
+    pub(crate) fn clear_frame_pending_all(&mut self) {
+        for surf in self.surfaces.values_mut() {
+            surf.frame_pending = false;
+        }
+    }
+
     pub(crate) fn keyboard_layout_info(&self) -> crate::input::KeyboardLayoutInfo {
         crate::input::KeyboardLayoutInfo::from_layouts(
             self.keyboard_layouts.clone(),

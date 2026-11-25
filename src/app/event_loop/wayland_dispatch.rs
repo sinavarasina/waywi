@@ -111,6 +111,7 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
         match ev {
             WaylandEvent::OutputsChanged => {
                 wl.refresh_outputs();
+                wl.clear_frame_pending_all();
                 wl.refresh_wayland_capabilities(&mut rt.core.capabilities);
                 rt.core.memo_store.invalidate_all();
                 rt.needs_view_sync = true;

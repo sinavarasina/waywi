@@ -89,6 +89,7 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, RetainedSurfaceKey> f
             let new_scale = ScaleFactor::from_120ths(scale);
             if surf.scale != new_scale {
                 surf.scale = new_scale;
+                surf.frame_pending = false;
                 surf.pending_redraw = true;
                 state.events.push_back(WaylandEvent::SurfaceScaleChanged {
                     key: *key,
