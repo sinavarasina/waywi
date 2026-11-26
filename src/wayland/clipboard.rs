@@ -1,12 +1,17 @@
 //! Wayland data-control clipboard backend supporting `ext-data-control-v1` and `zwlr-data-control-v1`.
+//!
+//! All clipboard pipe reads and writes run directly on WayWi's single `calloop` event loop via
+//! non-blocking [`calloop::generic::Generic`] FD sources paired with bounded
+//! [`calloop::timer::Timer`] deadlines — zero auxiliary OS threads.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
-use calloop::ping::Ping;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use calloop::generic::Generic;
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_seat;
@@ -33,7 +38,7 @@ use crate::wayland::connection::WaylandState;
 use crate::wayland::surface_state::WaylandEvent;
 
 const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
-const PIPE_READ_TIMEOUT_SECS: i64 = 2;
+const PIPE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum ManagerProxy {
     Ext(ExtDataControlManagerV1),
@@ -109,7 +114,23 @@ struct ActiveSource {
     payloads: HashMap<String, Arc<[u8]>>,
 }
 
-/// Manages Wayland clipboard / primary-selection watches and outbound data sources.
+struct PendingClipRead {
+    selection: ClipboardSelection,
+    mime_types: Vec<String>,
+    primary_mime: String,
+    buf: Vec<u8>,
+    fd_token: Option<RegistrationToken>,
+    timer_token: Option<RegistrationToken>,
+}
+
+struct PendingClipWrite {
+    payload: Arc<[u8]>,
+    offset: usize,
+    fd_token: Option<RegistrationToken>,
+    timer_token: Option<RegistrationToken>,
+}
+
+/// Manages Wayland clipboard / primary-selection watches and outbound data sources on `calloop`.
 pub(crate) struct WaylandClipboardState {
     manager: Option<ManagerProxy>,
     device: Option<DeviceProxy>,
@@ -118,8 +139,10 @@ pub(crate) struct WaylandClipboardState {
     active_clipboard_offer: Option<OfferProxy>,
     active_primary_offer: Option<OfferProxy>,
     active_sources: HashMap<ObjectId, ActiveSource>,
-    async_events: Arc<Mutex<VecDeque<ClipboardEvent>>>,
-    wake_ping: Option<Ping>,
+    loop_handle: Option<LoopHandle<'static, WaylandState>>,
+    next_io_id: u64,
+    pending_reads: HashMap<u64, PendingClipRead>,
+    pending_writes: HashMap<u64, PendingClipWrite>,
 }
 
 impl Default for WaylandClipboardState {
@@ -132,8 +155,31 @@ impl Default for WaylandClipboardState {
             active_clipboard_offer: None,
             active_primary_offer: None,
             active_sources: HashMap::new(),
-            async_events: Arc::new(Mutex::new(VecDeque::new())),
-            wake_ping: None,
+            loop_handle: None,
+            next_io_id: 1,
+            pending_reads: HashMap::new(),
+            pending_writes: HashMap::new(),
+        }
+    }
+}
+
+impl Drop for WaylandClipboardState {
+    fn drop(&mut self) {
+        self.cleanup();
+        for (_, (offer, _)) in self.pending_offers.drain() {
+            offer.destroy();
+        }
+        if let Some(offer) = self.active_clipboard_offer.take() {
+            offer.destroy();
+        }
+        if let Some(offer) = self.active_primary_offer.take() {
+            offer.destroy();
+        }
+        for (_, src) in self.active_sources.drain() {
+            src.proxy.destroy();
+        }
+        if let Some(dev) = self.device.take() {
+            dev.destroy();
         }
     }
 }
@@ -151,28 +197,61 @@ impl WaylandClipboardState {
                     .map(ManagerProxy::Wlr)
             });
 
-        Self {
-            manager,
-            ..Self::default()
-        }
+        let mut st = Self::default();
+        st.manager = manager;
+        st
     }
 
     pub(crate) fn is_supported(&self) -> bool {
         self.manager.is_some()
     }
 
-    pub(crate) fn set_wake_ping(&mut self, ping: Ping) {
-        self.wake_ping = Some(ping);
+    pub(crate) fn set_loop_handle(&mut self, handle: LoopHandle<'static, WaylandState>) {
+        self.loop_handle = Some(handle);
     }
 
-    pub(crate) fn drain_async_events(&self) -> Vec<ClipboardEvent> {
-        let mut out = Vec::new();
-        if let Ok(mut guard) = self.async_events.lock() {
-            while let Some(ev) = guard.pop_front() {
-                out.push(ev);
+    fn alloc_io_id(&mut self) -> u64 {
+        let id = self.next_io_id;
+        self.next_io_id = self.next_io_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn cancel_all_pending_reads(&mut self) {
+        for (_, mut read) in self.pending_reads.drain() {
+            if let Some(ref h) = self.loop_handle {
+                if let Some(tok) = read.fd_token.take() {
+                    h.remove(tok);
+                }
+                if let Some(tok) = read.timer_token.take() {
+                    h.remove(tok);
+                }
             }
         }
-        out
+    }
+
+    /// Unregisters all in-flight non-blocking clipboard pipe sources and timers cleanly.
+    pub(crate) fn cleanup(&mut self) {
+        let handle = self.loop_handle.take();
+        for (_, mut read) in self.pending_reads.drain() {
+            if let Some(ref h) = handle {
+                if let Some(tok) = read.fd_token.take() {
+                    h.remove(tok);
+                }
+                if let Some(tok) = read.timer_token.take() {
+                    h.remove(tok);
+                }
+            }
+        }
+        for (_, mut write) in self.pending_writes.drain() {
+            if let Some(ref h) = handle {
+                if let Some(tok) = write.fd_token.take() {
+                    h.remove(tok);
+                }
+                if let Some(tok) = write.timer_token.take() {
+                    h.remove(tok);
+                }
+            }
+        }
     }
 
     pub(crate) fn set_watching(
@@ -188,7 +267,10 @@ impl WaylandClipboardState {
             && let Some(dev) = self.device.take()
         {
             dev.destroy();
-            self.pending_offers.clear();
+            self.cancel_all_pending_reads();
+            for (_, (offer, _)) in self.pending_offers.drain() {
+                offer.destroy();
+            }
             if let Some(offer) = self.active_clipboard_offer.take() {
                 offer.destroy();
             }
@@ -339,94 +421,12 @@ impl WaylandClipboardState {
         }
     }
 
-    fn on_selection(
-        &mut self,
-        events: &mut VecDeque<WaylandEvent>,
-        selection: ClipboardSelection,
-        offer_id: Option<ObjectId>,
-    ) {
-        let slot = match selection {
-            ClipboardSelection::Clipboard => &mut self.active_clipboard_offer,
-            ClipboardSelection::Primary => &mut self.active_primary_offer,
-        };
-        if let Some(prev) = slot.take() {
-            prev.destroy();
-        }
-
-        let Some(id) = offer_id else {
-            events.push_back(WaylandEvent::Clipboard(ClipboardEvent::Changed(
-                ClipboardSnapshot {
-                    selection,
-                    mime_types: Vec::new(),
-                    text: None,
-                    bytes: Vec::new(),
-                    primary_mime: None,
-                    cleared: true,
-                },
-            )));
-            return;
-        };
-
-        let Some((offer, mime_types)) = self.pending_offers.remove(&id) else {
-            return;
-        };
-        let preferred = select_preferred_mime(&mime_types).map(str::to_owned);
-        let Some(target_mime) = preferred else {
-            *slot = Some(offer);
-            events.push_back(WaylandEvent::Clipboard(ClipboardEvent::Changed(
-                ClipboardSnapshot {
-                    selection,
-                    mime_types,
-                    text: None,
-                    bytes: Vec::new(),
-                    primary_mime: None,
-                    cleared: false,
-                },
-            )));
-            return;
-        };
-
-        let Ok((rx, tx)) = std::io::pipe() else {
-            *slot = Some(offer);
-            events.push_back(WaylandEvent::Clipboard(ClipboardEvent::Error(
-                "failed to create pipe for clipboard transfer".to_owned(),
-            )));
-            return;
-        };
-
-        offer.receive(&target_mime, tx.as_fd());
-        drop(tx);
-        *slot = Some(offer);
-
-        spawn_pipe_reader(
-            rx,
-            selection,
-            mime_types,
-            target_mime,
-            Arc::clone(&self.async_events),
-            self.wake_ping.clone(),
-        );
-    }
-
     fn on_device_finished(&mut self) {
         self.device = None;
-        self.pending_offers.clear();
-    }
-
-    fn on_source_send(&self, source_id: &ObjectId, mime_type: &str, fd: OwnedFd) {
-        let Some(entry) = self.active_sources.get(source_id) else {
-            return;
-        };
-        let Some(payload) = entry.payloads.get(mime_type).map(Arc::clone) else {
-            return;
-        };
-        let _ = std::thread::Builder::new()
-            .name("waywi-clip-tx".to_owned())
-            .spawn(move || {
-                let mut file = std::fs::File::from(fd);
-                let _ = file.write_all(&payload);
-                let _ = file.flush();
-            });
+        self.cancel_all_pending_reads();
+        for (_, (offer, _)) in self.pending_offers.drain() {
+            offer.destroy();
+        }
     }
 
     fn on_source_cancelled(&mut self, source_id: &ObjectId) {
@@ -436,82 +436,312 @@ impl WaylandClipboardState {
     }
 }
 
-fn spawn_pipe_reader(
-    mut rx: std::io::PipeReader,
+fn handle_selection(
+    state: &mut WaylandState,
+    conn: &Connection,
+    selection: ClipboardSelection,
+    offer_id: Option<ObjectId>,
+) {
+    let prev = match selection {
+        ClipboardSelection::Clipboard => state.clipboard.active_clipboard_offer.take(),
+        ClipboardSelection::Primary => state.clipboard.active_primary_offer.take(),
+    };
+    if let Some(p) = prev {
+        p.destroy();
+    }
+
+    let Some(id) = offer_id else {
+        state
+            .events
+            .push_back(WaylandEvent::Clipboard(ClipboardEvent::Changed(
+                ClipboardSnapshot {
+                    selection,
+                    mime_types: Vec::new(),
+                    text: None,
+                    bytes: Vec::new(),
+                    primary_mime: None,
+                    cleared: true,
+                },
+            )));
+        return;
+    };
+
+    let Some((offer, mime_types)) = state.clipboard.pending_offers.remove(&id) else {
+        return;
+    };
+    let preferred = select_preferred_mime(&mime_types).map(str::to_owned);
+    let Some(target_mime) = preferred else {
+        match selection {
+            ClipboardSelection::Clipboard => state.clipboard.active_clipboard_offer = Some(offer),
+            ClipboardSelection::Primary => state.clipboard.active_primary_offer = Some(offer),
+        }
+        state
+            .events
+            .push_back(WaylandEvent::Clipboard(ClipboardEvent::Changed(
+                ClipboardSnapshot {
+                    selection,
+                    mime_types,
+                    text: None,
+                    bytes: Vec::new(),
+                    primary_mime: None,
+                    cleared: false,
+                },
+            )));
+        return;
+    };
+
+    let Ok((read_fd, write_fd)) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) else {
+        match selection {
+            ClipboardSelection::Clipboard => state.clipboard.active_clipboard_offer = Some(offer),
+            ClipboardSelection::Primary => state.clipboard.active_primary_offer = Some(offer),
+        }
+        state
+            .events
+            .push_back(WaylandEvent::Clipboard(ClipboardEvent::Error(
+                "failed to create pipe for clipboard transfer".to_owned(),
+            )));
+        return;
+    };
+
+    offer.receive(&target_mime, write_fd.as_fd());
+    let _ = conn.flush();
+    drop(write_fd);
+    match selection {
+        ClipboardSelection::Clipboard => state.clipboard.active_clipboard_offer = Some(offer),
+        ClipboardSelection::Primary => state.clipboard.active_primary_offer = Some(offer),
+    }
+
+    register_clipboard_pipe_reader(state, read_fd, selection, mime_types, target_mime);
+}
+
+fn finish_clipboard_read(
+    state: &mut WaylandState,
+    io_id: u64,
+    result: std::result::Result<(), String>,
+) {
+    let Some(mut entry) = state.clipboard.pending_reads.remove(&io_id) else {
+        return;
+    };
+    if let Some(ref handle) = state.clipboard.loop_handle
+        && let Some(tok) = entry.timer_token.take()
+    {
+        handle.remove(tok);
+    }
+    let event = match result {
+        Ok(()) => {
+            let text = decode_text_for_mime(&entry.primary_mime, &entry.buf);
+            ClipboardEvent::Changed(ClipboardSnapshot {
+                selection: entry.selection,
+                mime_types: entry.mime_types,
+                text,
+                bytes: entry.buf,
+                primary_mime: Some(entry.primary_mime),
+                cleared: false,
+            })
+        }
+        Err(msg) => ClipboardEvent::Error(msg),
+    };
+    state.events.push_back(WaylandEvent::Clipboard(event));
+}
+
+fn register_clipboard_pipe_reader(
+    state: &mut WaylandState,
+    read_fd: OwnedFd,
     selection: ClipboardSelection,
     mime_types: Vec<String>,
     primary_mime: String,
-    async_events: Arc<Mutex<VecDeque<ClipboardEvent>>>,
-    wake_ping: Option<Ping>,
 ) {
-    let async_events_tx = Arc::clone(&async_events);
-    let spawn_res = std::thread::Builder::new()
-        .name("waywi-clip-rx".to_owned())
-        .spawn(move || {
-            let event = match read_pipe_bounded(&mut rx) {
-                Ok(bytes) => {
-                    let text = decode_text_for_mime(&primary_mime, &bytes);
-                    ClipboardEvent::Changed(ClipboardSnapshot {
-                        selection,
-                        mime_types,
-                        text,
-                        bytes,
-                        primary_mime: Some(primary_mime),
-                        cleared: false,
-                    })
+    let _ = rustix::fs::fcntl_setfl(&read_fd, rustix::fs::OFlags::NONBLOCK);
+    let Some(handle) = state.clipboard.loop_handle.clone() else {
+        state
+            .events
+            .push_back(WaylandEvent::Clipboard(ClipboardEvent::Error(
+                "clipboard event loop handle unavailable".to_owned(),
+            )));
+        return;
+    };
+
+    let io_id = state.clipboard.alloc_io_id();
+    let file = std::fs::File::from(read_fd);
+    let fd_source = Generic::new(file, Interest::READ, Mode::Level);
+    let fd_tok = match handle.insert_source(fd_source, move |_, file_ref, wl| {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match rustix::io::read(file_ref.as_fd(), &mut chunk) {
+                Ok(0) => {
+                    finish_clipboard_read(wl, io_id, Ok(()));
+                    return Ok(PostAction::Remove);
                 }
-                Err(err) => ClipboardEvent::Error(err),
-            };
-            if let Ok(mut guard) = async_events_tx.lock() {
-                guard.push_back(event);
+                Ok(n) => {
+                    let Some(entry) = wl.clipboard.pending_reads.get_mut(&io_id) else {
+                        return Ok(PostAction::Remove);
+                    };
+                    let remaining = MAX_CLIPBOARD_BYTES.saturating_sub(entry.buf.len());
+                    if remaining == 0 {
+                        finish_clipboard_read(wl, io_id, Ok(()));
+                        return Ok(PostAction::Remove);
+                    }
+                    let take = n.min(remaining);
+                    entry.buf.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        finish_clipboard_read(wl, io_id, Ok(()));
+                        return Ok(PostAction::Remove);
+                    }
+                }
+                Err(rustix::io::Errno::AGAIN) => return Ok(PostAction::Continue),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => {
+                    finish_clipboard_read(wl, io_id, Err(format!("clipboard read failed: {e}")));
+                    return Ok(PostAction::Remove);
+                }
             }
-            if let Some(ping) = wake_ping {
-                ping.ping();
+        }
+    }) {
+        Ok(tok) => tok,
+        Err(e) => {
+            state
+                .events
+                .push_back(WaylandEvent::Clipboard(ClipboardEvent::Error(format!(
+                    "clipboard reader registration failed: {e}"
+                ))));
+            return;
+        }
+    };
+
+    let timer_tok = handle
+        .insert_source(Timer::from_duration(PIPE_IO_TIMEOUT), move |_, _, wl| {
+            if let Some(mut entry) = wl.clipboard.pending_reads.remove(&io_id) {
+                if let Some(ref h) = wl.clipboard.loop_handle
+                    && let Some(ftok) = entry.fd_token.take()
+                {
+                    h.remove(ftok);
+                }
+                wl.events
+                    .push_back(WaylandEvent::Clipboard(ClipboardEvent::Error(
+                        "clipboard read timed out waiting for source application".to_owned(),
+                    )));
             }
-        });
-    if let Err(err) = spawn_res
-        && let Ok(mut guard) = async_events.lock()
+            TimeoutAction::Drop
+        })
+        .ok();
+
+    state.clipboard.pending_reads.insert(
+        io_id,
+        PendingClipRead {
+            selection,
+            mime_types,
+            primary_mime,
+            buf: Vec::new(),
+            fd_token: Some(fd_tok),
+            timer_token: timer_tok,
+        },
+    );
+}
+
+fn finish_clipboard_write(state: &mut WaylandState, io_id: u64) {
+    if let Some(mut entry) = state.clipboard.pending_writes.remove(&io_id)
+        && let Some(ref handle) = state.clipboard.loop_handle
+        && let Some(tok) = entry.timer_token.take()
     {
-        guard.push_back(ClipboardEvent::Error(format!(
-            "failed to spawn clipboard reader thread: {err}"
-        )));
+        handle.remove(tok);
     }
 }
 
-fn read_pipe_bounded(rx: &mut std::io::PipeReader) -> std::result::Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let timeout = Timespec {
-        tv_sec: PIPE_READ_TIMEOUT_SECS,
-        tv_nsec: 0,
+fn handle_source_send(
+    state: &mut WaylandState,
+    source_id: &ObjectId,
+    mime_type: &str,
+    fd: OwnedFd,
+) {
+    let Some(payload) = state
+        .clipboard
+        .active_sources
+        .get(source_id)
+        .and_then(|entry| entry.payloads.get(mime_type))
+        .cloned()
+    else {
+        return;
     };
-    loop {
-        let mut pfd = [PollFd::new(&*rx, PollFlags::IN | PollFlags::HUP)];
-        match poll(&mut pfd, Some(&timeout)) {
-            Ok(0) => {
-                return Err("clipboard read timed out waiting for source application".to_owned());
-            }
-            Ok(_) => {}
+
+    let _ = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK);
+    let mut offset = 0usize;
+
+    // Fast path: small clipboard payloads fit inside the kernel pipe buffer and complete
+    // synchronously without registering a calloop source.
+    while offset < payload.len() {
+        match rustix::io::write(fd.as_fd(), &payload[offset..]) {
+            Ok(0) => return,
+            Ok(n) => offset += n,
             Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(format!("clipboard pipe poll failed: {e}")),
-        }
-        match rx.read(&mut chunk) {
-            Ok(0) => return Ok(out),
-            Ok(n) => {
-                let remaining = MAX_CLIPBOARD_BYTES.saturating_sub(out.len());
-                if remaining == 0 {
-                    return Ok(out);
-                }
-                let take = n.min(remaining);
-                out.extend_from_slice(&chunk[..take]);
-                if take < n {
-                    return Ok(out);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("clipboard read failed: {e}")),
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(_) => return,
         }
     }
+    if offset >= payload.len() {
+        return;
+    }
+
+    let Some(handle) = state.clipboard.loop_handle.clone() else {
+        return;
+    };
+
+    let io_id = state.clipboard.alloc_io_id();
+    let file = std::fs::File::from(fd);
+    let fd_source = Generic::new(file, Interest::WRITE, Mode::Level);
+    let Ok(fd_tok) = handle.insert_source(fd_source, move |_, file_ref, wl| {
+        loop {
+            let Some(entry) = wl.clipboard.pending_writes.get_mut(&io_id) else {
+                return Ok(PostAction::Remove);
+            };
+            if entry.offset >= entry.payload.len() {
+                finish_clipboard_write(wl, io_id);
+                return Ok(PostAction::Remove);
+            }
+            match rustix::io::write(file_ref.as_fd(), &entry.payload[entry.offset..]) {
+                Ok(0) => {
+                    finish_clipboard_write(wl, io_id);
+                    return Ok(PostAction::Remove);
+                }
+                Ok(n) => {
+                    entry.offset += n;
+                    if entry.offset >= entry.payload.len() {
+                        finish_clipboard_write(wl, io_id);
+                        return Ok(PostAction::Remove);
+                    }
+                }
+                Err(rustix::io::Errno::AGAIN) => return Ok(PostAction::Continue),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => {
+                    finish_clipboard_write(wl, io_id);
+                    return Ok(PostAction::Remove);
+                }
+            }
+        }
+    }) else {
+        return;
+    };
+
+    let timer_tok = handle
+        .insert_source(Timer::from_duration(PIPE_IO_TIMEOUT), move |_, _, wl| {
+            if let Some(mut entry) = wl.clipboard.pending_writes.remove(&io_id)
+                && let Some(ref h) = wl.clipboard.loop_handle
+                && let Some(ftok) = entry.fd_token.take()
+            {
+                h.remove(ftok);
+            }
+            TimeoutAction::Drop
+        })
+        .ok();
+
+    state.clipboard.pending_writes.insert(
+        io_id,
+        PendingClipWrite {
+            payload,
+            offset,
+            fd_token: Some(fd_tok),
+            timer_token: timer_tok,
+        },
+    );
 }
 
 pub(crate) fn decode_text_for_mime(mime: &str, bytes: &[u8]) -> Option<String> {
@@ -558,7 +788,7 @@ macro_rules! impl_data_control_dispatch {
                 _proxy: &$dev,
                 event: $dev_mod::Event,
                 _data: &(),
-                _conn: &Connection,
+                conn: &Connection,
                 _qh: &QueueHandle<Self>,
             ) {
                 match event {
@@ -569,15 +799,17 @@ macro_rules! impl_data_control_dispatch {
                             .on_data_offer(obj_id, OfferProxy::$offer_variant(id));
                     }
                     $dev_mod::Event::Selection { id } => {
-                        state.clipboard.on_selection(
-                            &mut state.events,
+                        handle_selection(
+                            state,
+                            conn,
                             ClipboardSelection::Clipboard,
                             id.map(|o| o.id()),
                         );
                     }
                     $dev_mod::Event::PrimarySelection { id } => {
-                        state.clipboard.on_selection(
-                            &mut state.events,
+                        handle_selection(
+                            state,
+                            conn,
                             ClipboardSelection::Primary,
                             id.map(|o| o.id()),
                         );
@@ -616,7 +848,7 @@ macro_rules! impl_data_control_dispatch {
             ) {
                 match event {
                     $src_mod::Event::Send { mime_type, fd } => {
-                        state.clipboard.on_source_send(&proxy.id(), &mime_type, fd);
+                        handle_source_send(state, &proxy.id(), &mime_type, fd);
                     }
                     $src_mod::Event::Cancelled => {
                         state.clipboard.on_source_cancelled(&proxy.id());

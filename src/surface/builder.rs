@@ -3,14 +3,15 @@ use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
 use crate::geometry::{Edges, Length, LogicalPx, Size};
 use crate::input::{
-    ElementKey, GestureEvent, ImeConfig, ImeEvent, KeyEvent, PointerEvent, TabletEvent, TouchEvent,
+    CursorShape, DndEvent, ElementKey, GestureEvent, ImeConfig, ImeEvent, KeyEvent,
+    PointerConstraintMode, PointerEvent, RelativePointerEvent, TabletEvent, TouchEvent,
 };
 use crate::render::{Color, Element, begin_memo_check, set_memo_surface_hash};
 use crate::text::SharedStr;
 
 use super::types::{
     Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer,
-    PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind,
+    PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind, WindowDecoration,
 };
 
 /// Wayland surface specification returned from `view(state)`.
@@ -33,6 +34,11 @@ pub struct Surface<M = ()> {
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
     pub(crate) namespace: SharedStr,
+    pub(crate) cursor: CursorShape,
+    pub(crate) decoration: WindowDecoration,
+    pub(crate) inhibit_idle: bool,
+    pub(crate) pointer_constraint: PointerConstraintMode,
+    pub(crate) dnd_mime_types: Vec<String>,
     pub(crate) a11y: AccessibleProps,
     pub(crate) children: FrameVec<Element<M>>,
     pub(crate) on_close: Option<M>,
@@ -41,6 +47,8 @@ pub struct Surface<M = ()> {
     pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
+    pub(crate) on_relative_pointer: Option<FrameSharedFn<RelativePointerEvent, Option<M>>>,
+    pub(crate) on_dnd: Option<FrameSharedFn<DndEvent, Option<M>>>,
     pub(crate) on_touch: Option<FrameSharedFn<TouchEvent, Option<M>>>,
     pub(crate) on_gesture: Option<FrameSharedFn<GestureEvent, Option<M>>>,
     pub(crate) on_tablet: Option<FrameSharedFn<TabletEvent, Option<M>>>,
@@ -50,36 +58,48 @@ pub struct Surface<M = ()> {
 impl<M: 'static> Surface<M> {
     fn new_base(key: SurfaceKey, kind: SurfaceKind, output: Output) -> Self {
         set_memo_surface_hash(key.0);
-        let (anchor, size, input_mode, layer) = match kind {
+        let (anchor, size, input_mode, layer, kb) = match kind {
             SurfaceKind::Panel => (
                 Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
                 Size::new(Length::Fill, LogicalPx(36.0)),
                 InputMode::Full,
                 Layer::Top,
+                KeyboardInteractivity::None,
             ),
             SurfaceKind::Floating => (
                 Anchor::empty(),
                 Size::new(LogicalPx(200.0), LogicalPx(64.0)),
                 InputMode::Full,
                 Layer::Overlay,
+                KeyboardInteractivity::None,
             ),
             SurfaceKind::Overlay => (
                 Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                 Size::fill(),
                 InputMode::Selective,
                 Layer::Overlay,
+                KeyboardInteractivity::None,
             ),
             SurfaceKind::Window => (
                 Anchor::empty(),
                 Size::new(LogicalPx(480.0), LogicalPx(320.0)),
                 InputMode::Full,
                 Layer::Top,
+                KeyboardInteractivity::None,
             ),
             SurfaceKind::Popup => (
                 Anchor::empty(),
                 Size::new(LogicalPx(200.0), LogicalPx(120.0)),
                 InputMode::Full,
                 Layer::Overlay,
+                KeyboardInteractivity::None,
+            ),
+            SurfaceKind::SessionLock => (
+                Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                Size::fill(),
+                InputMode::Full,
+                Layer::Overlay,
+                KeyboardInteractivity::Exclusive,
             ),
         };
         Self {
@@ -91,7 +111,7 @@ impl<M: 'static> Surface<M> {
             margin: Edges::ZERO,
             size,
             exclusive_zone: 0,
-            keyboard_interactivity: KeyboardInteractivity::None,
+            keyboard_interactivity: kb,
             input_mode,
             buffer_retention: None,
             popup: None,
@@ -99,6 +119,11 @@ impl<M: 'static> Surface<M> {
             background: Color::TRANSPARENT,
             title: SharedStr::EMPTY,
             namespace: SharedStr::EMPTY,
+            cursor: CursorShape::Default,
+            decoration: WindowDecoration::default(),
+            inhibit_idle: false,
+            pointer_constraint: PointerConstraintMode::None,
+            dnd_mime_types: Vec::new(),
             a11y: AccessibleProps::default(),
             children: FrameVec::new(),
             on_close: None,
@@ -107,6 +132,8 @@ impl<M: 'static> Surface<M> {
             on_ime: None,
             on_pointer_move: None,
             on_pointer_up: None,
+            on_relative_pointer: None,
+            on_dnd: None,
             on_touch: None,
             on_gesture: None,
             on_tablet: None,
@@ -137,6 +164,15 @@ impl<M: 'static> Surface<M> {
     /// Intended as an honest fallback when `Capability::LayerShell` is unavailable.
     pub fn window(key: impl IntoSurfaceKey) -> Self {
         Self::new_base(key.into_surface_key(), SurfaceKind::Window, Output::Primary)
+    }
+
+    /// Declares a native Wayland session lockscreen surface (`ext_session_lock_v1`).
+    ///
+    /// Declaring one or more `session_lock` surfaces (typically with [`Output::All`]) acquires
+    /// the compositor lock automatically; removing all `session_lock` surfaces from `view(state)`
+    /// calls `unlock_and_destroy()`.
+    pub fn session_lock(key: impl IntoSurfaceKey, output: Output) -> Self {
+        Self::new_base(key.into_surface_key(), SurfaceKind::SessionLock, output)
     }
 
     /// Declares a compositor-positioned XDG popup (`xdg_popup` + `xdg_positioner`) attached to
@@ -274,6 +310,43 @@ impl<M: 'static> Surface<M> {
         self
     }
 
+    /// Sets the fallback cursor shape (`wp_cursor_shape_v1` or [`CursorShape::Hidden`]) for this
+    /// surface when the pointer is not hovering an element with its own `.cursor(...)`.
+    pub fn cursor(mut self, shape: CursorShape) -> Self {
+        self.cursor = shape;
+        self
+    }
+
+    /// Configures `zxdg_decoration_manager_v1` decoration mode for [`Self::window`] surfaces.
+    pub fn decoration(mut self, decoration: WindowDecoration) -> Self {
+        self.decoration = decoration;
+        self
+    }
+
+    /// Requests per-surface idle inhibition (`zwp_idle_inhibit_manager_v1`) while this surface is
+    /// mapped and visible.
+    pub fn inhibit_idle(mut self, inhibit: bool) -> Self {
+        self.inhibit_idle = inhibit;
+        self
+    }
+
+    /// Requests pointer locking or confinement (`zwp_pointer_constraints_v1`) on this surface.
+    pub fn pointer_constraint(mut self, mode: PointerConstraintMode) -> Self {
+        self.pointer_constraint = mode;
+        self
+    }
+
+    /// Configures preferred MIME types accepted by this surface during Drag & Drop
+    /// (`wl_data_device`), in priority order (e.g. `["text/uri-list", "text/plain;charset=utf-8"]`).
+    pub fn dnd_mime_types<I, S>(mut self, mimes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.dnd_mime_types = mimes.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn accessible_role(mut self, role: AccessibleRole) -> Self {
         self.a11y.role = Some(role);
         self
@@ -354,6 +427,26 @@ impl<M: 'static> Surface<M> {
         self
     }
 
+    /// Subscribes to unaccelerated relative pointer deltas (`zwp_relative_pointer_v1`) while
+    /// pointer focus is on this surface.
+    pub fn on_relative_pointer<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(RelativePointerEvent) -> Option<M> + 'static,
+    {
+        self.on_relative_pointer = Some(FrameSharedFn::new(handler));
+        self
+    }
+
+    /// Subscribes to Wayland Drag & Drop events (`wl_data_device`: `Enter`, `Motion`, `Leave`,
+    /// `Drop`, `DropError`) targeting this surface.
+    pub fn on_dnd<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(DndEvent) -> Option<M> + 'static,
+    {
+        self.on_dnd = Some(FrameSharedFn::new(handler));
+        self
+    }
+
     /// Subscribes to surface-level touchscreen events (`Down`, `Move`, `Up`, `Cancel`).
     pub fn on_touch<F>(mut self, handler: F) -> Self
     where
@@ -405,6 +498,8 @@ impl<M: 'static> Surface<M> {
         let on_ime = map_opt(self.on_ime, &mapper);
         let on_pointer_move = map_opt(self.on_pointer_move, &mapper);
         let on_pointer_up = map_opt(self.on_pointer_up, &mapper);
+        let on_relative_pointer = map_opt(self.on_relative_pointer, &mapper);
+        let on_dnd = map_opt(self.on_dnd, &mapper);
         let on_touch = map_opt(self.on_touch, &mapper);
         let on_gesture = map_opt(self.on_gesture, &mapper);
         let on_tablet = map_opt(self.on_tablet, &mapper);
@@ -425,6 +520,11 @@ impl<M: 'static> Surface<M> {
             background: self.background,
             title: self.title,
             namespace: self.namespace,
+            cursor: self.cursor,
+            decoration: self.decoration,
+            inhibit_idle: self.inhibit_idle,
+            pointer_constraint: self.pointer_constraint,
+            dnd_mime_types: self.dnd_mime_types,
             a11y: self.a11y,
             children: mapped_children,
             on_close: self.on_close.map(|m| mapper.call(m)),
@@ -433,6 +533,8 @@ impl<M: 'static> Surface<M> {
             on_ime,
             on_pointer_move,
             on_pointer_up,
+            on_relative_pointer,
+            on_dnd,
             on_touch,
             on_gesture,
             on_tablet,

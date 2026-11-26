@@ -2,7 +2,7 @@ use crate::accessibility::AccessibleProps;
 use crate::arena::FrameSharedFn;
 use crate::geometry::{Affine2D, Bounds, LogicalPx};
 use crate::image::{ImageFilter, ImageFit, SourceRect};
-use crate::input::{ElementKey, EventHandlers, HitTestNode, NodeId};
+use crate::input::{CursorShape, ElementKey, EventHandlers, HitTestNode, NodeId};
 use crate::render::canvas::Painter;
 use crate::render::style::{Border, Color, CornerRadius};
 use crate::sprite::{SpriteSheet, SpriteSourceState, SpriteTimeline};
@@ -79,17 +79,20 @@ pub(crate) struct RetainedNode<M> {
     pub(crate) kind_tag: u8,
     pub(crate) bounds: Bounds,
     pub(crate) world_bounds: Bounds,
+    pub(crate) local_affine: Affine2D,
     pub(crate) affine: Affine2D,
     pub(crate) clip_rect: Option<Bounds>,
     pub(crate) z_index: i32,
     pub(crate) visible: bool,
     pub(crate) input_enabled: bool,
     pub(crate) opacity: f32,
+    pub(crate) cursor: Option<CursorShape>,
     pub(crate) handlers: EventHandlers<M>,
     pub(crate) visual: RetainedVisual,
     #[cfg_attr(not(feature = "accessibility"), allow(dead_code))]
     pub(crate) a11y: AccessibleProps,
     pub(crate) sprite_timeline: Option<SpriteTimeline>,
+    pub(crate) transitions: Option<Box<crate::animation::RetainedTransitions>>,
     pub(crate) on_animation_end: Option<M>,
     pub(crate) children: Vec<RetainedNode<M>>,
 }
@@ -223,19 +226,28 @@ impl RetainedVisual {
     }
 }
 
-/// Flattens a retained tree into sorted `DrawCommand`s and `HitTestNode`s.
+/// Flattens a retained tree into sorted `DrawCommand`s and `HitTestNode`s, returning `true` when
+/// any visible input-enabled node declares a custom `.cursor(...)`.
 pub(crate) fn collect_draw_and_hit<M: Clone + 'static>(
     roots: &[RetainedNode<M>],
     commands: &mut Vec<DrawCommand>,
     hit_nodes: &mut Vec<HitTestNode<M>>,
-) {
+) -> bool {
     commands.clear();
     hit_nodes.clear();
     let mut order = 0_usize;
+    let mut has_custom_cursors = false;
     for node in roots {
-        collect_node_recursive(node, commands, hit_nodes, &mut order);
+        collect_node_recursive(
+            node,
+            commands,
+            hit_nodes,
+            &mut order,
+            &mut has_custom_cursors,
+        );
     }
     commands.sort_by_key(|c| (c.z_index, c.paint_order));
+    has_custom_cursors
 }
 
 fn collect_node_recursive<M: Clone + 'static>(
@@ -243,6 +255,7 @@ fn collect_node_recursive<M: Clone + 'static>(
     commands: &mut Vec<DrawCommand>,
     hit_nodes: &mut Vec<HitTestNode<M>>,
     order: &mut usize,
+    has_custom_cursors: &mut bool,
 ) {
     if !node.visible {
         return;
@@ -251,7 +264,10 @@ fn collect_node_recursive<M: Clone + 'static>(
     let paint_order = *order;
     *order += 1;
 
-    if node.input_enabled && node.handlers.has_pointer_handlers() {
+    if node.input_enabled && (node.handlers.has_pointer_handlers() || node.cursor.is_some()) {
+        if node.cursor.is_some() {
+            *has_custom_cursors = true;
+        }
         hit_nodes.push(HitTestNode {
             node_id: node.node_id,
             local_rect: node.bounds,
@@ -262,6 +278,7 @@ fn collect_node_recursive<M: Clone + 'static>(
             paint_order,
             visible: node.visible,
             input_enabled: node.input_enabled,
+            cursor: node.cursor,
             handlers: node.handlers.clone(),
         });
     }
@@ -345,7 +362,7 @@ fn collect_node_recursive<M: Clone + 'static>(
             payload,
         });
         for child in &node.children {
-            collect_node_recursive(child, commands, hit_nodes, order);
+            collect_node_recursive(child, commands, hit_nodes, order, has_custom_cursors);
         }
         if is_clip {
             let pop_order = *order;
@@ -364,7 +381,7 @@ fn collect_node_recursive<M: Clone + 'static>(
         }
     } else {
         for child in &node.children {
-            collect_node_recursive(child, commands, hit_nodes, order);
+            collect_node_recursive(child, commands, hit_nodes, order, has_custom_cursors);
         }
     }
 }

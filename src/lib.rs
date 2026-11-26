@@ -22,6 +22,7 @@ pub(crate) mod reconcile;
 pub(crate) mod wayland;
 
 pub mod accessibility;
+pub mod animation;
 pub mod app;
 #[cfg(any(
     feature = "pipewire",
@@ -56,6 +57,7 @@ pub mod surface;
 pub mod system;
 pub mod text;
 pub mod timer;
+pub mod wayland_ext;
 
 pub use app::{App, Application, HeadlessRuntime, MemoryConfig};
 pub use capabilities::{Capabilities, Capability};

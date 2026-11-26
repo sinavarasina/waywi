@@ -13,6 +13,58 @@ use crate::image::ImageAsset;
 
 pub(crate) type AssetCallback<M> = Box<dyn FnOnce(Result<ImageAsset>) -> M>;
 pub(crate) type ActivationCallback<M> = Box<dyn FnOnce(Result<String>) -> M>;
+pub(crate) type ScreencopyCallback<M> =
+    Box<dyn FnOnce(Result<crate::wayland_ext::ScreencopyFrame>) -> M>;
+
+/// Imperative foreign-toplevel control action queued from [`EffectCtx`](super::EffectCtx).
+#[derive(Debug, Clone)]
+pub(crate) enum ForeignToplevelAction {
+    Activate(crate::wayland_ext::ForeignToplevelId),
+    Close(crate::wayland_ext::ForeignToplevelId),
+    SetMinimized(crate::wayland_ext::ForeignToplevelId, bool),
+    SetMaximized(crate::wayland_ext::ForeignToplevelId, bool),
+    SetFullscreen(
+        crate::wayland_ext::ForeignToplevelId,
+        bool,
+        Option<crate::display::OutputId>,
+    ),
+}
+
+/// Imperative `ext_workspace_v1` mutation queued from [`EffectCtx`](super::EffectCtx).
+#[derive(Debug, Clone)]
+pub(crate) enum ExtWorkspaceAction {
+    Activate(crate::wayland_ext::ExtWorkspaceId),
+    Deactivate(crate::wayland_ext::ExtWorkspaceId),
+    Create {
+        group: crate::wayland_ext::ExtWorkspaceGroupId,
+        name: String,
+    },
+    Remove(crate::wayland_ext::ExtWorkspaceId),
+}
+
+/// Imperative `zwp_virtual_keyboard_v1` action queued from [`EffectCtx`](super::EffectCtx).
+#[derive(Debug, Clone)]
+pub(crate) enum VirtualKeyboardAction {
+    Key {
+        keycode: u32,
+        state: crate::input::VirtualKeyState,
+    },
+    Modifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
+    Keymap(String),
+}
+
+/// Imperative outgoing `wl_data_device.start_drag` request queued from [`EffectCtx`](super::EffectCtx).
+#[derive(Debug, Clone)]
+pub(crate) struct DragStartRequest {
+    pub(crate) surface_key: crate::surface::SurfaceKey,
+    pub(crate) entries: Vec<(String, Vec<u8>)>,
+    pub(crate) actions: crate::input::DndAction,
+}
 
 pub(crate) struct AsyncAssetCompletion {
     pub(crate) job_id: u64,

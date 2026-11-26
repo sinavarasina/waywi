@@ -60,6 +60,8 @@ pub(crate) enum SurfaceRole {
     Layer(LayerSurface),
     Xdg(Window),
     Popup(Popup),
+    #[cfg(feature = "session-lock")]
+    SessionLock(crate::wayland::session_lock::SessionLockRole),
 }
 
 impl SurfaceRole {
@@ -68,6 +70,8 @@ impl SurfaceRole {
             Self::Layer(l) => l.wl_surface(),
             Self::Xdg(w) => w.wl_surface(),
             Self::Popup(p) => p.wl_surface(),
+            #[cfg(feature = "session-lock")]
+            Self::SessionLock(sl) => sl.wl_surface(),
         }
     }
 }
@@ -108,7 +112,7 @@ impl Drop for LiveWaylandSurface {
 }
 
 /// Discrete events produced by the Wayland queue for [`crate::App`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum WaylandEvent {
     OutputsChanged,
     SurfaceConfigured {
@@ -209,5 +213,21 @@ pub(crate) enum WaylandEvent {
     Ime {
         key: RetainedSurfaceKey,
         event: crate::input::ImeEvent,
+    },
+    Dnd {
+        key: RetainedSurfaceKey,
+        event: crate::input::DndEvent,
+    },
+    #[cfg(feature = "session-lock")]
+    SessionLock(crate::wayland_ext::SessionLockEvent),
+    #[cfg(feature = "screencopy")]
+    ScreencopyDone {
+        request_id: u64,
+        result: crate::error::Result<crate::wayland_ext::ScreencopyFrame>,
+    },
+    #[cfg(feature = "pointer-constraints")]
+    RelativePointer {
+        key: RetainedSurfaceKey,
+        event: crate::input::RelativePointerEvent,
     },
 }

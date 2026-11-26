@@ -2,23 +2,73 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use crate::capabilities::{Capabilities, Capability};
-use crate::display::OutputInfo;
-use crate::effect::ActivationCallback;
+use crate::display::{OutputId, OutputInfo};
+use crate::effect::{
+    DragStartRequest, ExtWorkspaceAction, ForeignToplevelAction, VirtualKeyboardAction,
+};
 use crate::error::{Result, WaywiError};
 use crate::geometry::{LogicalPx, LogicalSize, Point};
 use crate::input::{
-    GestureEvent, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, ScrollEvent, ScrollSource,
-    TabletEvent, TouchEvent,
+    CursorShape, DndAction, DndEvent, GestureEvent, ImeConfig, ImeEvent, KeyEvent, Modifiers,
+    MouseButton, PointerConstraintMode, RelativePointerEvent, ScrollEvent, ScrollSource,
+    TabletEvent, TouchEvent, VirtualKeyState,
 };
 use crate::reconcile::RetainedSurfaceKey;
 use crate::render::{FrameScene, RenderBackend, RendererPreference};
-use crate::surface::SurfaceKey;
+use crate::surface::{SurfaceKey, WindowDecoration};
 use crate::text::SharedStr;
+use crate::wayland_ext::{ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, ScreencopyFrame};
 
-use super::core::CoreEngine;
+use super::core::{CoreEngine, EffectPostWork};
 use super::memory::MemoryConfig;
 use super::runner::Application;
 use super::subscription_mgr::flatten_specs;
+
+/// Foreign-toplevel control action recorded by [`HeadlessRuntime`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessToplevelAction {
+    Activate(ForeignToplevelId),
+    Close(ForeignToplevelId),
+    SetMinimized(ForeignToplevelId, bool),
+    SetMaximized(ForeignToplevelId, bool),
+    SetFullscreen(ForeignToplevelId, bool, Option<OutputId>),
+}
+
+/// `ext_workspace_v1` mutation recorded by [`HeadlessRuntime`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessExtWorkspaceAction {
+    Activate(ExtWorkspaceId),
+    Deactivate(ExtWorkspaceId),
+    Create {
+        group: ExtWorkspaceGroupId,
+        name: String,
+    },
+    Remove(ExtWorkspaceId),
+}
+
+/// `zwp_virtual_keyboard_v1` action recorded by [`HeadlessRuntime`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessVirtualKeyboardAction {
+    Key {
+        keycode: u32,
+        state: VirtualKeyState,
+    },
+    Modifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
+    Keymap(String),
+}
+
+/// Outgoing Drag & Drop request recorded by [`HeadlessRuntime`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessDragStart {
+    pub surface_key: SurfaceKey,
+    pub entries: Vec<(String, Vec<u8>)>,
+    pub actions: DndAction,
+}
 
 /// Deterministic headless runtime driving any [`Application`] without opening a Wayland socket.
 ///
@@ -33,6 +83,11 @@ pub struct HeadlessRuntime<A: Application> {
     frame_buffers: HashMap<RetainedSurfaceKey, Vec<u8>>,
     activation_seq: u64,
     activated_surfaces: Vec<(SurfaceKey, String)>,
+    synthetic_screencopy: Option<ScreencopyFrame>,
+    recorded_toplevel_actions: Vec<HeadlessToplevelAction>,
+    recorded_ext_workspace_actions: Vec<HeadlessExtWorkspaceAction>,
+    recorded_virtual_keyboard_actions: Vec<HeadlessVirtualKeyboardAction>,
+    recorded_drag_starts: Vec<HeadlessDragStart>,
     #[cfg(feature = "accessibility")]
     a11y_tree_state: crate::accessibility::AccessibilityTreeState,
 }
@@ -96,21 +151,22 @@ impl<A: Application> HeadlessRuntime<A> {
             frame_buffers: HashMap::new(),
             activation_seq: 0,
             activated_surfaces: Vec::new(),
+            synthetic_screencopy: None,
+            recorded_toplevel_actions: Vec::new(),
+            recorded_ext_workspace_actions: Vec::new(),
+            recorded_virtual_keyboard_actions: Vec::new(),
+            recorded_drag_starts: Vec::new(),
             #[cfg(feature = "accessibility")]
             a11y_tree_state: crate::accessibility::AccessibilityTreeState::default(),
         };
-        rt.drain_activation_effects(post.activation_requests, post.surface_activations);
+        rt.drain_post_work(post);
         rt.step_at(now)?;
         Ok(rt)
     }
 
-    fn drain_activation_effects(
-        &mut self,
-        requests: Vec<(Option<String>, ActivationCallback<A::Message>)>,
-        activations: Vec<(SurfaceKey, String)>,
-    ) {
+    fn drain_post_work(&mut self, post: EffectPostWork<A::Message>) {
         let supported = self.core.capabilities.has(Capability::XdgActivation);
-        for (_app_id, callback) in requests {
+        for (_app_id, callback) in post.activation_requests {
             let result = if supported {
                 self.activation_seq = self.activation_seq.saturating_add(1);
                 Ok(format!("headless-activation-token-{}", self.activation_seq))
@@ -120,7 +176,99 @@ impl<A: Application> HeadlessRuntime<A> {
             self.inbox.push_back(callback(result));
         }
         if supported {
-            self.activated_surfaces.extend(activations);
+            self.activated_surfaces.extend(post.surface_activations);
+        }
+
+        let sc_supported = self.core.capabilities.has(Capability::Screencopy);
+        for (_target, _overlay_cursor, callback) in post.screencopy_requests {
+            let result = if !sc_supported {
+                Err(WaywiError::UnsupportedCapability(Capability::Screencopy))
+            } else if let Some(frame) = self.synthetic_screencopy.clone() {
+                Ok(frame)
+            } else {
+                Err(WaywiError::InvalidState(
+                    "no synthetic screencopy frame configured on HeadlessRuntime; call set_synthetic_screencopy(...)"
+                        .to_owned(),
+                ))
+            };
+            self.inbox.push_back(callback(result));
+        }
+
+        if self
+            .core
+            .capabilities
+            .has(Capability::ForeignToplevelControl)
+        {
+            for action in post.toplevel_actions {
+                let recorded = match action {
+                    ForeignToplevelAction::Activate(id) => HeadlessToplevelAction::Activate(id),
+                    ForeignToplevelAction::Close(id) => HeadlessToplevelAction::Close(id),
+                    ForeignToplevelAction::SetMinimized(id, m) => {
+                        HeadlessToplevelAction::SetMinimized(id, m)
+                    }
+                    ForeignToplevelAction::SetMaximized(id, m) => {
+                        HeadlessToplevelAction::SetMaximized(id, m)
+                    }
+                    ForeignToplevelAction::SetFullscreen(id, f, out) => {
+                        HeadlessToplevelAction::SetFullscreen(id, f, out)
+                    }
+                };
+                self.recorded_toplevel_actions.push(recorded);
+            }
+        }
+
+        if self.core.capabilities.has(Capability::ExtWorkspace) {
+            for action in post.ext_workspace_actions {
+                let recorded = match action {
+                    ExtWorkspaceAction::Activate(id) => HeadlessExtWorkspaceAction::Activate(id),
+                    ExtWorkspaceAction::Deactivate(id) => {
+                        HeadlessExtWorkspaceAction::Deactivate(id)
+                    }
+                    ExtWorkspaceAction::Create { group, name } => {
+                        HeadlessExtWorkspaceAction::Create { group, name }
+                    }
+                    ExtWorkspaceAction::Remove(id) => HeadlessExtWorkspaceAction::Remove(id),
+                };
+                self.recorded_ext_workspace_actions.push(recorded);
+            }
+        }
+
+        if self.core.capabilities.has(Capability::VirtualKeyboard) {
+            for action in post.virtual_keyboard_actions {
+                let recorded = match action {
+                    VirtualKeyboardAction::Key { keycode, state } => {
+                        HeadlessVirtualKeyboardAction::Key { keycode, state }
+                    }
+                    VirtualKeyboardAction::Modifiers {
+                        depressed,
+                        latched,
+                        locked,
+                        group,
+                    } => HeadlessVirtualKeyboardAction::Modifiers {
+                        depressed,
+                        latched,
+                        locked,
+                        group,
+                    },
+                    VirtualKeyboardAction::Keymap(km) => HeadlessVirtualKeyboardAction::Keymap(km),
+                };
+                self.recorded_virtual_keyboard_actions.push(recorded);
+            }
+        }
+
+        if self.core.capabilities.has(Capability::DragAndDrop) {
+            for DragStartRequest {
+                surface_key,
+                entries,
+                actions,
+            } in post.drag_starts
+            {
+                self.recorded_drag_starts.push(HeadlessDragStart {
+                    surface_key,
+                    entries,
+                    actions,
+                });
+            }
         }
     }
 
@@ -149,7 +297,7 @@ impl<A: Application> HeadlessRuntime<A> {
                 |ctx| A::update(&mut self.state, msg, ctx),
             );
             res?;
-            self.drain_activation_effects(post.activation_requests, post.surface_activations);
+            self.drain_post_work(post);
         }
 
         let report = {
@@ -161,6 +309,11 @@ impl<A: Application> HeadlessRuntime<A> {
             self.core
                 .system_samplers
                 .reconcile(flat.iter().copied(), &mut self.core.system);
+            for spec in &flat {
+                if let crate::subscription::SubscriptionSpec::AnimationFrame { map, .. } = spec {
+                    self.inbox.push_back(map.call(now));
+                }
+            }
 
             self.core
                 .reconcile_view(&self.outputs, now, || A::view(&self.state))
@@ -173,6 +326,30 @@ impl<A: Application> HeadlessRuntime<A> {
             self.core.surface_scales.remove(rk);
         }
 
+        self.render_dirty_surfaces()?;
+
+        Ok(())
+    }
+
+    /// Advances active sprite timelines and retained element transitions up to `now` and re-renders
+    /// any dirtied surfaces **without** calling `Application::view(state)`.
+    ///
+    /// Returns `true` if any surface still has active transitions or dirtied pixels.
+    pub fn tick_animations_at(&mut self, now: Instant) -> Result<bool> {
+        let (dirty, _, msgs) = self.core.reconciler.tick_animations(now);
+        self.inbox.extend(msgs);
+        let had_dirty = !dirty.is_empty();
+        self.render_dirty_surfaces()?;
+        let still_active = self
+            .core
+            .reconciler
+            .surfaces
+            .values()
+            .any(|s| s.has_active_transitions || s.next_animation_deadline.is_some());
+        Ok(had_dirty || still_active)
+    }
+
+    fn render_dirty_surfaces(&mut self) -> Result<()> {
         let mut reclaim_candidates = Vec::new();
         for (rk, surf) in &mut self.core.reconciler.surfaces {
             if !surf.needs_redraw {
@@ -211,7 +388,6 @@ impl<A: Application> HeadlessRuntime<A> {
                 .collect_reclaimable_from_commands(&surf.commands, &mut reclaim_candidates);
         }
         self.core.assets.reclaim_assets(&reclaim_candidates);
-
         Ok(())
     }
 
@@ -287,6 +463,7 @@ impl<A: Application> HeadlessRuntime<A> {
         let pos = Point::new(LogicalPx(x), LogicalPx(y));
         self.core
             .dispatch_pointer_move(rk, pos, Modifiers::empty(), true, &mut self.inbox)
+            .0
     }
 
     /// Simulates the pointer leaving a surface, firing `on_leave` for the currently hovered node.
@@ -451,6 +628,84 @@ impl<A: Application> HeadlessRuntime<A> {
         self.surface_by_key(surface_key).map(|surf| &surf.spec.ime)
     }
 
+    /// Resolves the effective [`CursorShape`] at surface-local `(x, y)`.
+    #[must_use]
+    pub fn surface_cursor_at(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        x: f32,
+        y: f32,
+    ) -> Option<CursorShape> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.cursor_at(Point::new(LogicalPx(x), LogicalPx(y))))
+    }
+
+    /// Returns the reconciled [`WindowDecoration`] mode for a retained surface.
+    #[must_use]
+    pub fn surface_decoration(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<WindowDecoration> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.spec.decoration)
+    }
+
+    /// Returns whether a retained surface currently requests idle inhibition.
+    #[must_use]
+    pub fn surface_inhibits_idle(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<bool> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.spec.inhibit_idle)
+    }
+
+    /// Returns the reconciled [`PointerConstraintMode`] for a retained surface.
+    #[must_use]
+    pub fn surface_pointer_constraint(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<PointerConstraintMode> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.spec.pointer_constraint)
+    }
+
+    /// Simulates a `zwp_relative_pointer_v1` event targeting the surface's `on_relative_pointer`.
+    pub fn simulate_relative_pointer(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: RelativePointerEvent,
+    ) -> bool {
+        let msg = self
+            .surface_by_key(surface_key)
+            .and_then(|surf| surf.on_relative_pointer.as_ref())
+            .and_then(|h| h.call(event));
+        if let Some(m) = msg {
+            self.inbox.push_back(m);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Simulates a `wl_data_device` Drag & Drop event targeting the surface's `on_dnd`.
+    pub fn simulate_dnd(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: DndEvent,
+    ) -> bool {
+        let msg = self
+            .surface_by_key(surface_key)
+            .and_then(|surf| surf.on_dnd.as_ref())
+            .and_then(|h| h.call(event));
+        if let Some(m) = msg {
+            self.inbox.push_back(m);
+            true
+        } else {
+            false
+        }
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> &Capabilities {
         &self.core.capabilities
@@ -511,6 +766,43 @@ impl<A: Application> HeadlessRuntime<A> {
     #[must_use]
     pub fn activated_surfaces(&self) -> &[(SurfaceKey, String)] {
         &self.activated_surfaces
+    }
+
+    /// Injects a synthetic [`ScreencopyFrame`] returned by
+    /// [`EffectCtx::capture_screen`](crate::effect::EffectCtx::capture_screen) when
+    /// [`Capability::Screencopy`] is enabled. Passing `None` causes headless screencopy requests
+    /// to return `Err(WaywiError::InvalidState(..))`.
+    pub fn set_synthetic_screencopy(&mut self, frame: Option<ScreencopyFrame>) {
+        self.synthetic_screencopy = frame;
+    }
+
+    /// Returns all foreign-toplevel actions recorded via [`EffectCtx`](crate::effect::EffectCtx)
+    /// when [`Capability::ForeignToplevelControl`] is enabled.
+    #[must_use]
+    pub fn recorded_toplevel_actions(&self) -> &[HeadlessToplevelAction] {
+        &self.recorded_toplevel_actions
+    }
+
+    /// Returns all `ext_workspace_v1` actions recorded via [`EffectCtx`](crate::effect::EffectCtx)
+    /// when [`Capability::ExtWorkspace`] is enabled.
+    #[must_use]
+    pub fn recorded_ext_workspace_actions(&self) -> &[HeadlessExtWorkspaceAction] {
+        &self.recorded_ext_workspace_actions
+    }
+
+    /// Returns all virtual-keyboard actions recorded via [`EffectCtx`](crate::effect::EffectCtx)
+    /// when [`Capability::VirtualKeyboard`] is enabled.
+    #[must_use]
+    pub fn recorded_virtual_keyboard_actions(&self) -> &[HeadlessVirtualKeyboardAction] {
+        &self.recorded_virtual_keyboard_actions
+    }
+
+    /// Returns all outgoing Drag & Drop requests recorded via
+    /// [`EffectCtx::start_drag`](crate::effect::EffectCtx::start_drag) when
+    /// [`Capability::DragAndDrop`] is enabled.
+    #[must_use]
+    pub fn recorded_drag_starts(&self) -> &[HeadlessDragStart] {
+        &self.recorded_drag_starts
     }
 
     /// Simulates a compositor `configure` event updating `configured_sizes` for a surface.

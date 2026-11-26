@@ -238,7 +238,15 @@ impl<M> Default for LoopInbox<M> {
 }
 
 pub(crate) struct SubscriptionManager<M> {
+    pub(crate) animation_frame_subs: Vec<FrameSharedFn<std::time::Instant, M>>,
     pub(crate) keyboard_layout_subs: Vec<FrameSharedFn<crate::input::KeyboardLayoutInfo, M>>,
+    #[cfg(feature = "session-lock")]
+    pub(crate) session_lock_subs: Vec<FrameSharedFn<crate::wayland_ext::SessionLockEvent, M>>,
+    #[cfg(feature = "foreign-toplevel")]
+    pub(crate) foreign_toplevel_subs:
+        Vec<FrameSharedFn<crate::wayland_ext::ForeignToplevelSnapshot, M>>,
+    #[cfg(feature = "ext-workspace")]
+    pub(crate) ext_workspace_subs: Vec<FrameSharedFn<crate::wayland_ext::ExtWorkspaceSnapshot, M>>,
     #[cfg(feature = "idle-notify")]
     pub(crate) idle_subs: Vec<(
         std::time::Duration,
@@ -393,7 +401,14 @@ pub(crate) struct SubscriptionManager<M> {
 impl<M: Clone + 'static> SubscriptionManager<M> {
     pub(crate) fn new() -> Self {
         Self {
+            animation_frame_subs: Vec::new(),
             keyboard_layout_subs: Vec::new(),
+            #[cfg(feature = "session-lock")]
+            session_lock_subs: Vec::new(),
+            #[cfg(feature = "foreign-toplevel")]
+            foreign_toplevel_subs: Vec::new(),
+            #[cfg(feature = "ext-workspace")]
+            ext_workspace_subs: Vec::new(),
             #[cfg(feature = "idle-notify")]
             idle_subs: Vec::new(),
             #[cfg(feature = "idle-notify")]
@@ -510,7 +525,14 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
         #[cfg(feature = "dbus")]
         let dbus_client = clients.dbus;
 
+        self.animation_frame_subs.clear();
         self.keyboard_layout_subs.clear();
+        #[cfg(feature = "session-lock")]
+        self.session_lock_subs.clear();
+        #[cfg(feature = "foreign-toplevel")]
+        self.foreign_toplevel_subs.clear();
+        #[cfg(feature = "ext-workspace")]
+        self.ext_workspace_subs.clear();
         #[cfg(feature = "idle-notify")]
         {
             self.idle_subs.clear();
@@ -572,8 +594,23 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
 
         for spec in specs {
             match spec {
+                SubscriptionSpec::AnimationFrame { map, .. } => {
+                    self.animation_frame_subs.push(map.clone());
+                }
                 SubscriptionSpec::KeyboardLayout { map } => {
                     self.keyboard_layout_subs.push(map.clone());
+                }
+                #[cfg(feature = "session-lock")]
+                SubscriptionSpec::SessionLock { map } => {
+                    self.session_lock_subs.push(map.clone());
+                }
+                #[cfg(feature = "foreign-toplevel")]
+                SubscriptionSpec::ForeignToplevel { map } => {
+                    self.foreign_toplevel_subs.push(map.clone());
+                }
+                #[cfg(feature = "ext-workspace")]
+                SubscriptionSpec::ExtWorkspace { map } => {
+                    self.ext_workspace_subs.push(map.clone());
                 }
                 #[cfg(feature = "idle-notify")]
                 SubscriptionSpec::IdleNotify {

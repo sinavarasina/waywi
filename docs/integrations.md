@@ -13,15 +13,25 @@ Optional Linux subsystems are selected at compile time via Cargo features. Missi
 | `image-svg` | No | `resvg` | SVG rasterizer |
 | `image-gif` | No | `gif` | Static first-frame GIF decoder |
 | `image-webp` | No | `image-webp` | Static first-frame WebP decoder |
-| `animation` | Yes | - | Frame-clock `SpriteSheet` / `Sprite` playback |
+| `animation` | Yes | - | Pure-mechanism `Easing`/`Lerp`/`Spring`/`Tween`/`Animated`, `Animation::frames` VSync ticks, retained transitions, and `SpriteSheet`/`Sprite` playback |
 | `fractional-scale` | No | `wayland-protocols` | `wp_fractional_scale_v1` + `wp_viewporter` scaling |
-| `clipboard` | No | `wayland-protocols`, `wayland-protocols-wlr` | `ext-data-control-v1` / `zwlr-data-control-v1` clipboard |
+| `clipboard` | No | `wayland-protocols`, `wayland-protocols-wlr` | `ext-data-control-v1` / `zwlr-data-control-v1` clipboard (zero-thread `calloop` pipe I/O) |
 | `idle-notify` | No | `wayland-protocols` | `ext-idle-notify-v1` user/input idle monitor |
 | `ime` | No | `wayland-protocols` | `zwp_text_input_manager_v3` / `zwp_text_input_v3` IME composition support |
+| `pointer-gestures` | No | `wayland-protocols` | `zwp_pointer_gestures_v1` multi-finger touchpad swipe, pinch, and hold gestures |
+| `tablet` | No | `wayland-protocols` | `zwp_tablet_manager_v2` pen stylus axes and express-key pad input |
+| `cursor-shape` | No | `wayland-protocols` | `wp_cursor_shape_v1` server-side cursor shapes (`Element::cursor` / `Surface::cursor`) |
+| `session-lock` | No | `wayland-protocols` | `ext_session_lock_v1` native multi-output Wayland lockscreen surfaces |
+| `screencopy` | No | `wayland-protocols`, `wayland-protocols-wlr` | `ext_image_copy_capture_v1` + `zwlr_screencopy_manager_v1` async screen/region pixel capture |
+| `foreign-toplevel` | No | `wayland-protocols`, `wayland-protocols-wlr` | `zwlr_foreign_toplevel_management_v1` + `ext_foreign_toplevel_list_v1` window listing & control |
+| `ext-workspace` | No | `wayland-protocols` | `ext_workspace_v1` cross-compositor workspace snapshots and batched mutations |
+| `idle-inhibit` | No | `wayland-protocols` | `zwp_idle_inhibit_manager_v1` declarative per-surface idle inhibition |
+| `virtual-keyboard` | No | `wayland-protocols-misc` | `zwp_virtual_keyboard_v1` synthetic key/modifier injection and XKB keymap upload |
+| `pointer-constraints` | No | `wayland-protocols` | `zwp_pointer_constraints_v1` lock/confine and `zwp_relative_pointer_v1` relative motion |
 | `control-ipc` | No | `calloop/signals` | Unix control socket (under `$XDG_RUNTIME_DIR`, falling back to `/run/user/<uid>`; same-user peers only) and `SIGUSR1`/`SIGUSR2` |
 | `hyprland-ipc` | No | `serde`, `serde_json` | Hyprland command socket and `socket2` event stream (`waywi::compositor::hyprland`) |
 | `sway-ipc` | No | `serde`, `serde_json` | Sway `i3-ipc` binary client and event stream (`waywi::compositor::sway`) |
-| `dbus` | No | `zbus`, `futures-lite`, `serde` | Async `zbus` workers and domain clients for Notifications, StatusNotifier tray host, MPRIS, NetworkManager, PowerProfiles, UPower, logind, BlueZ, ModemManager1, ScreenSaver, GeoClue2, UDisks2, XDG Portal Settings |
+| `dbus` | No | `zbus`, `futures-lite`, `serde` | Async `zbus` workers and 28 domain clients (Notifications, Tray, MPRIS, NetworkManager, PowerProfiles, UPower, logind, BlueZ, ModemManager1, ScreenSaver, GeoClue2, UDisks2, XDG Portals, Polkit, Sensors, systemd, timedate1, hostname1, locale1, AccountsService, Fprintd, GameMode, Secrets, fwupd, PackageKit, CUPS, KDE Connect, Colord, Avahi) |
 | `global-shortcuts` | No | `zbus`, `futures-lite` | `org.freedesktop.portal.GlobalShortcuts` via `Dbus::global_shortcuts` (implies `dbus`) |
 | `accessibility` | No | `accesskit`, `accesskit_unix` | On-demand AT-SPI2 tree publishing and action dispatch |
 | `pipewire` | No | `pipewire` | PipeWire audio mixer, SFX output, and privacy graph monitor |

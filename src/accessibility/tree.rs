@@ -221,7 +221,7 @@ pub(crate) fn build_tree_update<M: 'static>(
         }
 
         let default_role = match surf.spec.kind {
-            SurfaceKind::Window => Role::Window,
+            SurfaceKind::Window | SurfaceKind::SessionLock => Role::Window,
             SurfaceKind::Popup => Role::Menu,
             SurfaceKind::Panel | SurfaceKind::Floating | SurfaceKind::Overlay => Role::Pane,
         };
@@ -433,12 +433,14 @@ mod tests {
                 LogicalPx(80.0),
                 LogicalPx(28.0),
             ),
+            local_affine: Affine2D::IDENTITY,
             affine: Affine2D::IDENTITY,
             clip_rect: None,
             z_index: 0,
             visible: true,
             input_enabled: true,
             opacity: 1.0,
+            cursor: None,
             handlers: btn_handlers,
             visual: RetainedVisual::Text {
                 content: SharedStr::from_static("Launch"),
@@ -458,6 +460,7 @@ mod tests {
                 hidden: false,
             },
             sprite_timeline: None,
+            transitions: None,
             on_animation_end: None,
             children: Vec::new(),
         };
@@ -478,6 +481,12 @@ mod tests {
                 background: crate::render::Color::BLACK,
                 title: SharedStr::from_static("Top Panel"),
                 namespace: SharedStr::from_static("waywi"),
+                cursor: crate::input::CursorShape::Default,
+                decoration: crate::surface::WindowDecoration::Server,
+                inhibit_idle: false,
+                pointer_constraint: crate::input::PointerConstraintMode::None,
+                accepts_dnd: false,
+                dnd_mime_types: Vec::new(),
                 a11y: AccessibleProps::default(),
                 ime: crate::input::ImeConfig::disabled(),
             },
@@ -485,12 +494,15 @@ mod tests {
             roots: vec![btn_node],
             commands: Vec::new(),
             hit_nodes: Vec::new(),
+            has_custom_cursors: false,
             hovered_node: None,
             on_close: None,
             on_key: None,
             on_ime: None,
             on_pointer_move: None,
             on_pointer_up: None,
+            on_relative_pointer: None,
+            on_dnd: None,
             on_touch: None,
             on_gesture: None,
             on_tablet: None,
@@ -502,6 +514,7 @@ mod tests {
             input_region_dirty: false,
             selective_input_rects: Vec::new(),
             next_animation_deadline: None,
+            has_active_transitions: false,
         };
 
         let mut surfaces = HashMap::new();

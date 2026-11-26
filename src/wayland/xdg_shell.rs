@@ -2,14 +2,16 @@ use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positi
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::LayerSurface;
 use smithay_client_toolkit::shell::xdg::popup::Popup;
-use smithay_client_toolkit::shell::xdg::window::{Window, WindowDecorations};
+use smithay_client_toolkit::shell::xdg::window::{DecorationMode, Window, WindowDecorations};
 use smithay_client_toolkit::shell::xdg::{XdgPositioner, XdgShell, XdgSurface};
 use wayland_client::protocol::{wl_seat, wl_surface};
 use wayland_client::{Proxy, QueueHandle};
 
 use crate::error::{Result, WaywiError};
 use crate::reconcile::SurfaceSpec;
-use crate::surface::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupPositioner};
+use crate::surface::{
+    PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupPositioner, WindowDecoration,
+};
 use crate::wayland::connection::WaylandState;
 use crate::wayland::surface_state::SurfaceRole;
 
@@ -21,14 +23,21 @@ pub(crate) fn create_xdg_window(
     wl_surface: wl_surface::WlSurface,
     spec: &SurfaceSpec,
 ) -> Window {
-    let window = xdg_shell.create_window(wl_surface, WindowDecorations::RequestServer, qh);
-    apply_xdg_spec(&window, spec);
+    let deco = match spec.decoration {
+        WindowDecoration::Auto => WindowDecorations::ServerDefault,
+        WindowDecoration::Server => WindowDecorations::RequestServer,
+        WindowDecoration::Client => WindowDecorations::RequestClient,
+        WindowDecoration::None => WindowDecorations::None,
+    };
+    let window = xdg_shell.create_window(wl_surface, deco, qh);
+    apply_xdg_spec(&window, spec, false);
     window.commit();
     window
 }
 
-/// Applies mutable XDG window title, app ID, and size hints from [`SurfaceSpec`].
-pub(crate) fn apply_xdg_spec(window: &Window, spec: &SurfaceSpec) {
+/// Applies mutable XDG window title, app ID, size hints, and optional decoration changes from
+/// [`SurfaceSpec`].
+pub(crate) fn apply_xdg_spec(window: &Window, spec: &SurfaceSpec, decoration_changed: bool) {
     let title = if spec.title.is_empty() {
         if spec.namespace.is_empty() {
             "WayWi"
@@ -50,6 +59,19 @@ pub(crate) fn apply_xdg_spec(window: &Window, spec: &SurfaceSpec) {
     let w = spec.logical_size.width.0.max(1.0).round() as u32;
     let h = spec.logical_size.height.0.max(1.0).round() as u32;
     window.set_min_size(Some((w, h)));
+
+    if decoration_changed {
+        match spec.decoration {
+            WindowDecoration::Auto => window.request_decoration_mode(None),
+            WindowDecoration::Server => {
+                window.request_decoration_mode(Some(DecorationMode::Server))
+            }
+            WindowDecoration::Client => {
+                window.request_decoration_mode(Some(DecorationMode::Client))
+            }
+            WindowDecoration::None => {}
+        }
+    }
 }
 
 /// Builds a configured `xdg_positioner` from a WayWi [`PopupPositioner`] and logical popup size.
@@ -136,6 +158,12 @@ pub(crate) fn create_xdg_popup(
             xdg_shell,
         )
         .map_err(|e| WaywiError::SurfaceError(format!("failed to create nested xdg_popup: {e}")))?,
+        #[cfg(feature = "session-lock")]
+        SurfaceRole::SessionLock(_) => {
+            return Err(WaywiError::SurfaceError(
+                "xdg_popup cannot be attached to an ext_session_lock_v1 surface".to_owned(),
+            ));
+        }
     };
 
     if popup_spec.grab

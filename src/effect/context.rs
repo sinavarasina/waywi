@@ -4,13 +4,20 @@ use std::time::Duration;
 use crate::app::MemoryConfig;
 use crate::asset::{AssetCache, AssetId, AssetRetention};
 use crate::capabilities::{Capabilities, Capability};
-use crate::display::OutputInfo;
+use crate::display::{OutputId, OutputInfo};
 use crate::error::{Result, WaywiError};
 use crate::image::ImageAsset;
+use crate::input::{DndAction, VirtualKeyState};
 use crate::surface::{IntoSurfaceKey, SurfaceKey};
 use crate::system::SystemProviders;
+use crate::wayland_ext::{
+    ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, ScreencopyFrame, ScreencopyTarget,
+};
 
-use super::worker::{ActivationCallback, AssetCallback};
+use super::worker::{
+    ActivationCallback, AssetCallback, DragStartRequest, ExtWorkspaceAction, ForeignToplevelAction,
+    ScreencopyCallback, VirtualKeyboardAction,
+};
 
 #[cfg(feature = "clipboard")]
 pub(crate) type ClipboardSetter<'a> =
@@ -42,6 +49,12 @@ pub struct EffectCtx<'a, M> {
     pub(crate) evicted_assets: &'a mut Vec<AssetId>,
     pub(crate) pending_activation_requests: &'a mut Vec<(Option<String>, ActivationCallback<M>)>,
     pub(crate) pending_surface_activations: &'a mut Vec<(SurfaceKey, String)>,
+    pub(crate) pending_screencopy_requests:
+        &'a mut Vec<(ScreencopyTarget, bool, ScreencopyCallback<M>)>,
+    pub(crate) pending_toplevel_actions: &'a mut Vec<ForeignToplevelAction>,
+    pub(crate) pending_ext_workspace_actions: &'a mut Vec<ExtWorkspaceAction>,
+    pub(crate) pending_virtual_keyboard_actions: &'a mut Vec<VirtualKeyboardAction>,
+    pub(crate) pending_drag_starts: &'a mut Vec<DragStartRequest>,
 
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     pub(crate) audio: &'a crate::audio::AudioClient,
@@ -259,6 +272,175 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
         }
         self.pending_surface_activations
             .push((surface_key.into_surface_key(), token));
+        Ok(())
+    }
+
+    /// Captures pixels from a Wayland output or output sub-region asynchronously (non-blocking).
+    ///
+    /// Prefers `ext_image_copy_capture_v1` + `ext_output_image_capture_source_manager_v1` and
+    /// falls back to `zwlr_screencopy_manager_v1`. Delivers `map(Ok(ScreencopyFrame))` normalized
+    /// to top-to-bottom RGBA8, or `map(Err(WaywiError::UnsupportedCapability(Capability::Screencopy)))`
+    /// when unsupported.
+    pub fn capture_screen(
+        &mut self,
+        target: ScreencopyTarget,
+        overlay_cursor: bool,
+        map: impl FnOnce(Result<ScreencopyFrame>) -> M + 'static,
+    ) {
+        self.pending_screencopy_requests
+            .push((target, overlay_cursor, Box::new(map)));
+    }
+
+    /// Activates/focuses a foreign toplevel window (`zwlr_foreign_toplevel_management_v1`).
+    pub fn activate_toplevel(&mut self, id: ForeignToplevelId) -> Result<()> {
+        self.capabilities
+            .require(Capability::ForeignToplevelControl)?;
+        self.pending_toplevel_actions
+            .push(ForeignToplevelAction::Activate(id));
+        Ok(())
+    }
+
+    /// Requests closing a foreign toplevel window (`zwlr_foreign_toplevel_management_v1`).
+    pub fn close_toplevel(&mut self, id: ForeignToplevelId) -> Result<()> {
+        self.capabilities
+            .require(Capability::ForeignToplevelControl)?;
+        self.pending_toplevel_actions
+            .push(ForeignToplevelAction::Close(id));
+        Ok(())
+    }
+
+    /// Minimizes or unminimizes a foreign toplevel window (`zwlr_foreign_toplevel_management_v1`).
+    pub fn set_toplevel_minimized(&mut self, id: ForeignToplevelId, minimized: bool) -> Result<()> {
+        self.capabilities
+            .require(Capability::ForeignToplevelControl)?;
+        self.pending_toplevel_actions
+            .push(ForeignToplevelAction::SetMinimized(id, minimized));
+        Ok(())
+    }
+
+    /// Maximizes or unmaximizes a foreign toplevel window (`zwlr_foreign_toplevel_management_v1`).
+    pub fn set_toplevel_maximized(&mut self, id: ForeignToplevelId, maximized: bool) -> Result<()> {
+        self.capabilities
+            .require(Capability::ForeignToplevelControl)?;
+        self.pending_toplevel_actions
+            .push(ForeignToplevelAction::SetMaximized(id, maximized));
+        Ok(())
+    }
+
+    /// Fullscreens or unfullscreens a foreign toplevel window (`zwlr_foreign_toplevel_management_v1`).
+    pub fn set_toplevel_fullscreen(
+        &mut self,
+        id: ForeignToplevelId,
+        fullscreen: bool,
+        output: Option<OutputId>,
+    ) -> Result<()> {
+        self.capabilities
+            .require(Capability::ForeignToplevelControl)?;
+        self.pending_toplevel_actions
+            .push(ForeignToplevelAction::SetFullscreen(id, fullscreen, output));
+        Ok(())
+    }
+
+    /// Activates an `ext_workspace_v1` workspace and commits the manager transaction.
+    pub fn activate_ext_workspace(&mut self, id: ExtWorkspaceId) -> Result<()> {
+        self.capabilities.require(Capability::ExtWorkspace)?;
+        self.pending_ext_workspace_actions
+            .push(ExtWorkspaceAction::Activate(id));
+        Ok(())
+    }
+
+    /// Deactivates an `ext_workspace_v1` workspace and commits the manager transaction.
+    pub fn deactivate_ext_workspace(&mut self, id: ExtWorkspaceId) -> Result<()> {
+        self.capabilities.require(Capability::ExtWorkspace)?;
+        self.pending_ext_workspace_actions
+            .push(ExtWorkspaceAction::Deactivate(id));
+        Ok(())
+    }
+
+    /// Creates a named workspace in an `ext_workspace_v1` workspace group and commits.
+    pub fn create_ext_workspace(
+        &mut self,
+        group: ExtWorkspaceGroupId,
+        name: impl Into<String>,
+    ) -> Result<()> {
+        self.capabilities.require(Capability::ExtWorkspace)?;
+        self.pending_ext_workspace_actions
+            .push(ExtWorkspaceAction::Create {
+                group,
+                name: name.into(),
+            });
+        Ok(())
+    }
+
+    /// Removes an `ext_workspace_v1` workspace and commits the manager transaction.
+    pub fn remove_ext_workspace(&mut self, id: ExtWorkspaceId) -> Result<()> {
+        self.capabilities.require(Capability::ExtWorkspace)?;
+        self.pending_ext_workspace_actions
+            .push(ExtWorkspaceAction::Remove(id));
+        Ok(())
+    }
+
+    /// Starts an outgoing Wayland Drag & Drop operation (`wl_data_device.start_drag`) originating
+    /// from `surface_key` using the most recent pointer/touch press serial.
+    pub fn start_drag(
+        &mut self,
+        surface_key: impl IntoSurfaceKey,
+        entries: Vec<(String, Vec<u8>)>,
+        actions: DndAction,
+    ) -> Result<()> {
+        self.capabilities.require(Capability::DragAndDrop)?;
+        if entries.is_empty() {
+            return Err(WaywiError::InvalidState(
+                "start_drag requires at least one (mime_type, payload) entry".to_owned(),
+            ));
+        }
+        self.pending_drag_starts.push(DragStartRequest {
+            surface_key: surface_key.into_surface_key(),
+            entries,
+            actions,
+        });
+        Ok(())
+    }
+
+    /// Injects a Linux evdev keycode press or release via `zwp_virtual_keyboard_v1` (uploading a
+    /// default US XKB keymap automatically on first use if [`Self::virtual_keymap`] was not called).
+    pub fn virtual_key(&mut self, keycode: u32, state: VirtualKeyState) -> Result<()> {
+        self.capabilities.require(Capability::VirtualKeyboard)?;
+        self.pending_virtual_keyboard_actions
+            .push(VirtualKeyboardAction::Key { keycode, state });
+        Ok(())
+    }
+
+    /// Updates virtual keyboard XKB modifier masks (`zwp_virtual_keyboard_v1.modifiers`).
+    pub fn virtual_modifiers(
+        &mut self,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    ) -> Result<()> {
+        self.capabilities.require(Capability::VirtualKeyboard)?;
+        self.pending_virtual_keyboard_actions
+            .push(VirtualKeyboardAction::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            });
+        Ok(())
+    }
+
+    /// Uploads a custom XKB keymap string to the virtual keyboard (`zwp_virtual_keyboard_v1.keymap`).
+    pub fn virtual_keymap(&mut self, xkb_keymap: impl Into<String>) -> Result<()> {
+        self.capabilities.require(Capability::VirtualKeyboard)?;
+        let km = xkb_keymap.into();
+        if km.is_empty() {
+            return Err(WaywiError::InvalidState(
+                "virtual_keymap must not be empty".to_owned(),
+            ));
+        }
+        self.pending_virtual_keyboard_actions
+            .push(VirtualKeyboardAction::Keymap(km));
         Ok(())
     }
 

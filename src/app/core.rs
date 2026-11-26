@@ -9,7 +9,10 @@ use crate::capabilities::{Capabilities, Capability};
 use crate::display::OutputInfo;
 #[cfg(feature = "clipboard")]
 use crate::effect::context::ClipboardSetter;
-use crate::effect::{ActivationCallback, AssetCallback, AsyncAssetWorker, EffectCtx};
+use crate::effect::{
+    ActivationCallback, AssetCallback, AsyncAssetWorker, DragStartRequest, EffectCtx,
+    ExtWorkspaceAction, ForeignToplevelAction, ScreencopyCallback, VirtualKeyboardAction,
+};
 use crate::error::Result;
 use crate::geometry::{LogicalSize, Point, ScaleFactor};
 use crate::input::tablet::map_stylus_button_to_mouse;
@@ -33,6 +36,15 @@ use super::memory::MemoryConfig;
 pub(crate) struct EffectPostWork<M> {
     pub(crate) activation_requests: Vec<(Option<String>, ActivationCallback<M>)>,
     pub(crate) surface_activations: Vec<(SurfaceKey, String)>,
+    pub(crate) screencopy_requests: Vec<(
+        crate::wayland_ext::ScreencopyTarget,
+        bool,
+        ScreencopyCallback<M>,
+    )>,
+    pub(crate) toplevel_actions: Vec<ForeignToplevelAction>,
+    pub(crate) ext_workspace_actions: Vec<ExtWorkspaceAction>,
+    pub(crate) virtual_keyboard_actions: Vec<VirtualKeyboardAction>,
+    pub(crate) drag_starts: Vec<DragStartRequest>,
     pub(crate) trim_requested: bool,
 }
 
@@ -181,6 +193,11 @@ impl<M: Clone + 'static> CoreEngine<M> {
         let mut evicted_assets: Vec<AssetId> = Vec::new();
         let mut activation_requests = Vec::new();
         let mut surface_activations = Vec::new();
+        let mut screencopy_requests = Vec::new();
+        let mut toplevel_actions = Vec::new();
+        let mut ext_workspace_actions = Vec::new();
+        let mut virtual_keyboard_actions = Vec::new();
+        let mut drag_starts = Vec::new();
 
         #[cfg(feature = "clipboard")]
         let has_clipboard = clipboard_writer.is_some();
@@ -218,6 +235,11 @@ impl<M: Clone + 'static> CoreEngine<M> {
                 evicted_assets: &mut evicted_assets,
                 pending_activation_requests: &mut activation_requests,
                 pending_surface_activations: &mut surface_activations,
+                pending_screencopy_requests: &mut screencopy_requests,
+                pending_toplevel_actions: &mut toplevel_actions,
+                pending_ext_workspace_actions: &mut ext_workspace_actions,
+                pending_virtual_keyboard_actions: &mut virtual_keyboard_actions,
+                pending_drag_starts: &mut drag_starts,
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 audio: &self.audio_client,
                 #[cfg(any(
@@ -269,6 +291,11 @@ impl<M: Clone + 'static> CoreEngine<M> {
             EffectPostWork {
                 activation_requests,
                 surface_activations,
+                screencopy_requests,
+                toplevel_actions,
+                ext_workspace_actions,
+                virtual_keyboard_actions,
+                drag_starts,
                 trim_requested,
             },
         )
@@ -393,11 +420,12 @@ impl<M: Clone + 'static> CoreEngine<M> {
         modifiers: Modifiers,
         emit_move: bool,
         out_msgs: &mut VecDeque<M>,
-    ) -> bool {
+    ) -> (bool, Option<crate::input::CursorShape>) {
         let Some(surf) = self.reconciler.surfaces.get_mut(&key) else {
-            return false;
+            return (false, None);
         };
         let move_dispatch = surf.dispatch_pointer_move_at(pos, modifiers, emit_move);
+        let cursor = move_dispatch.cursor;
         let mut dispatched = false;
         if let Some(tr) = move_dispatch.hover {
             if let Some(msg) = tr.on_leave {
@@ -427,7 +455,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
             out_msgs.push_back(msg);
             dispatched = true;
         }
-        dispatched
+        (dispatched, Some(cursor))
     }
 
     /// Dispatches a multi-touch contact event to matching `on_touch` handlers, falling back
@@ -484,13 +512,9 @@ impl<M: Clone + 'static> CoreEngine<M> {
                 if !self.claimed_touch_ids.contains(&event.id)
                     && self.primary_touch_id == Some(event.id)
                 {
-                    dispatched |= self.dispatch_pointer_move(
-                        key,
-                        event.position,
-                        event.modifiers,
-                        true,
-                        out_msgs,
-                    );
+                    dispatched |= self
+                        .dispatch_pointer_move(key, event.position, event.modifiers, true, out_msgs)
+                        .0;
                 }
             }
             TouchPhase::Up | TouchPhase::Cancel => {
@@ -595,24 +619,28 @@ impl<M: Clone + 'static> CoreEngine<M> {
         match tool_ev.kind {
             TabletToolEventKind::ProximityIn => {
                 if !td.handled_by_tablet && !is_claimed {
-                    dispatched |= self.dispatch_pointer_move(
-                        key,
-                        tool_ev.position,
-                        tool_ev.modifiers,
-                        false,
-                        out_msgs,
-                    );
+                    dispatched |= self
+                        .dispatch_pointer_move(
+                            key,
+                            tool_ev.position,
+                            tool_ev.modifiers,
+                            false,
+                            out_msgs,
+                        )
+                        .0;
                 }
             }
             TabletToolEventKind::Motion => {
                 if is_fallback_down || (!td.handled_by_tablet && !is_claimed) {
-                    dispatched |= self.dispatch_pointer_move(
-                        key,
-                        tool_ev.position,
-                        tool_ev.modifiers,
-                        true,
-                        out_msgs,
-                    );
+                    dispatched |= self
+                        .dispatch_pointer_move(
+                            key,
+                            tool_ev.position,
+                            tool_ev.modifiers,
+                            true,
+                            out_msgs,
+                        )
+                        .0;
                 }
             }
             TabletToolEventKind::Down => {

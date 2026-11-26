@@ -13,6 +13,8 @@ use calloop_wayland_source::WaylandSource;
 use wayland_client::{Connection, QueueHandle};
 
 use crate::capabilities::Capability;
+#[cfg(feature = "screencopy")]
+use crate::effect::ScreencopyCallback;
 use crate::effect::{ActivationCallback, EffectCtx};
 use crate::error::{Result, WaywiError};
 #[cfg(feature = "accessibility")]
@@ -31,6 +33,10 @@ pub(crate) struct LoopRuntime<M: Clone + 'static> {
     pub(crate) core: CoreEngine<M>,
     pub(crate) next_activation_req_id: u64,
     pub(crate) pending_activation_callbacks: HashMap<u64, ActivationCallback<M>>,
+    #[cfg(feature = "screencopy")]
+    pub(crate) next_screencopy_req_id: u64,
+    #[cfg(feature = "screencopy")]
+    pub(crate) pending_screencopy_callbacks: HashMap<u64, ScreencopyCallback<M>>,
     pub(crate) inbox: Rc<RefCell<LoopInbox<M>>>,
     pub(crate) sub_mgr: SubscriptionManager<M>,
     pub(crate) needs_view_sync: bool,
@@ -54,8 +60,9 @@ impl<M: Clone + 'static> LoopRuntime<M> {
         app_cfg: App,
         app_name: String,
     ) -> Result<Self> {
+        wl.dnd.set_loop_handle(loop_handle.clone());
         #[cfg(feature = "clipboard")]
-        wl.clipboard.set_wake_ping(ping_tx.clone());
+        wl.clipboard.set_loop_handle(loop_handle.clone());
         #[allow(unused_mut)]
         let mut capabilities = wl.capabilities();
 
@@ -94,6 +101,10 @@ impl<M: Clone + 'static> LoopRuntime<M> {
             core,
             next_activation_req_id: 1,
             pending_activation_callbacks: HashMap::new(),
+            #[cfg(feature = "screencopy")]
+            next_screencopy_req_id: 1,
+            #[cfg(feature = "screencopy")]
+            pending_screencopy_callbacks: HashMap::new(),
             inbox: Rc::new(RefCell::new(LoopInbox::default())),
             sub_mgr: SubscriptionManager::new(),
             needs_view_sync: true,
@@ -158,6 +169,59 @@ impl<M: Clone + 'static> LoopRuntime<M> {
         }
         for (surface_key, token) in post.surface_activations {
             if wl.activate_surface(surface_key, token) {
+                flush_wayland = true;
+            }
+        }
+        for (target, overlay_cursor, cb) in post.screencopy_requests {
+            #[cfg(feature = "screencopy")]
+            {
+                let req_id = self.next_screencopy_req_id;
+                self.next_screencopy_req_id = self.next_screencopy_req_id.wrapping_add(1).max(1);
+                match wl.start_screencopy(&self.qh, req_id, &target, overlay_cursor) {
+                    Ok(()) => {
+                        self.pending_screencopy_callbacks.insert(req_id, cb);
+                        flush_wayland = true;
+                    }
+                    Err(err) => {
+                        self.inbox.borrow_mut().messages.push_back(cb(Err(err)));
+                    }
+                }
+            }
+            #[cfg(not(feature = "screencopy"))]
+            {
+                let _ = (target, overlay_cursor);
+                self.inbox.borrow_mut().messages.push_back(cb(Err(
+                    WaywiError::UnsupportedCapability(Capability::Screencopy),
+                )));
+            }
+        }
+        #[cfg(feature = "foreign-toplevel")]
+        for action in post.toplevel_actions {
+            if wl.apply_foreign_toplevel_action(&action) {
+                flush_wayland = true;
+            }
+        }
+        #[cfg(feature = "ext-workspace")]
+        {
+            let mut ws_acted = false;
+            for action in post.ext_workspace_actions {
+                if wl.apply_ext_workspace_action(&action) {
+                    ws_acted = true;
+                }
+            }
+            if ws_acted {
+                wl.commit_ext_workspace();
+                flush_wayland = true;
+            }
+        }
+        #[cfg(feature = "virtual-keyboard")]
+        for action in post.virtual_keyboard_actions {
+            if wl.apply_virtual_keyboard_action(&self.qh, &action).is_ok() {
+                flush_wayland = true;
+            }
+        }
+        for drag in post.drag_starts {
+            if wl.start_drag(&self.qh, drag) {
                 flush_wayland = true;
             }
         }

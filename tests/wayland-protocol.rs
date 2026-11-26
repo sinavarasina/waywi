@@ -1,8 +1,11 @@
+mod common;
+
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::DummyClientData;
 use wayland_client::Connection;
 #[cfg(feature = "pointer-gestures")]
 use wayland_protocols::wp::pointer_gestures::zv1::server::{
@@ -24,10 +27,9 @@ use wayland_protocols::xdg::shell::server::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
-use wayland_server::backend::ClientData;
 use wayland_server::protocol::{
-    wl_buffer, wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface, wl_touch,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
+    wl_shm, wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
@@ -105,17 +107,6 @@ struct MockServerConfig {
     enable_ime: bool,
 }
 
-struct DummyClientData;
-impl ClientData for DummyClientData {
-    fn initialized(&self, _client_id: wayland_server::backend::ClientId) {}
-    fn disconnected(
-        &self,
-        _client_id: wayland_server::backend::ClientId,
-        _reason: wayland_server::backend::DisconnectReason,
-    ) {
-    }
-}
-
 struct MockCompositor {
     wl_surfaces_created: usize,
     last_wl_surface: Option<wl_surface::WlSurface>,
@@ -182,18 +173,16 @@ struct MockCompositor {
     ime_trace: Arc<Mutex<MockImeTrace>>,
 }
 
-impl GlobalDispatch<wl_compositor::WlCompositor, ()> for MockCompositor {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<wl_compositor::WlCompositor>,
-        _data: &(),
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        data_init.init(resource, ());
-    }
-}
+impl_simple_global!(MockCompositor, wl_compositor::WlCompositor);
+impl_simple_global!(MockCompositor, xdg_wm_base::XdgWmBase);
+impl_noop_dispatch!(MockCompositor, wl_callback::WlCallback);
+impl_noop_dispatch!(MockCompositor, wl_region::WlRegion);
+impl_noop_dispatch!(MockCompositor, wl_buffer::WlBuffer);
+impl_noop_dispatch!(MockCompositor, wl_output::WlOutput);
+impl_noop_dispatch!(MockCompositor, wl_pointer::WlPointer);
+impl_noop_dispatch!(MockCompositor, wl_keyboard::WlKeyboard);
+impl_noop_dispatch!(MockCompositor, wl_touch::WlTouch);
+impl_noop_dispatch!(MockCompositor, xdg_toplevel::XdgToplevel);
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for MockCompositor {
     fn request(
@@ -254,32 +243,6 @@ impl Dispatch<wl_surface::WlSurface, ()> for MockCompositor {
     }
 }
 
-impl Dispatch<wayland_server::protocol::wl_callback::WlCallback, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wayland_server::protocol::wl_callback::WlCallback,
-        _request: wayland_server::protocol::wl_callback::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_region::WlRegion, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wl_region::WlRegion,
-        _request: wl_region::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
 impl GlobalDispatch<wl_shm::WlShm, ()> for MockCompositor {
     fn bind(
         _state: &mut Self,
@@ -326,19 +289,6 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for MockCompositor {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wl_buffer::WlBuffer,
-        _request: wl_buffer::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
 impl GlobalDispatch<wl_output::WlOutput, ()> for MockCompositor {
     fn bind(
         _state: &mut Self,
@@ -375,19 +325,6 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for MockCompositor {
         if out.version() >= 2 {
             out.done();
         }
-    }
-}
-
-impl Dispatch<wl_output::WlOutput, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wl_output::WlOutput,
-        _request: wl_output::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
     }
 }
 
@@ -436,58 +373,6 @@ impl Dispatch<wl_seat::WlSeat, ()> for MockCompositor {
             }
             _ => {}
         }
-    }
-}
-
-impl Dispatch<wayland_server::protocol::wl_pointer::WlPointer, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wayland_server::protocol::wl_pointer::WlPointer,
-        _request: wayland_server::protocol::wl_pointer::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wayland_server::protocol::wl_keyboard::WlKeyboard, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wayland_server::protocol::wl_keyboard::WlKeyboard,
-        _request: wayland_server::protocol::wl_keyboard::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wayland_server::protocol::wl_touch::WlTouch,
-        _request: wayland_server::protocol::wl_touch::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-    }
-}
-
-impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for MockCompositor {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<xdg_wm_base::XdgWmBase>,
-        _data: &(),
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        data_init.init(resource, ());
     }
 }
 
@@ -623,19 +508,6 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for MockCompositor {
             }
             _ => {}
         }
-    }
-}
-
-impl Dispatch<xdg_toplevel::XdgToplevel, ()> for MockCompositor {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &xdg_toplevel::XdgToplevel,
-        _request: xdg_toplevel::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
     }
 }
 

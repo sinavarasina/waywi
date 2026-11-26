@@ -135,6 +135,10 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
                 .system_samplers
                 .reconcile(flat.iter().copied(), &mut rt.core.system);
             let had_kb_subs = !rt.sub_mgr.keyboard_layout_subs.is_empty();
+            #[cfg(feature = "foreign-toplevel")]
+            let had_ft_subs = !rt.sub_mgr.foreign_toplevel_subs.is_empty();
+            #[cfg(feature = "ext-workspace")]
+            let had_ws_subs = !rt.sub_mgr.ext_workspace_subs.is_empty();
             rt.sub_mgr.sync(
                 &flat,
                 &rt.loop_handle,
@@ -163,6 +167,30 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
                 fanout_event(
                     info,
                     &rt.sub_mgr.keyboard_layout_subs,
+                    &mut rt.inbox.borrow_mut().messages,
+                );
+            }
+            #[cfg(feature = "foreign-toplevel")]
+            if !had_ft_subs
+                && !rt.sub_mgr.foreign_toplevel_subs.is_empty()
+                && wl.foreign_toplevel.is_supported()
+            {
+                let snap = wl.foreign_toplevel.snapshot(&wl.output_handles);
+                fanout_event(
+                    snap,
+                    &rt.sub_mgr.foreign_toplevel_subs,
+                    &mut rt.inbox.borrow_mut().messages,
+                );
+            }
+            #[cfg(feature = "ext-workspace")]
+            if !had_ws_subs
+                && !rt.sub_mgr.ext_workspace_subs.is_empty()
+                && wl.ext_workspace.is_supported()
+            {
+                let snap = wl.ext_workspace.snapshot(&wl.output_handles);
+                fanout_event(
+                    snap,
+                    &rt.sub_mgr.ext_workspace_subs,
                     &mut rt.inbox.borrow_mut().messages,
                 );
             }
@@ -232,8 +260,15 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
     }
     for rk in &report.updated_surfaces {
         if let Some(surf) = rt.core.reconciler.surfaces.get(rk) {
-            wl.update_surface_spec(*rk, &surf.spec)?;
+            wl.update_surface_spec(&rt.qh, *rk, &surf.spec)?;
         }
+    }
+    if let Some(focus_rk) = wl.pointer_focus_surface
+        && let Some(&pos) = wl.last_pointer_pos.get(&focus_rk)
+        && let Some(surf) = rt.core.reconciler.surfaces.get(&focus_rk)
+    {
+        let shape = surf.cursor_at(pos);
+        wl.apply_cursor_shape(shape);
     }
     for (rk, surf) in &mut rt.core.reconciler.surfaces {
         if let Some(hv) = surf.hovered_node
@@ -352,6 +387,29 @@ pub(crate) fn present_dirty_surfaces<M: Clone + 'static>(
 
     assets.reclaim_assets(&reclaim_candidates);
 
+    // Arm VSync `wl_surface.frame` callbacks ONLY for surfaces with active retained transitions
+    // (or a single configured surface when `Animation::frames` is subscribed). Zero wakeups once
+    // settled or unsubscribed.
+    let mut any_frame_pending = wl
+        .surfaces
+        .values()
+        .any(|s| s.configured && s.frame_pending);
+    for (&rk, surf) in &rt.core.reconciler.surfaces {
+        if surf.has_active_transitions && wl.arm_frame_callback(&rt.qh, rk) {
+            any_frame_pending = true;
+        }
+    }
+    if !rt.sub_mgr.animation_frame_subs.is_empty() && !any_frame_pending {
+        let first_configured = wl
+            .surfaces
+            .iter()
+            .find(|(_, s)| s.configured && !s.frame_pending)
+            .map(|(&rk, _)| rk);
+        if let Some(rk) = first_configured {
+            wl.arm_frame_callback(&rt.qh, rk);
+        }
+    }
+
     Ok(())
 }
 
@@ -378,6 +436,9 @@ pub(crate) fn shutdown_surfaces<M: Clone + 'static>(
     for rk in order_keys_children_first(wl, &active_keys) {
         teardown_surface(rt, wl, rk, true);
     }
+    wl.dnd.cleanup();
+    #[cfg(feature = "clipboard")]
+    wl.clipboard.cleanup();
     rt.sub_mgr.cleanup(&rt.loop_handle);
     rt.core.system.stop_idle_workers();
     let _ = conn.flush();

@@ -24,12 +24,11 @@ impl SeatHandler for WaylandState {
     }
 
     fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.dnd.add_seat(&seat, qh);
         #[cfg(feature = "ime")]
         self.ime.add_seat(&seat, qh);
         #[cfg(feature = "tablet")]
         self.tablet.add_seat(&seat, qh);
-        #[cfg(not(any(feature = "ime", feature = "tablet")))]
-        let _ = (qh, seat);
     }
 
     fn new_capability(
@@ -50,6 +49,10 @@ impl SeatHandler for WaylandState {
                 if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
                     #[cfg(feature = "pointer-gestures")]
                     self.pointer_gestures.add_pointer(&ptr, qh);
+                    #[cfg(feature = "cursor-shape")]
+                    self.cursor_shape.add_pointer(&ptr, qh);
+                    #[cfg(feature = "pointer-constraints")]
+                    self.pointer_constraints.add_pointer(&ptr, qh);
                     self.pointers.push(ptr);
                     self.has_pointer = true;
                 }
@@ -81,10 +84,17 @@ impl SeatHandler for WaylandState {
             SeatCapability::Pointer => {
                 #[cfg(feature = "pointer-gestures")]
                 self.pointer_gestures.clear_all_pointers();
+                #[cfg(feature = "cursor-shape")]
+                self.cursor_shape.clear_all_pointers();
+                #[cfg(feature = "pointer-constraints")]
+                self.pointer_constraints.clear_all_pointers();
                 for ptr in self.pointers.drain(..) {
                     ptr.release();
                 }
                 self.has_pointer = false;
+                self.pointer_focus_surface = None;
+                self.last_pointer_enter = None;
+                self.last_applied_cursor = None;
             }
             SeatCapability::Touch => {
                 for t in self.touches.drain(..) {
@@ -97,12 +107,13 @@ impl SeatHandler for WaylandState {
     }
 
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.dnd.remove_seat(&seat);
         #[cfg(feature = "ime")]
         self.ime.remove_seat(&seat);
         #[cfg(feature = "tablet")]
         self.tablet.remove_seat(&seat);
-        #[cfg(not(any(feature = "ime", feature = "tablet")))]
-        let _ = seat;
+        #[cfg(feature = "virtual-keyboard")]
+        self.virtual_keyboard.remove_seat(&seat);
     }
 }
 
@@ -111,17 +122,32 @@ impl PointerHandler for WaylandState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[SctkPointerEvent],
     ) {
         for ev in events {
             let Some(&key) = self.surface_by_obj.get(&ev.surface.id()) else {
                 continue;
             };
-            if let PointerEventKind::Press { serial, .. } = ev.kind
-                && let Some(seat) = self.seat_state.seats().next()
-            {
-                self.last_input_serial = Some((seat, serial, ev.surface.clone()));
+            match ev.kind {
+                PointerEventKind::Enter { serial } => {
+                    self.pointer_focus_surface = Some(key);
+                    self.last_pointer_enter = Some((pointer.clone(), serial));
+                    self.last_applied_cursor = None;
+                }
+                PointerEventKind::Leave { .. } => {
+                    if self.pointer_focus_surface == Some(key) {
+                        self.pointer_focus_surface = None;
+                        self.last_pointer_enter = None;
+                        self.last_applied_cursor = None;
+                    }
+                }
+                PointerEventKind::Press { serial, .. } => {
+                    if let Some(seat) = self.seat_state.seats().next() {
+                        self.last_input_serial = Some((seat, serial, ev.surface.clone()));
+                    }
+                }
+                _ => {}
             }
             match map_pointer_event(ev) {
                 MappedPointerAction::Enter { x, y } => {

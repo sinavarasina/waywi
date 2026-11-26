@@ -1,3 +1,5 @@
+pub mod cursor;
+pub mod dnd;
 pub mod events;
 pub(crate) mod hit_test;
 pub mod ime;
@@ -8,13 +10,16 @@ pub mod scroll;
 pub mod tablet;
 pub mod text_input;
 
+pub use cursor::{CursorShape, PointerConstraintMode, RelativePointerEvent, VirtualKeyState};
+pub use dnd::{DndAction, DndEvent};
 pub(crate) use events::EventHandlers;
 pub use events::{
     GestureEvent, GestureKind, GesturePhase, MouseButton, PointerEvent, ScrollEvent, ScrollSource,
     TouchEvent, TouchPhase,
 };
 pub(crate) use hit_test::{
-    HitTestNode, hit_test, hit_test_gesture, hit_test_scroll, hit_test_tablet, hit_test_touch,
+    HitTestNode, hit_test, hit_test_cursor, hit_test_gesture, hit_test_pointer_and_cursor,
+    hit_test_scroll, hit_test_tablet, hit_test_touch,
 };
 pub use ime::{
     ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit, ImeSurroundingText,

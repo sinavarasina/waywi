@@ -11,7 +11,7 @@ use crate::render::{RenderBackend, RetainedNode, collect_draw_and_hit};
 use crate::surface::{BufferRetention, InputMode, SurfaceKind, Surfaces};
 use crate::text::SharedStr;
 
-use super::animation::{tick_node_animations, update_asset_rev_in_tree};
+use super::animation::{NodeTickCtx, tick_node_animations, update_asset_rev_in_tree};
 use super::layout::{
     MeasureCtx, compute_selective_input_rects, resolve_surface_size_with_children,
 };
@@ -215,7 +215,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                 .get(&rk)
                 .copied()
                 .map(|cfg| match surf.kind {
-                    SurfaceKind::Window | SurfaceKind::Popup => cfg,
+                    SurfaceKind::Window | SurfaceKind::Popup | SurfaceKind::SessionLock => cfg,
                     SurfaceKind::Panel | SurfaceKind::Floating | SurfaceKind::Overlay => {
                         LogicalSize::new(
                             if matches!(surf.size.width, Length::Fill) {
@@ -266,6 +266,12 @@ impl<M: Clone + 'static> Reconciler<M> {
             background: surf.background,
             title,
             namespace,
+            cursor: surf.cursor,
+            decoration: surf.decoration,
+            inhibit_idle: surf.inhibit_idle,
+            pointer_constraint: surf.pointer_constraint,
+            accepts_dnd: surf.on_dnd.is_some(),
+            dnd_mime_types: surf.dnd_mime_types,
             a11y: surf.a11y,
             ime: surf.ime,
         };
@@ -294,6 +300,11 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.logical_size != spec.logical_size
                 || prev.spec.buffer_retention != spec.buffer_retention
                 || prev.spec.popup != spec.popup
+                || prev.spec.decoration != spec.decoration
+                || prev.spec.inhibit_idle != spec.inhibit_idle
+                || prev.spec.pointer_constraint != spec.pointer_constraint
+                || prev.spec.accepts_dnd != spec.accepts_dnd
+                || prev.spec.dnd_mime_types != spec.dnd_mime_types
                 || prev.spec.ime != spec.ime
                 || prev.scale != scale;
             full_redraw = prev.full_redraw
@@ -311,6 +322,7 @@ impl<M: Clone + 'static> Reconciler<M> {
         }
 
         let mut anim_deadline: Option<Instant> = None;
+        let mut has_active_transitions = false;
         let mut tree_pass = super::tree::TreePass {
             renderer: pass.renderer,
             assets: pass.assets,
@@ -322,6 +334,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             skipped_memo: &mut pass.report.skipped_memo_elements,
             retired_ids: &mut pass.report.retired_node_ids,
             anim_deadline: &mut anim_deadline,
+            has_active_transitions: &mut has_active_transitions,
         };
         let new_roots = self.reconcile_children_positioned(
             surf.children,
@@ -342,7 +355,7 @@ impl<M: Clone + 'static> Reconciler<M> {
 
         let mut commands = Vec::new();
         let mut hit_nodes = Vec::new();
-        collect_draw_and_hit(&new_roots, &mut commands, &mut hit_nodes);
+        let has_custom_cursors = collect_draw_and_hit(&new_roots, &mut commands, &mut hit_nodes);
 
         let selective_input_rects = if spec.input_mode == InputMode::Selective {
             compute_selective_input_rects(&hit_nodes)
@@ -364,12 +377,15 @@ impl<M: Clone + 'static> Reconciler<M> {
             roots: new_roots,
             commands,
             hit_nodes,
+            has_custom_cursors,
             hovered_node,
             on_close: surf.on_close,
             on_key: surf.on_key,
             on_ime: surf.on_ime,
             on_pointer_move: surf.on_pointer_move,
             on_pointer_up: surf.on_pointer_up,
+            on_relative_pointer: surf.on_relative_pointer,
+            on_dnd: surf.on_dnd,
             on_touch: surf.on_touch,
             on_gesture: surf.on_gesture,
             on_tablet: surf.on_tablet,
@@ -381,6 +397,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             input_region_dirty,
             selective_input_rects,
             next_animation_deadline: anim_deadline,
+            has_active_transitions,
         };
 
         self.surfaces.insert(rk, retained);
@@ -407,11 +424,21 @@ impl<M: Clone + 'static> Reconciler<M> {
             .min()
     }
 
-    /// Advances active keyed sprite animations up to `now`, marking only changed sprite regions
-    /// dirty without re-running `view(state)`, and returning any one-shot `on_animation_end`
-    /// messages emitted on completion.
+    /// Advances active keyed sprite animations and retained element transitions up to `now` across
+    /// all retained surfaces.
     pub(crate) fn tick_animations(
         &mut self,
+        now: Instant,
+    ) -> (Vec<RetainedSurfaceKey>, Option<Instant>, Vec<M>) {
+        self.tick_animations_for(None, now)
+    }
+
+    /// Advances active keyed sprite animations and retained element transitions up to `now`,
+    /// optionally scoped to a single surface (e.g. its own `wl_surface.frame` VSync callback) so
+    /// mixed-refresh multi-monitor surfaces never trigger redundant work on sibling outputs.
+    pub(crate) fn tick_animations_for(
+        &mut self,
+        surface_filter: Option<RetainedSurfaceKey>,
         now: Instant,
     ) -> (Vec<RetainedSurfaceKey>, Option<Instant>, Vec<M>) {
         let mut dirty_surfaces = Vec::new();
@@ -419,30 +446,63 @@ impl<M: Clone + 'static> Reconciler<M> {
         let mut emitted_messages = Vec::new();
 
         for (&rk, surface) in &mut self.surfaces {
-            if surface.next_animation_deadline.is_none() {
+            if let Some(target) = surface_filter
+                && rk != target
+            {
+                if let Some(dl) = surface.next_animation_deadline {
+                    next_deadline = Some(next_deadline.map_or(dl, |p| p.min(dl)));
+                }
+                continue;
+            }
+            if surface.next_animation_deadline.is_none() && !surface.has_active_transitions {
                 continue;
             }
             let mut changed_frames: Vec<(NodeId, SourceRect)> = Vec::new();
             let mut surf_deadline: Option<Instant> = None;
             let mut surf_dirty_rects = Vec::new();
+            let mut transitions_changed = false;
+            let mut still_active_transitions = false;
 
-            for node in &mut surface.roots {
-                tick_node_animations(
-                    node,
+            {
+                let mut tick_ctx = NodeTickCtx {
                     now,
-                    &mut changed_frames,
-                    &mut surf_dirty_rects,
-                    &mut surf_deadline,
-                    &mut emitted_messages,
-                );
+                    changed_frames: &mut changed_frames,
+                    dirty_rects: &mut surf_dirty_rects,
+                    next_deadline: &mut surf_deadline,
+                    emitted_messages: &mut emitted_messages,
+                    transitions_changed: &mut transitions_changed,
+                    has_active_transitions: &mut still_active_transitions,
+                };
+                for node in &mut surface.roots {
+                    tick_node_animations(node, Affine2D::IDENTITY, false, None, &mut tick_ctx);
+                }
             }
 
             surface.next_animation_deadline = surf_deadline;
+            surface.has_active_transitions = still_active_transitions;
             if let Some(dl) = surf_deadline {
                 next_deadline = Some(next_deadline.map_or(dl, |p| p.min(dl)));
             }
 
-            if !changed_frames.is_empty() {
+            if transitions_changed {
+                surface.commands.clear();
+                surface.hit_nodes.clear();
+                surface.has_custom_cursors = collect_draw_and_hit(
+                    &surface.roots,
+                    &mut surface.commands,
+                    &mut surface.hit_nodes,
+                );
+                if surface.spec.input_mode == InputMode::Selective {
+                    let next_rects = compute_selective_input_rects(&surface.hit_nodes);
+                    if next_rects != surface.selective_input_rects {
+                        surface.selective_input_rects = next_rects;
+                        surface.input_region_dirty = true;
+                    }
+                }
+                surface.dirty_logical_rects.extend(surf_dirty_rects);
+                surface.needs_redraw = true;
+                dirty_surfaces.push(rk);
+            } else if !changed_frames.is_empty() {
                 for cmd in &mut surface.commands {
                     if let PaintPayload::Image {
                         ref mut source_rect,
@@ -469,7 +529,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             if update_asset_rev_in_tree(&mut surface.roots, asset_id, new_rev) {
                 surface.commands.clear();
                 surface.hit_nodes.clear();
-                collect_draw_and_hit(
+                surface.has_custom_cursors = collect_draw_and_hit(
                     &surface.roots,
                     &mut surface.commands,
                     &mut surface.hit_nodes,

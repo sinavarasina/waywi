@@ -2,6 +2,9 @@
 //! subscription, and runtime types.
 
 pub use crate::accessibility::AccessibleRole;
+pub use crate::animation::{
+    Animated, Animation, Easing, Lerp, Spring, SpringConfig, TransitionSpec, Tween,
+};
 pub use crate::app::{App, Application, HeadlessRuntime, MemoryConfig};
 pub use crate::capabilities::{Capabilities, Capability};
 #[cfg(feature = "clipboard")]
@@ -25,13 +28,14 @@ pub use crate::image::{
     AssetId, AssetRetention, Image, ImageAsset, ImageFilter, ImageFit, SourceRect,
 };
 pub use crate::input::{
-    ElementKey, GestureEvent, GestureKind, GesturePhase, ImeConfig, ImeContentHint,
-    ImeContentPurpose, ImeEvent, ImePreedit, ImeSurroundingText, IntoElementKey, Key, KeyChord,
-    KeyEvent, KeyboardLayout, KeyboardLayoutInfo, Modifiers, MouseButton, PointerEvent,
-    ScrollEvent, ScrollSource, ScrollState, TabletEvent, TabletId, TabletPadAxisSource,
-    TabletPadEvent, TabletPadEventKind, TabletPadId, TabletToolAxes, TabletToolEvent,
-    TabletToolEventKind, TabletToolId, TabletToolType, TextInputOutcome, TextInputState,
-    TouchEvent, TouchPhase,
+    CursorShape, DndAction, DndEvent, ElementKey, GestureEvent, GestureKind, GesturePhase,
+    ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit, ImeSurroundingText,
+    IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout, KeyboardLayoutInfo, Modifiers,
+    MouseButton, PointerConstraintMode, PointerEvent, RelativePointerEvent, ScrollEvent,
+    ScrollSource, ScrollState, TabletEvent, TabletId, TabletPadAxisSource, TabletPadEvent,
+    TabletPadEventKind, TabletPadId, TabletToolAxes, TabletToolEvent, TabletToolEventKind,
+    TabletToolId, TabletToolType, TextInputOutcome, TextInputState, TouchEvent, TouchPhase,
+    VirtualKeyState,
 };
 pub use crate::render::{
     Align, Border, Canvas, Clip, Color, Column, CornerRadius, Element, Group, Painter, PathBuilder,
@@ -42,7 +46,7 @@ pub use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionKey
 pub use crate::surface::{
     Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, PopupAnchor,
     PopupConstraintAdjustment, PopupGravity, PopupPositioner, Surface, SurfaceKey, SurfaceKind,
-    Surfaces,
+    Surfaces, WindowDecoration,
 };
 pub use crate::system::{
     BacklightDevice, BatteryInfo, BatterySnapshot, BrightnessSnapshot, ByteSize, CalendarDayCell,
@@ -56,6 +60,12 @@ pub use crate::text::{
     TextLayoutOptions,
 };
 pub use crate::timer::Timer;
+pub use crate::wayland_ext::{
+    ExtWorkspace, ExtWorkspaceCapabilities, ExtWorkspaceGroupId, ExtWorkspaceGroupInfo,
+    ExtWorkspaceId, ExtWorkspaceInfo, ExtWorkspaceSnapshot, ExtWorkspaceState, ForeignToplevel,
+    ForeignToplevelId, ForeignToplevelInfo, ForeignToplevelSnapshot, ForeignToplevelState,
+    ScreencopyFrame, ScreencopyTarget, SessionLock, SessionLockEvent,
+};
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use crate::audio::{

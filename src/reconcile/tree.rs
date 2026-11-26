@@ -7,7 +7,7 @@ use crate::geometry::{Affine2D, Bounds, Edges, LogicalPx, LogicalSize, ScaleFact
 use crate::input::{ElementKey, NodeId};
 use crate::render::{Align, Element, ElementKind, RenderBackend, RetainedNode};
 
-use super::animation::collect_subtree_deadlines;
+use super::animation::collect_subtree_animation_state;
 use super::diff::Reconciler;
 use super::layout::{LayoutFlow, element_kind_tag};
 
@@ -58,6 +58,7 @@ pub(super) struct TreePass<'a, R: RenderBackend> {
     pub(super) skipped_memo: &'a mut usize,
     pub(super) retired_ids: &'a mut Vec<NodeId>,
     pub(super) anim_deadline: &'a mut Option<std::time::Instant>,
+    pub(super) has_active_transitions: &'a mut bool,
 }
 
 impl<M: Clone + 'static> Reconciler<M> {
@@ -101,7 +102,11 @@ impl<M: Clone + 'static> Reconciler<M> {
                     && let Some(retained) = prev_slots[idx].take()
                 {
                     *pass.skipped_memo += 1;
-                    collect_subtree_deadlines(&retained, pass.anim_deadline);
+                    collect_subtree_animation_state(
+                        &retained,
+                        pass.anim_deadline,
+                        pass.has_active_transitions,
+                    );
                     if let LayoutFlow::Row = flow.flow {
                         cursor_main = cursor_main + retained.bounds.width + flow.gap;
                     } else if let LayoutFlow::Column = flow.flow {

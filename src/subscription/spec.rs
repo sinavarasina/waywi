@@ -24,6 +24,10 @@ pub(crate) enum SubscriptionSpec<M> {
         interval: Duration,
         msg: M,
     },
+    AnimationFrame {
+        key: SubscriptionKey,
+        map: FrameSharedFn<std::time::Instant, M>,
+    },
     SystemCpu {
         key: SubscriptionKey,
         interval: Duration,
@@ -81,6 +85,15 @@ pub(crate) enum SubscriptionSpec<M> {
     },
     KeyboardLayout {
         map: FrameSharedFn<crate::input::KeyboardLayoutInfo, M>,
+    },
+    SessionLock {
+        map: FrameSharedFn<crate::wayland_ext::SessionLockEvent, M>,
+    },
+    ForeignToplevel {
+        map: FrameSharedFn<crate::wayland_ext::ForeignToplevelSnapshot, M>,
+    },
+    ExtWorkspace {
+        map: FrameSharedFn<crate::wayland_ext::ExtWorkspaceSnapshot, M>,
     },
     #[cfg(feature = "idle-notify")]
     IdleNotify {
@@ -348,6 +361,7 @@ impl<M: 'static> Subscription<M> {
         }
 
         let spec = map_specs! {
+            AnimationFrame { key },
             SystemCpu { key, interval },
             SystemMemory { key, interval },
             SystemTime { key, interval },
@@ -360,6 +374,9 @@ impl<M: 'static> Subscription<M> {
             SystemBrightness { key, interval },
             SystemPrivacy { key, interval },
             KeyboardLayout {},
+            SessionLock {},
+            ForeignToplevel {},
+            ExtWorkspace {},
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
             AudioSnapshot {},
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]

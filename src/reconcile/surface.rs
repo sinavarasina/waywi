@@ -5,14 +5,17 @@ use crate::arena::FrameSharedFn;
 use crate::display::OutputId;
 use crate::geometry::{Bounds, BufferRect, Edges, LogicalPx, LogicalSize, Point, ScaleFactor};
 use crate::input::{
-    GestureEvent, HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, NodeId,
-    PointerEvent, ScrollEvent, TabletEvent, TabletToolEventKind, TabletToolId, TouchEvent,
-    TouchPhase, hit_test, hit_test_gesture, hit_test_scroll, hit_test_tablet, hit_test_touch,
+    CursorShape, DndEvent, GestureEvent, HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers,
+    MouseButton, NodeId, PointerConstraintMode, PointerEvent, RelativePointerEvent, ScrollEvent,
+    TabletEvent, TabletToolEventKind, TabletToolId, TouchEvent, TouchPhase, hit_test,
+    hit_test_cursor, hit_test_gesture, hit_test_pointer_and_cursor, hit_test_scroll,
+    hit_test_tablet, hit_test_touch,
 };
 use crate::render::{Color, DrawCommand, RetainedNode};
 use crate::surface::types::PopupSpec;
 use crate::surface::{
     Anchor, BufferRetention, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind,
+    WindowDecoration,
 };
 use crate::text::SharedStr;
 
@@ -40,6 +43,12 @@ pub(crate) struct SurfaceSpec {
     pub(crate) background: Color,
     pub(crate) title: SharedStr,
     pub(crate) namespace: SharedStr,
+    pub(crate) cursor: CursorShape,
+    pub(crate) decoration: WindowDecoration,
+    pub(crate) inhibit_idle: bool,
+    pub(crate) pointer_constraint: PointerConstraintMode,
+    pub(crate) accepts_dnd: bool,
+    pub(crate) dnd_mime_types: Vec<String>,
     pub(crate) a11y: AccessibleProps,
     pub(crate) ime: ImeConfig,
 }
@@ -51,12 +60,15 @@ pub(crate) struct RetainedSurface<M> {
     pub(crate) roots: Vec<RetainedNode<M>>,
     pub(crate) commands: Vec<DrawCommand>,
     pub(crate) hit_nodes: Vec<HitTestNode<M>>,
+    pub(crate) has_custom_cursors: bool,
     pub(crate) hovered_node: Option<NodeId>,
     pub(crate) on_close: Option<M>,
     pub(crate) on_key: Option<FrameSharedFn<KeyEvent, Option<M>>>,
     pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
+    pub(crate) on_relative_pointer: Option<FrameSharedFn<RelativePointerEvent, Option<M>>>,
+    pub(crate) on_dnd: Option<FrameSharedFn<DndEvent, Option<M>>>,
     pub(crate) on_touch: Option<FrameSharedFn<TouchEvent, Option<M>>>,
     pub(crate) on_gesture: Option<FrameSharedFn<GestureEvent, Option<M>>>,
     pub(crate) on_tablet: Option<FrameSharedFn<TabletEvent, Option<M>>>,
@@ -70,11 +82,24 @@ pub(crate) struct RetainedSurface<M> {
     pub(crate) input_region_dirty: bool,
     pub(crate) selective_input_rects: Vec<Bounds>,
     pub(crate) next_animation_deadline: Option<Instant>,
+    pub(crate) has_active_transitions: bool,
 }
 
 impl<M: 'static> RetainedSurface<M> {
     pub(crate) fn effective_logical_size(&self) -> LogicalSize {
         self.spec.logical_size
+    }
+
+    /// Resolves the effective [`CursorShape`] at surface-local `pos`, checking the topmost
+    /// visible element with `.cursor(...)` before falling back to the surface cursor.
+    ///
+    /// Runs in $O(1)$ when no retained element on this surface declares a custom cursor.
+    #[must_use]
+    pub(crate) fn cursor_at(&self, pos: Point) -> CursorShape {
+        if !self.has_custom_cursors {
+            return self.spec.cursor;
+        }
+        hit_test_cursor(&self.hit_nodes, pos).unwrap_or(self.spec.cursor)
     }
 
     /// Dispatches a logical click/tap at `pos` against hit-tested nodes cleanly.
@@ -321,7 +346,8 @@ impl<M: 'static> RetainedSurface<M> {
         }
     }
 
-    /// Updates hover state at `pos` and optionally evaluates node/surface `on_pointer_move`.
+    /// Updates hover state at `pos`, resolves the active cursor shape in the same hit-test pass,
+    /// and optionally evaluates node/surface `on_pointer_move`.
     pub(crate) fn dispatch_pointer_move_at(
         &mut self,
         pos: Point,
@@ -331,7 +357,12 @@ impl<M: 'static> RetainedSurface<M> {
     where
         M: Clone,
     {
-        let hit = hit_test(&self.hit_nodes, pos);
+        let (hit, cursor_override) = if self.has_custom_cursors {
+            hit_test_pointer_and_cursor(&self.hit_nodes, pos)
+        } else {
+            (hit_test(&self.hit_nodes, pos), None)
+        };
+        let cursor = cursor_override.unwrap_or(self.spec.cursor);
         let hovered_id = hit.map(|(n, _)| n.node_id);
         let on_node_move = if emit_move {
             hit.and_then(|(node, local)| {
@@ -364,6 +395,7 @@ impl<M: 'static> RetainedSurface<M> {
             hover,
             on_node_move,
             on_surface_move,
+            cursor,
         }
     }
 
@@ -477,6 +509,7 @@ pub(crate) struct PointerMoveDispatch<M> {
     pub(crate) hover: Option<HoverTransition<M>>,
     pub(crate) on_node_move: Option<M>,
     pub(crate) on_surface_move: Option<M>,
+    pub(crate) cursor: CursorShape,
 }
 
 /// Output of touchscreen contact dispatch on a [`RetainedSurface`].

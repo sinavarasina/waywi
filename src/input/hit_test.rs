@@ -1,5 +1,6 @@
 use crate::geometry::{Affine2D, Bounds, Point};
 
+use super::cursor::CursorShape;
 use super::events::EventHandlers;
 use super::keys::NodeId;
 
@@ -18,6 +19,7 @@ pub(crate) struct HitTestNode<M> {
     pub(crate) paint_order: usize,
     pub(crate) visible: bool,
     pub(crate) input_enabled: bool,
+    pub(crate) cursor: Option<CursorShape>,
     pub(crate) handlers: EventHandlers<M>,
 }
 
@@ -95,13 +97,55 @@ where
     best.map(|(_, node, local)| (node, local))
 }
 
-/// Hit-tests surface-local `point` against retained nodes, returning the topmost hit node and
-/// element-local coordinates.
+/// Hit-tests surface-local `point` against retained interactive nodes, returning the topmost hit
+/// node and element-local coordinates.
 pub(crate) fn hit_test<M: 'static>(
     nodes: &[HitTestNode<M>],
     point: Point,
 ) -> Option<(&HitTestNode<M>, Point)> {
-    hit_test_where(nodes, point, |_| true)
+    hit_test_where(nodes, point, |n| n.handlers.has_pointer_handlers())
+}
+
+/// Hit-tests surface-local `point` against retained nodes that declare an explicit [`CursorShape`],
+/// returning the topmost matching cursor shape.
+pub(crate) fn hit_test_cursor<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<CursorShape> {
+    hit_test_where(nodes, point, |n| n.cursor.is_some()).and_then(|(n, _)| n.cursor)
+}
+
+/// Single-pass hit-test returning both the topmost interactive pointer node (and local coords)
+/// and the topmost explicit [`CursorShape`] at `point`, avoiding scanning `hit_nodes` twice per
+/// pointer motion event.
+pub(crate) fn hit_test_pointer_and_cursor<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> (Option<(&HitTestNode<M>, Point)>, Option<CursorShape>) {
+    let mut best_ptr: Option<((i32, usize), &HitTestNode<M>, Point)> = None;
+    let mut best_cur: Option<((i32, usize), CursorShape)> = None;
+    for node in nodes {
+        let wants_ptr = node.handlers.has_pointer_handlers();
+        let cursor = node.cursor;
+        if !wants_ptr && cursor.is_none() {
+            continue;
+        }
+        if let Some(local) = node.contains_surface_point(point) {
+            let rank = (node.z_index, node.paint_order);
+            if wants_ptr && best_ptr.is_none_or(|(best_rank, _, _)| rank > best_rank) {
+                best_ptr = Some((rank, node, local));
+            }
+            if let Some(shape) = cursor
+                && best_cur.is_none_or(|(best_rank, _)| rank > best_rank)
+            {
+                best_cur = Some((rank, shape));
+            }
+        }
+    }
+    (
+        best_ptr.map(|(_, node, local)| (node, local)),
+        best_cur.map(|(_, shape)| shape),
+    )
 }
 
 /// Hit-tests surface-local `point` against retained nodes that bind `on_scroll`.

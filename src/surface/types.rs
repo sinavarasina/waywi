@@ -97,6 +97,22 @@ pub enum SurfaceKind {
     /// Compositor-positioned XDG popup (`xdg_popup` + `xdg_positioner`) attached to a parent
     /// layer-shell (`zwlr_layer_surface_v1.get_popup`), toplevel window, or parent popup.
     Popup,
+    /// Native Wayland session lockscreen surface (`ext_session_lock_v1`) covering an output.
+    SessionLock,
+}
+
+/// Window decoration policy negotiated via `zxdg_decoration_manager_v1` for [`Surface::window`](super::Surface::window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WindowDecoration {
+    /// Request server-side window decorations (titlebar & borders drawn by compositor).
+    #[default]
+    Server,
+    /// Let the compositor choose its default decoration mode (`ServerDefault`).
+    Auto,
+    /// Request client-side window decorations (application draws its own titlebar/chrome).
+    Client,
+    /// Do not attach a `zxdg_toplevel_decoration_v1` object; render borderless/client-only.
+    None,
 }
 
 /// Anchor point on the parent surface's anchor rectangle (`xdg_positioner.set_anchor`).

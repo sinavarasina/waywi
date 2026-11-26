@@ -72,6 +72,30 @@ pub enum Capability {
     PointerGestures,
     /// Wayland `zwp_tablet_manager_v2` graphics tablet / stylus / pad support (`tablet` feature + compositor support).
     TabletInput,
+    /// Wayland `wp_cursor_shape_v1` server-side cursor shapes (`cursor-shape` feature + compositor support).
+    CursorShape,
+    /// Wayland `ext_session_lock_v1` native session lockscreen protocol (`session-lock` feature + compositor support).
+    SessionLock,
+    /// Wayland screen/output pixel capture (`ext_image_copy_capture_v1` or `zwlr_screencopy_manager_v1`, `screencopy` feature).
+    Screencopy,
+    /// Wayland foreign toplevel window listing (`zwlr_foreign_toplevel_management_v1` or `ext_foreign_toplevel_list_v1`, `foreign-toplevel` feature).
+    ForeignToplevel,
+    /// Wayland foreign toplevel window control actions (`zwlr_foreign_toplevel_management_v1`, `foreign-toplevel` feature).
+    ForeignToplevelControl,
+    /// Wayland `ext_workspace_v1` cross-compositor workspace protocol (`ext-workspace` feature + compositor support).
+    ExtWorkspace,
+    /// Core Wayland `wl_data_device_manager` Drag & Drop support.
+    DragAndDrop,
+    /// Wayland `zxdg_decoration_manager_v1` server/client window decoration negotiation.
+    XdgDecoration,
+    /// Wayland `zwp_idle_inhibit_manager_v1` per-surface idle inhibition (`idle-inhibit` feature + compositor support).
+    IdleInhibit,
+    /// Wayland `zwp_virtual_keyboard_v1` virtual keyboard input injection (`virtual-keyboard` feature + compositor support).
+    VirtualKeyboard,
+    /// Wayland `zwp_pointer_constraints_v1` pointer lock and confinement (`pointer-constraints` feature + compositor support).
+    PointerConstraints,
+    /// Wayland `zwp_relative_pointer_v1` unaccelerated relative pointer deltas (`pointer-constraints` feature + compositor support).
+    RelativePointer,
 }
 
 /// Snapshot of runtime and compile-time capabilities exposed by [`App`](crate::app::App) and
@@ -148,7 +172,7 @@ impl Capabilities {
     /// Updates Wayland protocol and seat capabilities from a live [`Capabilities`] snapshot
     /// without clobbering runtime-probed IPC, GPU, audio, or accessibility flags.
     pub(crate) fn refresh_wayland_from(&mut self, wl_caps: &Self) {
-        const WAYLAND_CAPS: [Capability; 15] = [
+        const WAYLAND_CAPS: [Capability; 27] = [
             Capability::Wayland,
             Capability::LayerShell,
             Capability::XdgShell,
@@ -164,6 +188,18 @@ impl Capabilities {
             Capability::IdleNotify,
             Capability::Clipboard,
             Capability::TextInput,
+            Capability::CursorShape,
+            Capability::SessionLock,
+            Capability::Screencopy,
+            Capability::ForeignToplevel,
+            Capability::ForeignToplevelControl,
+            Capability::ExtWorkspace,
+            Capability::DragAndDrop,
+            Capability::XdgDecoration,
+            Capability::IdleInhibit,
+            Capability::VirtualKeyboard,
+            Capability::PointerConstraints,
+            Capability::RelativePointer,
         ];
         for cap in WAYLAND_CAPS {
             self.set(cap, wl_caps.has(cap));

@@ -1,4 +1,7 @@
-use crate::geometry::{Affine2D, Bounds, Length, LogicalPx, LogicalSize, Position};
+use crate::animation::{
+    RetainedScalarTransition, RetainedTransformTransition, RetainedTransitions,
+};
+use crate::geometry::{Affine2D, Bounds, Length, LogicalPx, LogicalSize, Position, Transform};
 use crate::input::EventHandlers;
 use crate::render::{
     Align, CanvasDrawHandle, Element, ElementKind, RenderBackend, RetainedNode, RetainedVisual,
@@ -54,15 +57,14 @@ fn resolve_auto_position(
     }
 }
 
-fn resolve_node_geometry<M: 'static, R: RenderBackend>(
+fn compute_node_bounds_and_transform<M: 'static, R: RenderBackend>(
     el: &Element<M>,
     parent_rect: Bounds,
-    parent_affine: Affine2D,
     surface_size: LogicalSize,
     flow: FlowLayout,
     cursor_main: &mut LogicalPx,
     pass: &mut TreePass<'_, R>,
-) -> (Bounds, Affine2D, Bounds) {
+) -> (Bounds, Transform) {
     let common = el.common().expect("non-memo element has common props");
     let intrinsic = if matches!(common.size.width, Length::Auto)
         || matches!(common.size.height, Length::Auto)
@@ -139,6 +141,15 @@ fn resolve_node_geometry<M: 'static, R: RenderBackend>(
         }
         _ => {}
     }
+    (bounds, local_transform)
+}
+
+#[inline]
+pub(crate) fn compose_node_affine(
+    bounds: Bounds,
+    local_transform: Transform,
+    parent_affine: Affine2D,
+) -> (Affine2D, Affine2D, Bounds) {
     let local_affine = if local_transform.is_identity() {
         Affine2D::IDENTITY
     } else {
@@ -146,7 +157,7 @@ fn resolve_node_geometry<M: 'static, R: RenderBackend>(
     };
     let affine = local_affine.then(&parent_affine);
     let world_bounds = affine.transform_rect(bounds);
-    (bounds, affine, world_bounds)
+    (local_affine, affine, world_bounds)
 }
 
 fn resolve_sprite_timeline<R: RenderBackend>(
@@ -244,10 +255,9 @@ impl<M: Clone + 'static> Reconciler<M> {
         pass: &mut TreePass<'_, R>,
     ) -> RetainedNode<M> {
         let kind_tag = element_kind_tag(&el);
-        let (bounds, affine, world_bounds) = resolve_node_geometry(
+        let (bounds, target_transform) = compute_node_bounds_and_transform(
             &el,
             parent.rect,
-            parent.affine,
             pass.surface_size,
             flow,
             cursor_main,
@@ -258,11 +268,14 @@ impl<M: Clone + 'static> Reconciler<M> {
         let key = common.key;
         let visible = common.visible;
         let input_enabled = common.input_enabled;
-        let opacity = common.opacity;
+        let target_opacity = common.opacity;
         let z_index = common.z_index;
+        let cursor = common.cursor;
         let a11y = common.a11y.clone();
+        let opacity_tr_spec = common.opacity_transition;
+        let transform_tr_spec = common.transform_transition;
 
-        let (prev_id, prev_children, prev_timeline, prev_snapshot) = match prev {
+        let (prev_id, prev_children, prev_timeline, prev_transitions, prev_snapshot) = match prev {
             Some(p) => {
                 let snap = Some(PrevSnapshot {
                     visible: p.visible,
@@ -272,11 +285,81 @@ impl<M: Clone + 'static> Reconciler<M> {
                     z_index: p.z_index,
                     visual: p.visual,
                 });
-                (Some(p.node_id), p.children, p.sprite_timeline, snap)
+                (
+                    Some(p.node_id),
+                    p.children,
+                    p.sprite_timeline,
+                    p.transitions,
+                    snap,
+                )
             }
-            None => (None, Vec::new(), None, None),
+            None => (None, Vec::new(), None, None, None),
         };
         let node_id = prev_id.unwrap_or_else(|| self.node_ids.alloc());
+
+        let (opacity, effective_transform, transitions) = if cfg!(feature = "animation")
+            && (opacity_tr_spec.is_some() || transform_tr_spec.is_some())
+        {
+            debug_assert!(
+                key.is_some(),
+                "elements with .transition_opacity() or .transition_transform() must set .key(...) for stable identity across sibling reorders"
+            );
+            let mut tr = prev_transitions.unwrap_or_else(|| {
+                Box::new(RetainedTransitions {
+                    opacity: None,
+                    transform: None,
+                })
+            });
+
+            let eff_opacity = if let Some(spec) = opacity_tr_spec {
+                let state = match tr.opacity.as_mut() {
+                    Some(existing) => {
+                        existing.retarget(target_opacity, spec, pass.now);
+                        existing.advance(pass.now);
+                        existing
+                    }
+                    None => {
+                        let initial = prev_snapshot.as_ref().map_or(target_opacity, |s| s.opacity);
+                        let mut st = RetainedScalarTransition::new(initial, spec);
+                        st.retarget(target_opacity, spec, pass.now);
+                        st.advance(pass.now);
+                        tr.opacity.insert(st)
+                    }
+                };
+                state.value().clamp(0.0, 1.0)
+            } else {
+                tr.opacity = None;
+                target_opacity
+            };
+
+            let eff_transform = if let Some(spec) = transform_tr_spec {
+                let state = match tr.transform.as_mut() {
+                    Some(existing) => {
+                        existing.retarget(target_transform, spec, pass.now);
+                        existing.advance(pass.now);
+                        existing
+                    }
+                    None => {
+                        let st = RetainedTransformTransition::new(target_transform, spec);
+                        tr.transform.insert(st)
+                    }
+                };
+                state.value()
+            } else {
+                tr.transform = None;
+                target_transform
+            };
+
+            if visible && tr.is_active() {
+                *pass.has_active_transitions = true;
+            }
+            (eff_opacity, eff_transform, Some(tr))
+        } else {
+            (target_opacity, target_transform, None)
+        };
+
+        let (local_affine, affine, world_bounds) =
+            compose_node_affine(bounds, effective_transform, parent.affine);
 
         let mut sprite_timeline = None;
         let mut on_animation_end = None;
@@ -426,17 +509,20 @@ impl<M: Clone + 'static> Reconciler<M> {
             kind_tag,
             bounds,
             world_bounds,
+            local_affine,
             affine,
             clip_rect: parent.clip_rect,
             z_index,
             visible,
             input_enabled,
             opacity,
+            cursor,
             handlers,
             visual,
             a11y,
             sprite_timeline,
             on_animation_end,
+            transitions,
             children: children_out,
         }
     }

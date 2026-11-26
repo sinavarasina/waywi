@@ -1,7 +1,9 @@
 use crate::accessibility::AccessibleProps;
+use crate::animation::TransitionSpec;
 use crate::arena::FrameSharedFn;
 use crate::geometry::{ElementAnchor, Position, Size, Transform};
 
+use super::cursor::CursorShape;
 use super::events::EventHandlers;
 use super::keys::ElementKey;
 
@@ -15,8 +17,11 @@ pub(crate) struct CommonProps<M> {
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
     pub(crate) transform: Transform,
+    pub(crate) opacity_transition: Option<TransitionSpec>,
+    pub(crate) transform_transition: Option<TransitionSpec>,
     pub(crate) z_index: i32,
     pub(crate) input_enabled: bool,
+    pub(crate) cursor: Option<CursorShape>,
     pub(crate) handlers: EventHandlers<M>,
     pub(crate) a11y: AccessibleProps,
 }
@@ -31,8 +36,11 @@ impl<M> Default for CommonProps<M> {
             visible: true,
             opacity: 1.0,
             transform: Transform::identity(),
+            opacity_transition: None,
+            transform_transition: None,
             z_index: 0,
             input_enabled: true,
+            cursor: None,
             handlers: EventHandlers::default(),
             a11y: AccessibleProps::default(),
         }
@@ -57,8 +65,11 @@ impl<M: 'static> CommonProps<M> {
             visible: self.visible,
             opacity: self.opacity,
             transform: self.transform,
+            opacity_transition: self.opacity_transition,
+            transform_transition: self.transform_transition,
             z_index: self.z_index,
             input_enabled: self.input_enabled,
+            cursor: self.cursor,
             handlers: self.handlers.map(mapper),
             a11y: self.a11y,
         }
@@ -162,6 +173,28 @@ macro_rules! impl_common_builders {
             self
         }
 
+        /// Opt-in retained opacity transition evaluated on `wl_surface.frame` VSync without
+        /// rebuilding `view(state)`.
+        ///
+        /// Newly mounted elements start immediately at their initial declared opacity (no implicit
+        /// mount animation). Requires a stable `.key(...)` on the element (checked with
+        /// `debug_assert!` in debug builds).
+        pub fn transition_opacity(mut self, spec: $crate::animation::TransitionSpec) -> Self {
+            self.common.opacity_transition = Some(spec);
+            self
+        }
+
+        /// Opt-in retained transform transition evaluated on `wl_surface.frame` VSync without
+        /// rebuilding `view(state)`.
+        ///
+        /// Newly mounted elements start immediately at their initial declared transform (no
+        /// implicit mount animation). Requires a stable `.key(...)` on the element (checked with
+        /// `debug_assert!` in debug builds).
+        pub fn transition_transform(mut self, spec: $crate::animation::TransitionSpec) -> Self {
+            self.common.transform_transition = Some(spec);
+            self
+        }
+
         pub fn z_index(mut self, z_index: i32) -> Self {
             self.common.z_index = z_index;
             self
@@ -169,6 +202,13 @@ macro_rules! impl_common_builders {
 
         pub fn input_enabled(mut self, enabled: bool) -> Self {
             self.common.input_enabled = enabled;
+            self
+        }
+
+        /// Requests a compositor cursor shape (`wp_cursor_shape_v1` or `CursorShape::Hidden`)
+        /// while the pointer hovers over this element.
+        pub fn cursor(mut self, shape: $crate::input::CursorShape) -> Self {
+            self.common.cursor = Some(shape);
             self
         }
 

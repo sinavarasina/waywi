@@ -251,8 +251,58 @@ pub(crate) fn compute_selective_input_rects<M: 'static>(
 ) -> Vec<Bounds> {
     hit_nodes
         .iter()
-        .filter(|n| n.visible && n.input_enabled && n.handlers.has_pointer_handlers())
+        .filter(|n| {
+            n.visible
+                && n.input_enabled
+                && (n.handlers.has_pointer_handlers() || n.cursor.is_some())
+        })
         .map(|n| n.world_bounds())
         .filter(|r| !r.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Affine2D;
+    use crate::input::{CursorShape, EventHandlers, NodeId};
+
+    #[test]
+    fn selective_input_rects_include_cursor_only_elements() {
+        let rect = Bounds::from_xywh(10.0, 20.0, 100.0, 50.0);
+        let cursor_only = HitTestNode::<()> {
+            node_id: NodeId {
+                index: 0,
+                generation: 1,
+            },
+            local_rect: rect,
+            affine: Affine2D::IDENTITY,
+            inverse_affine: Some(Affine2D::IDENTITY),
+            clip_rect: None,
+            z_index: 0,
+            paint_order: 0,
+            visible: true,
+            input_enabled: true,
+            cursor: Some(CursorShape::Crosshair),
+            handlers: EventHandlers::default(),
+        };
+        let passive = HitTestNode::<()> {
+            node_id: NodeId {
+                index: 1,
+                generation: 1,
+            },
+            local_rect: Bounds::from_xywh(0.0, 0.0, 10.0, 10.0),
+            affine: Affine2D::IDENTITY,
+            inverse_affine: Some(Affine2D::IDENTITY),
+            clip_rect: None,
+            z_index: 0,
+            paint_order: 1,
+            visible: true,
+            input_enabled: true,
+            cursor: None,
+            handlers: EventHandlers::default(),
+        };
+        let rects = compute_selective_input_rects(&[cursor_only, passive]);
+        assert_eq!(rects, vec![rect]);
+    }
 }

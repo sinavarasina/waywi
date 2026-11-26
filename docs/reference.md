@@ -5,7 +5,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 ## Prelude & Top-Level Modules
 
 - `waywi::prelude::*`: re-exports core app, surface, geometry, primitive, text, input, timer, system, desktop, and enabled integration symbols.
-- Top-level public modules: `accessibility`, `app`, `audio`, `capabilities`, `clipboard` (`clipboard`), `compositor` (`hyprland-ipc` / `sway-ipc`), `control` (`control-ipc`), `dbus` (`dbus`), `desktop`, `display`, `effect`, `error`, `geometry`, `idle` (`idle-notify`), `image`, `input`, `render`, `sprite`, `subscription`, `surface`, `system`, `text`, `timer`.
+- Top-level public modules: `accessibility`, `animation`, `app`, `audio`, `capabilities`, `clipboard` (`clipboard`), `compositor` (`hyprland-ipc` / `sway-ipc`), `control` (`control-ipc`), `dbus` (`dbus`), `desktop`, `display`, `effect`, `error`, `geometry`, `idle` (`idle-notify`), `image`, `input`, `render`, `sprite`, `subscription`, `surface`, `system`, `text`, `timer`, `wayland_ext`.
 - Top-level re-exports: `App`, `Application`, `HeadlessRuntime`, `MemoryConfig`, `Capabilities`, `Capability`, `Output`, `OutputId`, `OutputInfo`, `OutputTransform`, `EffectCtx`, `ErrorKind`, `Result`, `WaywiError`, `Surface`, `Surfaces`.
 
 ## Application Runtime (`app`)
@@ -31,14 +31,15 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `RendererPreference` (`render::backend`): `Auto`, `Software`, `Gpu`.
 - `HeadlessRuntime<A: Application>` (`app::headless`):
   - Constructors: `new(capabilities, outputs)`, `new_with_renderer(...)`, `with_memory(capabilities, outputs, renderer_pref, memory)`.
-  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `trim_memory()`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `scroll_surface_event(...)`, `touch_surface(...)`, `gesture_surface(...)`, `tablet_surface(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_popup_dismiss(...)`, `simulate_surface_configure(...)`.
-  - Inspection & accessibility: `capabilities()`, `memory_config()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `activated_surfaces()`, `arena_heap_fallbacks()`, `asset_pixels_resident(asset)`, `decoded_asset_bytes()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
+  - Execution & events: `enqueue(msg)`, `step()`, `step_at(now)`, `tick_animations_at(now)`, `trim_memory()`, `click_surface_point(...)`, `pointer_down_surface_point(...)`, `pointer_move_surface_point(...)`, `pointer_leave_surface(...)`, `pointer_up_surface_point(...)`, `scroll_surface_point(...)`, `scroll_surface_event(...)`, `touch_surface(...)`, `gesture_surface(...)`, `tablet_surface(...)`, `key_surface(...)`, `simulate_ime(...)`, `simulate_relative_pointer(...)`, `simulate_dnd(...)`, `simulate_popup_dismiss(...)`, `simulate_surface_configure(...)`.
+  - Inspection & accessibility: `capabilities()`, `memory_config()`, `state()`, `quit_requested()`, `surface_count()`, `surface_logical_size(...)`, `surface_ime_config(...)`, `surface_cursor_at(...)`, `surface_decoration(...)`, `surface_inhibits_idle(...)`, `surface_pointer_constraint(...)`, `activated_surfaces()`, `set_synthetic_screencopy(...)`, `recorded_toplevel_actions()`, `recorded_ext_workspace_actions()`, `recorded_virtual_keyboard_actions()`, `recorded_drag_starts()`, `arena_heap_fallbacks()`, `asset_pixels_resident(asset)`, `decoded_asset_bytes()`, `rendered_buffer(...)`, `accessibility_tree()`, `dispatch_accessibility_action(...)`.
 
 ## Effects (`effect`)
 
 `EffectCtx<'a, M>` (`effect::context`) is passed into `Application::init` and `Application::update`:
 
 - **Lifecycle & memory**: `quit()`, `capabilities() -> &Capabilities`, `outputs() -> &[OutputInfo]`, `memory_config() -> &MemoryConfig`, `trim_memory()`, `after(delay, msg)`, `request_activation_token(app_id, map)`, `activate_surface(surface_key, token)`, `system() -> &mut SystemProviders`, `set_backlight_percent(device_name, percent)`.
+- **Wayland desktop extensions (`wayland_ext`, `input`)**: `capture_screen(target, overlay_cursor, map)` (`screencopy`), `activate_toplevel`, `close_toplevel`, `set_toplevel_minimized`, `set_toplevel_maximized`, `set_toplevel_fullscreen` (`foreign-toplevel`), `activate_ext_workspace`, `deactivate_ext_workspace`, `create_ext_workspace`, `remove_ext_workspace` (`ext-workspace`), `start_drag(surface_key, entries, actions)`, `virtual_key`, `virtual_modifiers`, `virtual_keymap` (`virtual-keyboard`).
 - **Image assets**: `load_image(path)`, `load_image_sized(path, min_svg_px)`, `load_image_bytes(bytes)`, `load_image_bytes_sized(bytes, min_svg_px)`, `load_image_static(bytes)`, `load_image_static_sized(bytes, min_svg_px)`, `load_rgba_image(width, height, rowstride, has_alpha, data)`, `load_image_async(path, map)`, `set_image_retention(asset, retention) -> bool`, `image_retention(asset) -> Option<AssetRetention>`, `evict_image_pixels(asset) -> bool`, `reload_image(asset, path)`, `unload_image(asset) -> bool`.
 - **Audio (`audio` / `audio-playback`)**: `audio() -> Result<&AudioClient>`, `player() -> Result<&AudioPlayer>`.
 - **Compositors**: `hyprland()` (`hyprland-ipc`), `sway()` (`sway-ipc`), `compositor() -> Result<CompositorClient<'_>>`.
@@ -51,7 +52,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `Result<T>`: `std::result::Result<T, WaywiError>`.
 - `ErrorKind`: `NotAvailable`, `NotSupported`, `TemporarilyUnavailable`, `PermissionDenied`, `OperationFailed`, `InvalidState`, `Timeout`, `Shutdown`.
 - `WaywiError` (`.kind(&self) -> ErrorKind`): `WaylandConnection`, `UnsupportedCapability(Capability)`, `OutputUnavailable`, `SurfaceError`, `RenderError`, `AssetDecode`, `UnsupportedAssetFormat`, `ProviderUnavailable`, `PermissionDenied`, `IpcError`, `DbusError`, `AudioError`, `InvalidGeometry`, `InvalidState`, `Timeout`, `Io(std::io::Error)`, `Shutdown`, `Custom`.
-- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `XdgActivation`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `PointerGestures`, `TabletInput`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `TextInput`, `KeyboardLayout`.
+- `Capability`: `Wayland`, `LayerShell`, `XdgShell`, `XdgActivation`, `XdgDecoration`, `FractionalScale`, `Viewporter`, `PointerInput`, `KeyboardInput`, `TouchInput`, `PointerGestures`, `TabletInput`, `CursorShape`, `SessionLock`, `Screencopy`, `ForeignToplevel`, `ForeignToplevelControl`, `ExtWorkspace`, `DragAndDrop`, `IdleInhibit`, `VirtualKeyboard`, `PointerConstraints`, `RelativePointer`, `SoftwareRenderer`, `GpuRenderer`, `Text`, `ImagePng`, `ImageSvg`, `ImageGif`, `ImageWebp`, `Animation`, `ControlIpc`, `HyprlandIpc`, `SwayIpc`, `PipeWire`, `PulseAudio`, `Alsa`, `Dbus`, `GlobalShortcuts`, `Accessibility`, `AudioPlayback`, `Clipboard`, `IdleNotify`, `TextInput`, `KeyboardLayout`.
 - `Capabilities`: `new()`, `from_compile_features()`, `has(cap)`, `set(cap, enabled)`, `require(cap) -> Result<()>`, `iter()`.
 
 ## Geometry & Units (`geometry`)
@@ -84,18 +85,19 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `KeyboardInteractivity`: `None`, `OnDemand`, `Exclusive`.
 - `InputMode`: `Full`, `Selective`, `PassThrough`.
 - `BufferRetention`: `Retain`, `ReleaseAfterCommit`.
-- `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`, `Popup`.
+- `SurfaceKind`: `Panel`, `Floating`, `Overlay`, `Window`, `Popup`, `SessionLock`.
+- `WindowDecoration`: `Server` (default), `Auto`, `Client`, `None`.
 - Popup positioning (`surface::types`): `PopupAnchor` (default `BottomLeft`), `PopupGravity` (default `BottomRight`), `PopupConstraintAdjustment` (`SLIDE_X`, `SLIDE_Y`, `FLIP_X`, `FLIP_Y`, `RESIZE_X`, `RESIZE_Y`), `PopupPositioner` (`new(anchor_rect)`, `anchor`, `gravity`, `offset`, `constraint_adjustment`, `reactive`).
 - `Surface<M>` (`surface::builder`):
-  - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::popup(key, parent_surface)`, `Surface::memo(key, dep, build)`.
-  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.buffer_retention`, `.output`, `.positioner`, `.popup_grab`, `.visible`, `.background`, `.title`, `.namespace`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.on_touch`, `.on_gesture`, `.on_tablet`, `.map`.
+  - Constructors: `Surface::panel(key, output)`, `Surface::floating(key, output)`, `Surface::overlay(key, output)`, `Surface::window(key)`, `Surface::popup(key, parent_surface)`, `Surface::session_lock(key, output)`, `Surface::memo(key, dep, build)`.
+  - Builders: `.layer`, `.anchor`, `.margin`, `.size`, `.exclusive_zone`, `.ignore_exclusive_zone`, `.keyboard_interactivity`, `.input_mode`, `.buffer_retention`, `.output`, `.positioner`, `.popup_grab`, `.visible`, `.background`, `.title`, `.namespace`, `.cursor`, `.decoration`, `.inhibit_idle`, `.pointer_constraint`, `.dnd_mime_types`, `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_hidden`, `.ime`, `.on_ime`, `.child`, `.children`, `.on_close`, `.on_key`, `.on_pointer_move`, `.on_pointer_up`, `.on_relative_pointer`, `.on_dnd`, `.on_touch`, `.on_gesture`, `.on_tablet`, `.map`.
 - `Surfaces<M>` (`surface::collection`): `new()`, `none()`, `push(surface)`, `extend(surfaces)`, `len()`, `is_empty()`, `map(f)`.
 - `OutputId(pub u64)` (`new`, `get`), `Output` (`primary()`, `named(name)`, `id(OutputId)`, `all()`), `OutputInfo`, `OutputTransform`, `resolve_outputs`, `select_primary_output`.
 
 ## Elements, Styling, Canvas, Text, Images & Sprites
 
 - **`Element<M>` (`render::elements::element`)**: `Element::memo(key, dep, build)`, `.map(f)`. Common setters from `CommonProps`:
-  - Identity & layout: `.key`, `.position`, `.size`, `.anchor`, `.visible`, `.opacity`, `.transform`, `.z_index`, `.input_enabled`.
+  - Identity & layout: `.key`, `.position`, `.size`, `.anchor`, `.visible`, `.opacity`, `.transform`, `.transition_opacity`, `.transition_transform`, `.z_index`, `.input_enabled`, `.cursor`.
   - Interaction: `.on_click`, `.on_hover`, `.on_leave`, `.on_scroll`, `.on_pointer_down`, `.on_pointer_up`, `.on_pointer_move`, `.on_touch`, `.on_gesture`, `.on_tablet`.
   - Audio feedback: `.on_click_sound(impl Into<SoundPlay>)`, `.on_hover_sound(impl Into<SoundPlay>)`.
   - Accessibility: `.accessible_role`, `.accessible_label`, `.accessible_description`, `.accessible_value`, `.accessible_hidden`.
@@ -117,9 +119,12 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 - `Clipboard` (`clipboard`): `Clipboard::subscribe`, `Clipboard::subscribe_selection`, `select_preferred_mime`, `ClipboardSelection`, `ClipboardSnapshot`, `ClipboardEvent`.
 - `Idle` (`idle-notify`): `Idle::notify`, `Idle::input_notify`, `IdleEvent`.
 
-## Subscriptions & Timers (`subscription`, `timer`)
+## Subscriptions, Animation & Timers (`subscription`, `animation`, `timer`, `wayland_ext`)
 
 - `SubscriptionKey`, `IntoSubscriptionKey`, `Subscription<M>` (`none`, `batch`, `map`), `Subscriptions<M>` (`new`, `none`, `push`, `extend`, `len`, `is_empty`, `map`), `Timer` (`once`, `every`).
+- Animation (`animation`): `Easing`, `Lerp`, `SpringConfig`, `Spring`, `Tween<T>`, `Animated<T>`, `TransitionSpec`, `Animation::frames(key, map)`.
+- Wayland extensions (`wayland_ext`): `SessionLock::subscribe` (`SessionLockEvent`), `ScreencopyTarget`, `ScreencopyFrame`, `ForeignToplevel::subscribe` (`ForeignToplevelId`, `ForeignToplevelState`, `ForeignToplevelInfo`, `ForeignToplevelSnapshot`), `ExtWorkspace::subscribe` (`ExtWorkspaceId`, `ExtWorkspaceGroupId`, `ExtWorkspaceState`, `ExtWorkspaceCapabilities`, `ExtWorkspaceInfo`, `ExtWorkspaceGroupInfo`, `ExtWorkspaceSnapshot`).
+- Cursor, DnD & constraints (`input`): `CursorShape`, `PointerConstraintMode`, `RelativePointerEvent`, `VirtualKeyState`, `DndAction`, `DndEvent`.
 
 ## System Telemetry & Units (`system`)
 

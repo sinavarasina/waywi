@@ -20,10 +20,11 @@ fn dispatch_pointer_hover_and_move<M: Clone + 'static>(
     pos: Point,
     modifiers: Modifiers,
     emit_move: bool,
-) {
+) -> Option<crate::input::CursorShape> {
     let mut guard = rt.inbox.borrow_mut();
     rt.core
-        .dispatch_pointer_move(key, pos, modifiers, emit_move, &mut guard.messages);
+        .dispatch_pointer_move(key, pos, modifiers, emit_move, &mut guard.messages)
+        .1
 }
 
 fn dispatch_pointer_leave<M: Clone + 'static>(rt: &mut LoopRuntime<M>, key: RetainedSurfaceKey) {
@@ -95,6 +96,7 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
     rt: &mut LoopRuntime<M>,
     wl: &mut WaylandState,
 ) {
+    let mut dispatched_anim_frame = false;
     while let Some(ev) = wl.events.pop_front() {
         match ev {
             WaylandEvent::OutputsChanged => {
@@ -144,14 +146,39 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 }
             }
             WaylandEvent::SurfaceFrame { key } => {
-                let (_, _, anim_msgs) = rt.core.reconciler.tick_animations(Instant::now());
+                let now = Instant::now();
+                let (dirty_surfs, _, anim_msgs) =
+                    rt.core.reconciler.tick_animations_for(Some(key), now);
                 if !anim_msgs.is_empty() {
                     rt.inbox.borrow_mut().messages.extend(anim_msgs);
+                }
+                for skey in dirty_surfs {
+                    if let Some(s) = rt.core.reconciler.surfaces.get_mut(&skey) {
+                        if s.input_region_dirty {
+                            wl.apply_input_region(
+                                skey,
+                                s.spec.input_mode,
+                                &s.selective_input_rects,
+                            );
+                            s.input_region_dirty = false;
+                        }
+                        if s.needs_redraw {
+                            wl.notify_surface_damage(skey, &s.dirty_buffer_rects(), s.full_redraw);
+                        }
+                    }
                 }
                 if let Some(s) = rt.core.reconciler.surfaces.get(&key)
                     && s.needs_redraw
                 {
                     wl.notify_surface_damage(key, &s.dirty_buffer_rects(), s.full_redraw);
+                }
+                if !dispatched_anim_frame && !rt.sub_mgr.animation_frame_subs.is_empty() {
+                    dispatched_anim_frame = true;
+                    fanout_event(
+                        now,
+                        &rt.sub_mgr.animation_frame_subs,
+                        &mut rt.inbox.borrow_mut().messages,
+                    );
                 }
             }
             WaylandEvent::BufferReleased { key } => {
@@ -167,13 +194,11 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 y,
                 modifiers,
             } => {
-                dispatch_pointer_hover_and_move(
-                    rt,
-                    key,
-                    Point::new(LogicalPx(x), LogicalPx(y)),
-                    modifiers,
-                    false,
-                );
+                let pos = Point::new(LogicalPx(x), LogicalPx(y));
+                if let Some(shape) = dispatch_pointer_hover_and_move(rt, key, pos, modifiers, false)
+                {
+                    wl.apply_cursor_shape(shape);
+                }
             }
             WaylandEvent::PointerMotion {
                 key,
@@ -181,13 +206,11 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 y,
                 modifiers,
             } => {
-                dispatch_pointer_hover_and_move(
-                    rt,
-                    key,
-                    Point::new(LogicalPx(x), LogicalPx(y)),
-                    modifiers,
-                    true,
-                );
+                let pos = Point::new(LogicalPx(x), LogicalPx(y));
+                if let Some(shape) = dispatch_pointer_hover_and_move(rt, key, pos, modifiers, true)
+                {
+                    wl.apply_cursor_shape(shape);
+                }
             }
             WaylandEvent::PointerLeave { key } => dispatch_pointer_leave(rt, key),
             WaylandEvent::PointerButton {
@@ -306,12 +329,58 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                     push_message(&rt.inbox, msg);
                 }
             }
+            WaylandEvent::Dnd { key, event } => {
+                if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
+                    && let Some(ref on_dnd) = surf.on_dnd
+                    && let Some(msg) = on_dnd.call(event)
+                {
+                    push_message(&rt.inbox, msg);
+                }
+            }
+            #[cfg(feature = "session-lock")]
+            WaylandEvent::SessionLock(sl_ev) => {
+                fanout_event(
+                    sl_ev,
+                    &rt.sub_mgr.session_lock_subs,
+                    &mut rt.inbox.borrow_mut().messages,
+                );
+            }
+            #[cfg(feature = "screencopy")]
+            WaylandEvent::ScreencopyDone { request_id, result } => {
+                if let Some(cb) = rt.pending_screencopy_callbacks.remove(&request_id) {
+                    push_message(&rt.inbox, cb(result));
+                }
+            }
+            #[cfg(feature = "pointer-constraints")]
+            WaylandEvent::RelativePointer { key, event } => {
+                if let Some(surf) = rt.core.reconciler.surfaces.get(&key)
+                    && let Some(ref on_rel) = surf.on_relative_pointer
+                    && let Some(msg) = on_rel.call(event)
+                {
+                    push_message(&rt.inbox, msg);
+                }
+            }
         }
     }
 
-    #[cfg(feature = "clipboard")]
-    for clip_ev in wl.clipboard.drain_async_events() {
-        dispatch_clipboard_event(rt, clip_ev);
+    #[cfg(feature = "foreign-toplevel")]
+    if wl.foreign_toplevel.take_dirty() && !rt.sub_mgr.foreign_toplevel_subs.is_empty() {
+        let snap = wl.foreign_toplevel.snapshot(&wl.output_handles);
+        fanout_event(
+            snap,
+            &rt.sub_mgr.foreign_toplevel_subs,
+            &mut rt.inbox.borrow_mut().messages,
+        );
+    }
+
+    #[cfg(feature = "ext-workspace")]
+    if wl.ext_workspace.take_dirty() && !rt.sub_mgr.ext_workspace_subs.is_empty() {
+        let snap = wl.ext_workspace.snapshot(&wl.output_handles);
+        fanout_event(
+            snap,
+            &rt.sub_mgr.ext_workspace_subs,
+            &mut rt.inbox.borrow_mut().messages,
+        );
     }
 
     #[cfg(feature = "accessibility")]

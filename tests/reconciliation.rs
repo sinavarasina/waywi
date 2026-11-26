@@ -1791,3 +1791,488 @@ fn tablet_stroke_capture_mixed_toolbar_fallback_and_pad() {
         }]
     );
 }
+
+#[cfg(feature = "animation")]
+#[test]
+fn retained_transitions_advance_without_rebuilding_view_and_auto_stop() {
+    thread_local! {
+        static VIEW_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+    VIEW_CALLS.with(|c| c.set(0));
+
+    struct AnimState {
+        expanded: bool,
+    }
+    #[derive(Clone)]
+    enum AnimMsg {
+        Toggle,
+    }
+    struct AnimApp;
+    impl Application for AnimApp {
+        type State = AnimState;
+        type Message = AnimMsg;
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(AnimState { expanded: false })
+        }
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                AnimMsg::Toggle => state.expanded = !state.expanded,
+            }
+            Ok(())
+        }
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            VIEW_CALLS.with(|c| c.set(c.get() + 1));
+            let target_opacity = if state.expanded { 1.0 } else { 0.2 };
+            let target_tf = if state.expanded {
+                Transform::identity().translate(20.logical_px(), 0.logical_px())
+            } else {
+                Transform::identity()
+            };
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::floating("anim-surf", Output::Primary)
+                    .size((100.logical_px(), 40.logical_px()))
+                    .background(Color::BLACK)
+                    .child(
+                        Rect::new()
+                            .key("box")
+                            .size((20.logical_px(), 20.logical_px()))
+                            .fill(Color::RED)
+                            .opacity(target_opacity)
+                            .transform(target_tf)
+                            .transition_opacity(TransitionSpec::tween(
+                                Duration::from_millis(200),
+                                Easing::Linear,
+                            ))
+                            .transition_transform(TransitionSpec::tween(
+                                Duration::from_millis(200),
+                                Easing::Linear,
+                            )),
+                    ),
+            );
+            s
+        }
+    }
+
+    let t0 = Instant::now();
+    let mut rt = HeadlessRuntime::<AnimApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+    rt.step_at(t0).unwrap();
+    let views_before = VIEW_CALLS.with(|c| c.get());
+
+    // Trigger target change via update + view once.
+    rt.enqueue(AnimMsg::Toggle);
+    rt.step_at(t0).unwrap();
+    let views_after_toggle = VIEW_CALLS.with(|c| c.get());
+    assert_eq!(views_after_toggle, views_before + 1);
+
+    // Tick halfway through the transition WITHOUT calling `view()`.
+    let still_active = rt
+        .tick_animations_at(t0 + Duration::from_millis(100))
+        .unwrap();
+    assert!(still_active);
+    assert_eq!(
+        VIEW_CALLS.with(|c| c.get()),
+        views_after_toggle,
+        "retained transitions must advance without rebuilding view()"
+    );
+    // At t=100ms, rect has translated ~10px to the right (covering x=10..30) and opacity ~0.6.
+    let buf_mid = rt.rendered_buffer("anim-surf").unwrap().to_vec();
+    // Pixel at (25, 10) is inside the translated rect (10..30), non-black red channel > 100.
+    let p_mid = (10 * 100 + 25) * 4;
+    assert!(
+        buf_mid[p_mid + 2] > 100,
+        "expected animated red pixel at x=25"
+    );
+
+    // Tick past completion: settles cleanly and subsequent tick reports false (idle).
+    let _ = rt
+        .tick_animations_at(t0 + Duration::from_millis(250))
+        .unwrap();
+    let idle_tick = rt
+        .tick_animations_at(t0 + Duration::from_millis(300))
+        .unwrap();
+    assert!(!idle_tick, "settled transitions must stop completely");
+    assert_eq!(VIEW_CALLS.with(|c| c.get()), views_after_toggle);
+}
+
+#[test]
+fn animation_frames_subscription_and_new_surface_props_headless() {
+    struct State {
+        animating: bool,
+        zoom: Animated<f32>,
+        ticks: usize,
+        rel_deltas: Vec<(f64, f64)>,
+        dnd_drops: Vec<String>,
+        screencopy_res: Option<std::result::Result<[u8; 4], String>>,
+    }
+    #[derive(Clone)]
+    enum Msg {
+        Frame(Instant),
+        Rel(RelativePointerEvent),
+        Dnd(DndEvent),
+        Capture,
+        Captured(std::result::Result<[u8; 4], String>),
+    }
+    struct ExtApp;
+    impl Application for ExtApp {
+        type State = State;
+        type Message = Msg;
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            let mut zoom = Animated::new(1.0_f32);
+            zoom.transition_to(
+                2.0,
+                Duration::from_millis(100),
+                Easing::Linear,
+                Instant::now(),
+            );
+            Ok(State {
+                animating: true,
+                zoom,
+                ticks: 0,
+                rel_deltas: Vec::new(),
+                dnd_drops: Vec::new(),
+                screencopy_res: None,
+            })
+        }
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                Msg::Frame(now) => {
+                    state.ticks += 1;
+                    let _ = state.zoom.sample(now);
+                    if !state.zoom.is_animating(now) {
+                        state.animating = false;
+                    }
+                }
+                Msg::Rel(ev) => state.rel_deltas.push((ev.dx_unaccel, ev.dy_unaccel)),
+                Msg::Dnd(DndEvent::Drop { data, .. }) => {
+                    state
+                        .dnd_drops
+                        .push(String::from_utf8_lossy(&data).into_owned());
+                }
+                Msg::Dnd(_) => {}
+                Msg::Capture => {
+                    ctx.capture_screen(ScreencopyTarget::Output(Output::Primary), false, |res| {
+                        Msg::Captured(
+                            res.map(|f| f.pixel_rgba(1, 0).unwrap_or([0; 4]))
+                                .map_err(|e| e.to_string()),
+                        )
+                    });
+                }
+                Msg::Captured(r) => state.screencopy_res = Some(r),
+            }
+            Ok(())
+        }
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("studio")
+                    .size((200.logical_px(), 100.logical_px()))
+                    .cursor(CursorShape::Crosshair)
+                    .decoration(WindowDecoration::Client)
+                    .inhibit_idle(true)
+                    .pointer_constraint(PointerConstraintMode::Locked)
+                    .on_relative_pointer(|ev| Some(Msg::Rel(ev)))
+                    .on_dnd(|ev| Some(Msg::Dnd(ev)))
+                    .child(
+                        Rect::new()
+                            .position(Position::Absolute {
+                                x: 10.logical_px(),
+                                y: 10.logical_px(),
+                            })
+                            .size((40.logical_px(), 40.logical_px()))
+                            .cursor(CursorShape::Pointer),
+                    ),
+            );
+            s
+        }
+        fn subscriptions(state: &Self::State) -> Subscriptions<Self::Message> {
+            let mut subs = Subscriptions::new();
+            if state.animating {
+                subs.push(Animation::frames("zoom", Msg::Frame));
+            }
+            subs
+        }
+    }
+
+    let mut caps = Capabilities::from_compile_features();
+    caps.set(Capability::Screencopy, true);
+    caps.set(Capability::ForeignToplevelControl, true);
+    caps.set(Capability::ExtWorkspace, true);
+    caps.set(Capability::VirtualKeyboard, true);
+    caps.set(Capability::DragAndDrop, true);
+    let mut rt = HeadlessRuntime::<ExtApp>::new(caps, vec![OutputInfo::default()]).unwrap();
+    assert_eq!(
+        rt.surface_cursor_at("studio", 20.0, 20.0),
+        Some(CursorShape::Pointer)
+    );
+    assert_eq!(
+        rt.surface_cursor_at("studio", 150.0, 50.0),
+        Some(CursorShape::Crosshair)
+    );
+    assert_eq!(
+        rt.surface_decoration("studio"),
+        Some(WindowDecoration::Client)
+    );
+    assert_eq!(rt.surface_inhibits_idle("studio"), Some(true));
+    assert_eq!(
+        rt.surface_pointer_constraint("studio"),
+        Some(PointerConstraintMode::Locked)
+    );
+
+    assert!(rt.simulate_relative_pointer(
+        "studio",
+        RelativePointerEvent {
+            time_us: 1000,
+            dx: 1.5,
+            dy: -2.0,
+            dx_unaccel: 3.0,
+            dy_unaccel: -4.0,
+        }
+    ));
+    assert!(rt.simulate_dnd(
+        "studio",
+        DndEvent::Drop {
+            position: Point::new(10.logical_px(), 10.logical_px()),
+            mime_type: "text/plain".into(),
+            data: b"dropped-ok".to_vec(),
+            action: DndAction::COPY,
+        }
+    ));
+
+    // Honest headless screencopy: without a synthetic frame injected, must fail honestly.
+    rt.enqueue(Msg::Capture);
+    let t_done = Instant::now() + Duration::from_millis(200);
+    rt.step_at(t_done).unwrap();
+    rt.step_at(t_done + Duration::from_millis(10)).unwrap();
+    assert!(
+        rt.state()
+            .screencopy_res
+            .as_ref()
+            .is_some_and(|r| r.is_err()),
+        "headless screencopy without injected synthetic frame must fail honestly"
+    );
+
+    // Inject synthetic screencopy frame and verify exact pixel delivery.
+    rt.set_synthetic_screencopy(Some(ScreencopyFrame {
+        width: 2,
+        height: 1,
+        stride: 8,
+        rgba: vec![0, 0, 0, 255, 42, 128, 200, 255],
+    }));
+    rt.enqueue(Msg::Capture);
+    rt.step_at(t_done + Duration::from_millis(20)).unwrap();
+    rt.step_at(t_done + Duration::from_millis(30)).unwrap();
+
+    assert_eq!(rt.state().rel_deltas, vec![(3.0, -4.0)]);
+    assert_eq!(rt.state().dnd_drops, vec!["dropped-ok".to_string()]);
+    assert_eq!(rt.state().screencopy_res, Some(Ok([42, 128, 200, 255])));
+    assert!(!rt.state().animating);
+    let ticks_settled = rt.state().ticks;
+    rt.step_at(t_done + Duration::from_millis(100)).unwrap();
+    assert_eq!(
+        rt.state().ticks,
+        ticks_settled,
+        "unsubscribed Animation::frames must stop delivering"
+    );
+}
+
+#[test]
+fn container_transform_transition_from_zero_scale_and_backout_opacity_clamp() {
+    struct State {
+        expanded: bool,
+    }
+    #[derive(Clone)]
+    enum Msg {
+        Expand,
+    }
+    struct ScaleApp;
+    impl Application for ScaleApp {
+        type State = State;
+        type Message = Msg;
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(State { expanded: false })
+        }
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                Msg::Expand => state.expanded = true,
+            }
+            Ok(())
+        }
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            let scale = if state.expanded { 1.0 } else { 0.0 };
+            let opacity = if state.expanded { 1.0 } else { 0.0 };
+            s.push(
+                Surface::floating("scale-zero", Output::Primary)
+                    .size((100.logical_px(), 100.logical_px()))
+                    .background(Color::BLACK)
+                    .child(
+                        Group::new()
+                            .key("container")
+                            .size((40.logical_px(), 40.logical_px()))
+                            .transform(Transform::identity().scale(scale))
+                            .transition_transform(TransitionSpec::tween(
+                                Duration::from_millis(200),
+                                Easing::Linear,
+                            ))
+                            .child(
+                                Rect::new()
+                                    .key("inner")
+                                    .size((40.logical_px(), 40.logical_px()))
+                                    .fill(Color::rgb(255, 0, 0))
+                                    .opacity(opacity)
+                                    .transition_opacity(TransitionSpec::tween(
+                                        Duration::from_millis(200),
+                                        Easing::BackOut,
+                                    )),
+                            ),
+                    ),
+            );
+            s
+        }
+    }
+
+    let t0 = Instant::now();
+    let mut rt = HeadlessRuntime::<ScaleApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+    rt.step_at(t0).unwrap();
+
+    // Initially at scale 0.0 -> center pixel (20, 20) is pure black.
+    let buf0 = rt.rendered_buffer("scale-zero").unwrap();
+    assert_eq!(buf0[(20 * 100 + 20) * 4 + 2], 0);
+
+    // Transition from singular scale(0.0) -> scale(1.0) + BackOut opacity (overshoots > 1.0).
+    rt.enqueue(Msg::Expand);
+    rt.step_at(t0).unwrap();
+    let active = rt
+        .tick_animations_at(t0 + Duration::from_millis(140))
+        .unwrap();
+    assert!(active);
+    let buf_mid = rt.rendered_buffer("scale-zero").unwrap();
+    // Child rect inside the formerly-scale-0 container MUST now be visible at (20, 20)!
+    assert!(
+        buf_mid[(20 * 100 + 20) * 4 + 2] > 200,
+        "child inside scale(0.0)->scale(1.0) container must animate cleanly without inverse() singularity"
+    );
+
+    // Settles cleanly past 200ms.
+    let _ = rt
+        .tick_animations_at(t0 + Duration::from_millis(250))
+        .unwrap();
+    assert!(
+        !rt.tick_animations_at(t0 + Duration::from_millis(300))
+            .unwrap()
+    );
+}
+
+#[test]
+fn headless_records_protocol_actions_and_defaults_window_decoration_to_server() {
+    use waywi::app::headless::{
+        HeadlessDragStart, HeadlessExtWorkspaceAction, HeadlessToplevelAction,
+        HeadlessVirtualKeyboardAction,
+    };
+
+    struct State;
+    #[derive(Clone)]
+    enum Msg {
+        FireActions,
+    }
+    struct ActionApp;
+    impl Application for ActionApp {
+        type State = State;
+        type Message = Msg;
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(State)
+        }
+        fn update(
+            _state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                Msg::FireActions => {
+                    ctx.activate_toplevel(ForeignToplevelId(7))?;
+                    ctx.activate_ext_workspace(ExtWorkspaceId(3))?;
+                    ctx.create_ext_workspace(ExtWorkspaceGroupId(1), "code")?;
+                    ctx.virtual_key(30, VirtualKeyState::Pressed)?;
+                    ctx.start_drag(
+                        "default-win",
+                        vec![("text/plain".into(), b"hello".to_vec())],
+                        DndAction::COPY,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            // Default window without explicit `.decoration(...)` must default to `Server`.
+            s.push(Surface::window("default-win"));
+            s
+        }
+    }
+
+    let mut caps = Capabilities::from_compile_features();
+    caps.set(Capability::ForeignToplevelControl, true);
+    caps.set(Capability::ExtWorkspace, true);
+    caps.set(Capability::VirtualKeyboard, true);
+    caps.set(Capability::DragAndDrop, true);
+    let mut rt = HeadlessRuntime::<ActionApp>::new(caps, vec![OutputInfo::default()]).unwrap();
+    assert_eq!(
+        rt.surface_decoration("default-win"),
+        Some(WindowDecoration::Server),
+        "Surface::window default decoration must stay WindowDecoration::Server (RequestServer)"
+    );
+
+    rt.enqueue(Msg::FireActions);
+    rt.step().unwrap();
+
+    assert_eq!(
+        rt.recorded_toplevel_actions(),
+        &[HeadlessToplevelAction::Activate(ForeignToplevelId(7))]
+    );
+    assert_eq!(
+        rt.recorded_ext_workspace_actions(),
+        &[
+            HeadlessExtWorkspaceAction::Activate(ExtWorkspaceId(3)),
+            HeadlessExtWorkspaceAction::Create {
+                group: ExtWorkspaceGroupId(1),
+                name: "code".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(
+        rt.recorded_virtual_keyboard_actions(),
+        &[HeadlessVirtualKeyboardAction::Key {
+            keycode: 30,
+            state: VirtualKeyState::Pressed,
+        }]
+    );
+    assert_eq!(
+        rt.recorded_drag_starts(),
+        &[HeadlessDragStart {
+            surface_key: "default-win".into_surface_key(),
+            entries: vec![("text/plain".to_owned(), b"hello".to_vec())],
+            actions: DndAction::COPY,
+        }]
+    );
+}

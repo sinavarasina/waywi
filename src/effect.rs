@@ -2,4 +2,7 @@ pub mod context;
 pub(crate) mod worker;
 
 pub use context::EffectCtx;
-pub(crate) use worker::{ActivationCallback, AssetCallback, AsyncAssetWorker};
+pub(crate) use worker::{
+    ActivationCallback, AssetCallback, AsyncAssetWorker, DragStartRequest, ExtWorkspaceAction,
+    ForeignToplevelAction, ScreencopyCallback, VirtualKeyboardAction,
+};
