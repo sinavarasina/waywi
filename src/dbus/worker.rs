@@ -64,6 +64,63 @@ impl Future for StopFuture {
     }
 }
 
+struct AsyncReplyState<T> {
+    reply: Option<T>,
+    waker: Option<Waker>,
+}
+
+/// Reusable zero-polling waker-backed oneshot slot shared across D-Bus interactive agents
+/// (BlueZ `Agent1`, NetworkManager `SecretAgent`, Polkit `AuthenticationAgent`) and background
+/// helper threads.
+pub(crate) struct AsyncReplySlot<T> {
+    state: Mutex<AsyncReplyState<T>>,
+}
+
+impl<T> AsyncReplySlot<T> {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(AsyncReplyState {
+                reply: None,
+                waker: None,
+            }),
+        })
+    }
+
+    pub(crate) fn resolve(&self, reply: T) {
+        if let Ok(mut guard) = self.state.lock() {
+            if guard.reply.is_none() {
+                guard.reply = Some(reply);
+            }
+            if let Some(waker) = guard.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    pub(crate) fn wait(&self) -> AsyncReplyFuture<'_, T> {
+        AsyncReplyFuture { slot: self }
+    }
+}
+
+pub(crate) struct AsyncReplyFuture<'a, T> {
+    slot: &'a AsyncReplySlot<T>,
+}
+
+impl<T> Future for AsyncReplyFuture<'_, T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Ok(mut guard) = self.slot.state.lock() else {
+            return Poll::Ready(None);
+        };
+        if let Some(reply) = guard.reply.take() {
+            return Poll::Ready(Some(reply));
+        }
+        guard.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 /// Reusable RAII thread handle for background D-Bus workers.
 ///
 /// Triggers [`AsyncStopSignal`] and joins the worker thread cleanly on drop.

@@ -1,11 +1,8 @@
 //! BlueZ Bluetooth adapter, device, battery, connection, and pairing agent management (`org.bluez`).
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
@@ -19,7 +16,7 @@ use super::client::{
     validate_object_path,
 };
 use super::types::{Dbus, DbusBus};
-use super::worker::{AsyncStopSignal, DbusWorkerHandle, ServiceWatchWorker};
+use super::worker::{AsyncReplySlot, AsyncStopSignal, DbusWorkerHandle, ServiceWatchWorker};
 use super::zvariant_helpers::{
     ManagedObjects, dict_bool, dict_i16, dict_str, dict_str_vec, dict_u8, dict_u32,
     get_managed_objects, unwrap_value,
@@ -174,56 +171,7 @@ pub enum BluetoothAgentReply {
     Cancel,
 }
 
-/// Zero-polling waker-backed oneshot slot shared between `BluetoothClient`, `BluezAgentIface`, and
-/// the raw D-Bus `Cancel`/`Release` signal interceptor.
-pub(crate) struct AgentReplySlot {
-    inner: Mutex<AgentReplyState>,
-}
-
-#[derive(Default)]
-struct AgentReplyState {
-    reply: Option<BluetoothAgentReply>,
-    waker: Option<Waker>,
-}
-
-impl AgentReplySlot {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(AgentReplyState::default()),
-        })
-    }
-
-    pub(crate) fn resolve(&self, reply: BluetoothAgentReply) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if guard.reply.is_none() {
-                guard.reply = Some(reply);
-            }
-            if let Some(waker) = guard.waker.take() {
-                waker.wake();
-            }
-        }
-    }
-}
-
-struct AgentReplyFuture {
-    slot: Arc<AgentReplySlot>,
-}
-
-impl Future for AgentReplyFuture {
-    type Output = Option<BluetoothAgentReply>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Ok(mut guard) = self.slot.inner.lock() else {
-            return Poll::Ready(None);
-        };
-        if let Some(reply) = guard.reply.take() {
-            return Poll::Ready(Some(reply));
-        }
-        guard.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
+pub(crate) type AgentReplySlot = AsyncReplySlot<BluetoothAgentReply>;
 pub(crate) type PendingAgentMap = Arc<Mutex<HashMap<u64, Arc<AgentReplySlot>>>>;
 
 pub(crate) fn cancel_all_pending_slots(pending: &PendingAgentMap) {
@@ -521,6 +469,150 @@ impl BluetoothClient<'_> {
         slot.resolve(reply);
         Ok(())
     }
+
+    /// Connects a specific Bluetooth profile UUID (`org.bluez.Device1.ConnectProfile`, e.g. A2DP
+    /// `"0000110b-0000-1000-8000-00805f9b34fb"`).
+    pub fn connect_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
+        let path = validate_object_path(device_path, "Bluetooth device path")?;
+        if uuid.trim().is_empty() {
+            return Err(WaywiError::DbusError(
+                "Bluetooth profile UUID cannot be empty".into(),
+            ));
+        }
+        let target = path.clone();
+        let uuid_owned = uuid.to_owned();
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::BluetoothDevice,
+                DbusBus::System,
+                "Device1.ConnectProfile",
+                target,
+            )
+            .with_dedup(format!("bt:connect_profile:{path}:{uuid_owned}"))
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                conn.call_method(
+                    Some(BLUEZ_DEST),
+                    path.as_str(),
+                    Some(BLUEZ_DEVICE_IFACE),
+                    "ConnectProfile",
+                    &(uuid_owned.as_str(),),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("Device1.ConnectProfile failed: {e}"))
+                })?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Disconnects a specific Bluetooth profile UUID (`org.bluez.Device1.DisconnectProfile`).
+    pub fn disconnect_profile(&self, device_path: &str, uuid: &str) -> Result<()> {
+        let path = validate_object_path(device_path, "Bluetooth device path")?;
+        if uuid.trim().is_empty() {
+            return Err(WaywiError::DbusError(
+                "Bluetooth profile UUID cannot be empty".into(),
+            ));
+        }
+        let target = path.clone();
+        let uuid_owned = uuid.to_owned();
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::BluetoothDevice,
+                DbusBus::System,
+                "Device1.DisconnectProfile",
+                target,
+            )
+            .with_dedup(format!("bt:disconnect_profile:{path}:{uuid_owned}")),
+            move |conn| async move {
+                conn.call_method(
+                    Some(BLUEZ_DEST),
+                    path.as_str(),
+                    Some(BLUEZ_DEVICE_IFACE),
+                    "DisconnectProfile",
+                    &(uuid_owned.as_str(),),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("Device1.DisconnectProfile failed: {e}"))
+                })?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Sends a local file to a paired Bluetooth device via `org.bluez.obex` Object Push (`opp`),
+    /// emitting `DbusActionReply::ObjectPath(transfer_path)` on [`Dbus::action_results`].
+    pub fn obex_send_file(
+        &self,
+        destination_mac: &str,
+        file_path: impl Into<std::path::PathBuf>,
+    ) -> Result<()> {
+        let mac = destination_mac.trim().to_owned();
+        if mac.is_empty() {
+            return Err(WaywiError::DbusError(
+                "Bluetooth OBEX destination MAC address cannot be empty".into(),
+            ));
+        }
+        let file_path = file_path.into();
+        let file_str = file_path.to_string_lossy().into_owned();
+        if file_str.is_empty() {
+            return Err(WaywiError::DbusError(
+                "OBEX file path cannot be empty".into(),
+            ));
+        }
+        let target = mac.clone();
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::BluetoothDevice,
+                DbusBus::Session,
+                "obex.ObjectPush1.SendFile",
+                target,
+            )
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                let mut args: HashMap<&str, Value<'_>> = HashMap::new();
+                args.insert("Target", Value::from("opp"));
+                let session_reply = conn
+                    .call_method(
+                        Some("org.bluez.obex"),
+                        "/org/bluez/obex",
+                        Some("org.bluez.obex.Client1"),
+                        "CreateSession",
+                        &(mac.as_str(), args),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WaywiError::DbusError(format!("obex CreateSession failed: {e}"))
+                    })?;
+                let session_path: OwnedObjectPath = session_reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let push_reply = conn
+                    .call_method(
+                        Some("org.bluez.obex"),
+                        session_path.as_str(),
+                        Some("org.bluez.obex.ObjectPush1"),
+                        "SendFile",
+                        &(file_str.as_str(),),
+                    )
+                    .await
+                    .map_err(|e| WaywiError::DbusError(format!("obex SendFile failed: {e}")))?;
+                let (transfer_path, _props): (
+                    OwnedObjectPath,
+                    HashMap<String, zbus::zvariant::OwnedValue>,
+                ) = push_reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                Ok(super::client::DbusActionReply::ObjectPath(
+                    transfer_path.to_string(),
+                ))
+            },
+        )
+    }
 }
 
 pub(crate) fn spawn_bluetooth_worker(
@@ -699,7 +791,7 @@ impl BluezAgentIface {
             .sender
             .send(BluetoothAgentEvent::Request(make_req(request_id)));
 
-        let reply = futures_lite::future::or(AgentReplyFuture { slot }, async {
+        let reply = futures_lite::future::or(slot.wait(), async {
             self.stop.wait_stopped().await;
             None
         })
@@ -1001,7 +1093,7 @@ mod tests {
         pending.lock().unwrap().insert(1, Arc::clone(&slot));
 
         cancel_all_pending_slots(&pending);
-        let res = futures_lite::future::block_on(AgentReplyFuture { slot });
+        let res = futures_lite::future::block_on(slot.wait());
         assert_eq!(res, Some(BluetoothAgentReply::Cancel));
 
         let client = DbusClient::new();
@@ -1015,7 +1107,7 @@ mod tests {
             .bluetooth()
             .reply_agent(7, BluetoothAgentReply::Passkey(123_456))
             .unwrap();
-        let res2 = futures_lite::future::block_on(AgentReplyFuture { slot: slot2 });
+        let res2 = futures_lite::future::block_on(slot2.wait());
         assert_eq!(res2, Some(BluetoothAgentReply::Passkey(123_456)));
     }
 }

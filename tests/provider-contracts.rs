@@ -680,8 +680,11 @@ fn audio_volume_and_orthogonal_target_contracts() {
 #[test]
 fn dbus_client_subhandles_and_options_contracts() {
     use waywi::dbus::{
-        BluetoothAgentReply, DbusActionReply, DbusClient, PowerAction, UDisksMountOptions,
-        WifiConnectOptions,
+        BluetoothAgentReply, DbusActionReply, DbusBus, DbusClient, HotspotOptions,
+        NmSecretAgentReply, OutgoingNotification, PolkitAgentReply, PortalBackgroundOptions,
+        PortalFileChooserOptions, PortalInhibitFlags, PortalOpenUriOptions,
+        PortalScreenCastOptions, PortalScreenshotOptions, PowerAction, UDisksFormatOptions,
+        UDisksMountOptions, WifiConnectOptions, WifiEnterpriseOptions,
     };
 
     let client = DbusClient::new();
@@ -694,19 +697,97 @@ fn dbus_client_subhandles_and_options_contracts() {
     assert!(client.power_profiles().cached_snapshot().is_none());
     assert!(client.upower().cached_snapshot().is_none());
     assert!(client.modem().cached_snapshot().is_none());
+    assert!(client.sensors().cached_snapshot().is_none());
+    assert!(client.systemd().cached_snapshot(DbusBus::Session).is_none());
+    assert!(client.systemd().cached_snapshot(DbusBus::System).is_none());
+    assert!(client.timedate().cached_snapshot().is_none());
+    assert!(client.accounts().cached_snapshot().is_none());
+    assert!(client.gamemode().cached_snapshot().is_none());
+    assert!(client.fwupd().cached_snapshot().is_none());
+    assert!(client.kdeconnect().cached_snapshot().is_none());
+    assert!(client.colord().cached_snapshot().is_none());
     let _ = client.notifications().capabilities();
     let _ = client.portal();
     let _ = client.screensaver();
     let _ = client.geoclue();
+    let _ = client.polkit();
+    let _ = client.hostname();
+    let _ = client.locale();
+    let _ = client.fprint();
+    let _ = client.secrets();
+    let _ = client.packagekit();
+    let _ = client.avahi();
     client.trim_cache();
 
-    let wifi = WifiConnectOptions::new().password("secret").hidden(true);
+    // Validation contracts reject invalid inputs synchronously before scheduling D-Bus lanes.
+    assert!(
+        client
+            .mpris()
+            .set_rate("org.mpris.MediaPlayer2.test", 0.0)
+            .is_err()
+    );
+    assert!(
+        client
+            .mpris()
+            .open_uri("org.mpris.MediaPlayer2.test", "")
+            .is_err()
+    );
+    assert!(client.nm().start_hotspot(&HotspotOptions::new("")).is_err());
+    assert!(
+        client
+            .nm()
+            .reply_secret_agent(999, NmSecretAgentReply::Cancelled)
+            .is_err()
+    );
+    assert!(
+        client
+            .polkit()
+            .reply("missing-cookie", PolkitAgentReply::Cancel)
+            .is_err()
+    );
+    assert!(client.systemd().start_unit(DbusBus::Session, "").is_err());
+    assert!(client.timedate().set_timezone("", false).is_err());
+    assert!(
+        client
+            .bluetooth()
+            .connect_profile("/org/bluez/hci0/dev_00", "")
+            .is_err()
+    );
+    assert!(
+        client
+            .udisks()
+            .format_block(
+                "/org/freedesktop/UDisks2/block_devices/sdb1",
+                &UDisksFormatOptions::new("")
+            )
+            .is_err()
+    );
+    assert!(
+        client
+            .portal()
+            .open_uri("", &PortalOpenUriOptions::new())
+            .is_err()
+    );
+    assert!(client.fwupd().verify_device("").is_err());
+    assert!(client.kdeconnect().ping("", "hi").is_err());
+
+    let wifi = WifiConnectOptions::new()
+        .password("secret")
+        .hidden(true)
+        .enterprise(WifiEnterpriseOptions::new("peap", "user@corp"));
     assert!(wifi.hidden);
-    assert_eq!(wifi.password.as_deref(), Some("secret"));
+    assert!(wifi.enterprise.is_some());
 
     let mount = UDisksMountOptions::new().fs_type("ext4").interactive(false);
     assert!(!mount.interactive);
     assert_eq!(mount.fs_type.as_deref(), Some("ext4"));
+
+    let _ = OutgoingNotification::new("Title").body("Body");
+    let _ = PortalScreenshotOptions::new().interactive(true);
+    let _ = PortalFileChooserOptions::new("Open");
+    let _ = PortalBackgroundOptions::new().autostart(true);
+    let _ = PortalScreenCastOptions::default();
+    assert!(PortalInhibitFlags::IDLE.contains(PortalInhibitFlags::IDLE));
 
     assert_eq!(DbusActionReply::default(), DbusActionReply::Unit);
     assert_ne!(PowerAction::Suspend, PowerAction::Reboot);

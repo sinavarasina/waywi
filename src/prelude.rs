@@ -92,17 +92,27 @@ pub use crate::compositor::{
 
 #[cfg(feature = "dbus")]
 pub use crate::dbus::{
-    BluetoothAgentEvent, BluetoothAgentReply, BluetoothAgentRequest, BluetoothClient,
-    BluetoothSnapshot, Dbus, DbusActionLane, DbusActionReply, DbusActionResult, DbusBus,
-    DbusClient, DbusSignalEvent, DbusValue, DesktopNotification, GeoClueClient, GeoClueSnapshot,
-    LogindClient, LogindEvent, LogindSnapshot, ModemClient, ModemSnapshot, MprisClient, MprisEvent,
-    MprisLoopStatus, MprisPlaybackStatus, MprisSnapshot, NetworkManagerClient,
-    NetworkManagerSnapshot, NotificationCapabilities, NotificationCloseReason, NotificationEvent,
-    NotificationUrgency, NotificationsClient, PortalClient, PortalColorScheme,
-    PortalSettingsSnapshot, PowerAction, PowerProfileKind, PowerProfileSnapshot,
-    PowerProfilesClient, ScreenSaverClient, ScreenSaverSnapshot, TrayClient, TrayEvent,
-    TrayItemSnapshot, UDisksClient, UDisksMountOptions, UDisksSnapshot, UPowerClient,
-    UPowerSnapshot, WifiConnectOptions,
+    AccountsClient, AccountsSnapshot, AvahiClient, AvahiSnapshot, BluetoothAgentEvent,
+    BluetoothAgentReply, BluetoothAgentRequest, BluetoothClient, BluetoothSnapshot, ColordClient,
+    ColordSnapshot, CupsEvent, Dbus, DbusActionLane, DbusActionReply, DbusActionResult, DbusBus,
+    DbusClient, DbusSignalEvent, DbusValue, DesktopNotification, FprintClient, FprintEvent,
+    FprintVerifyResult, FwupdClient, FwupdSnapshot, GameModeClient, GameModeSnapshot,
+    GeoClueClient, GeoClueSnapshot, HostnameClient, HostnameSnapshot, HotspotOptions,
+    KdeConnectClient, KdeConnectSnapshot, LocaleClient, LocaleSnapshot, LogindClient, LogindEvent,
+    LogindSnapshot, ModemClient, ModemSnapshot, MprisClient, MprisEvent, MprisLoopStatus,
+    MprisPlaybackStatus, MprisSnapshot, NetworkManagerClient, NetworkManagerSnapshot,
+    NmSecretAgentEvent, NmSecretAgentReply, NmSecretAgentRequest, NmVpnState,
+    NotificationCapabilities, NotificationCloseReason, NotificationEvent, NotificationUrgency,
+    NotificationsClient, OutgoingNotification, PackageKitClient, PackageKitSnapshot,
+    PolkitAgentEvent, PolkitAgentReply, PolkitAuthRequest, PolkitClient, PortalClient,
+    PortalColorScheme, PortalFileChooserOptions, PortalFileFilter, PortalInhibitFlags,
+    PortalOpenUriOptions, PortalScreenCastOptions, PortalScreenshotOptions, PortalSettingsSnapshot,
+    PowerAction, PowerProfileKind, PowerProfileSnapshot, PowerProfilesClient, ScreenSaverClient,
+    ScreenSaverSnapshot, SecretsClient, SensorOrientation, SensorProxySnapshot, SensorsClient,
+    SystemdClient, SystemdUnitsSnapshot, TimedateClient, TimedateSnapshot, TrayClient, TrayEvent,
+    TrayItemSnapshot, UDisksClient, UDisksFormatOptions, UDisksMountOptions, UDisksSmartHealth,
+    UDisksSnapshot, UPowerClient, UPowerSnapshot, UserAccount, WifiConnectOptions,
+    WifiEnterpriseOptions,
 };
 #[cfg(feature = "global-shortcuts")]
 pub use crate::dbus::{BoundGlobalShortcut, GlobalShortcutDescriptor, GlobalShortcutEvent};

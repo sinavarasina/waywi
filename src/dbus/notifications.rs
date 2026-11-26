@@ -273,11 +273,237 @@ impl Dbus {
     }
 }
 
-/// Zero-cost domain handle for XDG Desktop Notifications server controls.
+/// Builder for sending a client-side desktop notification via `org.freedesktop.Notifications.Notify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingNotification {
+    pub app_name: String,
+    pub replaces_id: u32,
+    pub app_icon: String,
+    pub summary: String,
+    pub body: String,
+    pub actions: Vec<(String, String)>,
+    pub urgency: NotificationUrgency,
+    pub category: Option<String>,
+    pub desktop_entry: Option<String>,
+    pub image_path: Option<String>,
+    pub transient: bool,
+    pub resident: bool,
+    pub suppress_sound: bool,
+    pub sound_name: Option<String>,
+    pub expire_timeout_ms: i32,
+}
+
+impl OutgoingNotification {
+    /// Creates an outgoing notification with the required `summary` title.
+    #[must_use]
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            app_name: String::new(),
+            replaces_id: 0,
+            app_icon: String::new(),
+            summary: summary.into(),
+            body: String::new(),
+            actions: Vec::new(),
+            urgency: NotificationUrgency::Normal,
+            category: None,
+            desktop_entry: None,
+            image_path: None,
+            transient: false,
+            resident: false,
+            suppress_sound: false,
+            sound_name: None,
+            expire_timeout_ms: -1,
+        }
+    }
+
+    #[must_use]
+    pub fn app_name(mut self, name: impl Into<String>) -> Self {
+        self.app_name = name.into();
+        self
+    }
+
+    #[must_use]
+    pub fn replaces_id(mut self, id: u32) -> Self {
+        self.replaces_id = id;
+        self
+    }
+
+    #[must_use]
+    pub fn app_icon(mut self, icon: impl Into<String>) -> Self {
+        self.app_icon = icon.into();
+        self
+    }
+
+    #[must_use]
+    pub fn body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    #[must_use]
+    pub fn action(mut self, key: impl Into<String>, label: impl Into<String>) -> Self {
+        self.actions.push((key.into(), label.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn urgency(mut self, urgency: NotificationUrgency) -> Self {
+        self.urgency = urgency;
+        self
+    }
+
+    #[must_use]
+    pub fn category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
+    #[must_use]
+    pub fn desktop_entry(mut self, entry: impl Into<String>) -> Self {
+        self.desktop_entry = Some(entry.into());
+        self
+    }
+
+    #[must_use]
+    pub fn image_path(mut self, path: impl Into<String>) -> Self {
+        self.image_path = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn transient(mut self, transient: bool) -> Self {
+        self.transient = transient;
+        self
+    }
+
+    #[must_use]
+    pub fn resident(mut self, resident: bool) -> Self {
+        self.resident = resident;
+        self
+    }
+
+    #[must_use]
+    pub fn suppress_sound(mut self, suppress: bool) -> Self {
+        self.suppress_sound = suppress;
+        self
+    }
+
+    #[must_use]
+    pub fn sound_name(mut self, name: impl Into<String>) -> Self {
+        self.sound_name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn expire_timeout_ms(mut self, ms: i32) -> Self {
+        self.expire_timeout_ms = ms;
+        self
+    }
+
+    fn build_wire_actions(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(self.actions.len() * 2);
+        for (k, v) in &self.actions {
+            out.push(k.as_str());
+            out.push(v.as_str());
+        }
+        out
+    }
+
+    fn build_wire_hints(&self) -> HashMap<&'static str, zbus::zvariant::Value<'_>> {
+        let mut hints: HashMap<&'static str, zbus::zvariant::Value<'_>> = HashMap::new();
+        let urg: u8 = match self.urgency {
+            NotificationUrgency::Low => 0,
+            NotificationUrgency::Normal => 1,
+            NotificationUrgency::Critical => 2,
+        };
+        hints.insert("urgency", zbus::zvariant::Value::from(urg));
+        if let Some(ref cat) = self.category {
+            hints.insert("category", zbus::zvariant::Value::from(cat.as_str()));
+        }
+        if let Some(ref de) = self.desktop_entry {
+            hints.insert("desktop-entry", zbus::zvariant::Value::from(de.as_str()));
+        }
+        if let Some(ref img) = self.image_path {
+            hints.insert("image-path", zbus::zvariant::Value::from(img.as_str()));
+        }
+        if self.transient {
+            hints.insert("transient", zbus::zvariant::Value::from(true));
+        }
+        if self.resident {
+            hints.insert("resident", zbus::zvariant::Value::from(true));
+        }
+        if self.suppress_sound {
+            hints.insert("suppress-sound", zbus::zvariant::Value::from(true));
+        }
+        if let Some(ref sound) = self.sound_name {
+            hints.insert("sound-name", zbus::zvariant::Value::from(sound.as_str()));
+        }
+        hints
+    }
+}
+
+/// Zero-cost domain handle for XDG Desktop Notifications (both server controls and client `Notify`).
 #[derive(Clone, Copy)]
 pub struct NotificationsClient<'a>(pub(super) &'a DbusClient);
 
 impl NotificationsClient<'_> {
+    /// Sends a desktop notification asynchronously to the session's `org.freedesktop.Notifications`
+    /// daemon (`Notify`), emitting `DbusActionReply::Count(id as usize)` on [`Dbus::action_results`].
+    pub fn send(&self, notification: &OutgoingNotification) -> Result<()> {
+        let notif = notification.clone();
+        let target = if notif.summary.is_empty() {
+            NOTIFICATIONS_BUS_NAME.to_owned()
+        } else {
+            notif.summary.clone()
+        };
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "Notifications.Notify",
+                target,
+            ),
+            move |conn| async move {
+                let id = send_notification_async(&conn, &notif).await?;
+                Ok(super::client::DbusActionReply::Count(id as usize))
+            },
+        )
+    }
+
+    /// Sends a desktop notification synchronously via `org.freedesktop.Notifications.Notify` and
+    /// returns the assigned notification ID.
+    pub fn send_blocking(&self, notification: &OutgoingNotification) -> Result<u32> {
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        let notif = notification.clone();
+        futures_lite::future::block_on(async move { send_notification_async(&conn, &notif).await })
+    }
+
+    /// Requests the session's `org.freedesktop.Notifications` daemon to close notification `id`
+    /// (`CloseNotification`).
+    pub fn close_notification(&self, id: u32) -> Result<()> {
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Desktop,
+                DbusBus::Session,
+                "Notifications.CloseNotification",
+                id.to_string(),
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(NOTIFICATIONS_BUS_NAME),
+                    NOTIFICATIONS_OBJECT_PATH,
+                    Some(NOTIFICATIONS_BUS_NAME),
+                    "CloseNotification",
+                    &(id,),
+                )
+                .await
+                .map_err(|e| {
+                    WaywiError::DbusError(format!("Notifications.CloseNotification failed: {e}"))
+                })?;
+                Ok(())
+            },
+        )
+    }
     /// Returns the currently configured [`NotificationCapabilities`] advertised by the
     /// notification server.
     #[must_use]
@@ -343,6 +569,37 @@ impl NotificationsClient<'_> {
             WaywiError::DbusError("org.freedesktop.Notifications server is not running".into())
         })
     }
+}
+
+async fn send_notification_async(
+    conn: &zbus::Connection,
+    notif: &OutgoingNotification,
+) -> Result<u32> {
+    let actions = notif.build_wire_actions();
+    let hints = notif.build_wire_hints();
+    let reply = conn
+        .call_method(
+            Some(NOTIFICATIONS_BUS_NAME),
+            NOTIFICATIONS_OBJECT_PATH,
+            Some(NOTIFICATIONS_BUS_NAME),
+            "Notify",
+            &(
+                notif.app_name.as_str(),
+                notif.replaces_id,
+                notif.app_icon.as_str(),
+                notif.summary.as_str(),
+                notif.body.as_str(),
+                actions,
+                hints,
+                notif.expire_timeout_ms,
+            ),
+        )
+        .await
+        .map_err(|e| WaywiError::DbusError(format!("Notifications.Notify failed: {e}")))?;
+    reply
+        .body()
+        .deserialize()
+        .map_err(|e| WaywiError::DbusError(e.to_string()))
 }
 
 pub(crate) struct NotificationServerWorker {
@@ -719,5 +976,31 @@ mod tests {
         );
         client.notifications().set_capabilities(full);
         assert_eq!(client.notifications().capabilities(), full);
+    }
+
+    #[test]
+    fn outgoing_notification_encodes_actions_and_hints() {
+        let notif = OutgoingNotification::new("Download complete")
+            .app_name("waywi-demo")
+            .body("archive.tar.zst saved")
+            .urgency(NotificationUrgency::Critical)
+            .action("open", "Open")
+            .category("transfer.complete")
+            .transient(true)
+            .expire_timeout_ms(5000);
+        assert_eq!(notif.build_wire_actions(), vec!["open", "Open"]);
+        let hints = notif.build_wire_hints();
+        assert_eq!(
+            hints.get("urgency"),
+            Some(&zbus::zvariant::Value::from(2u8))
+        );
+        assert_eq!(
+            hints.get("category"),
+            Some(&zbus::zvariant::Value::from("transfer.complete"))
+        );
+        assert_eq!(
+            hints.get("transient"),
+            Some(&zbus::zvariant::Value::from(true))
+        );
     }
 }

@@ -185,6 +185,56 @@ pub(crate) enum SubscriptionSpec<M> {
     DbusActionResults {
         map: FrameSharedFn<crate::dbus::DbusActionResult, M>,
     },
+    #[cfg(feature = "dbus")]
+    DbusNmSecretAgent {
+        map: FrameSharedFn<crate::dbus::NmSecretAgentEvent, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusSensors {
+        map: FrameSharedFn<crate::dbus::SensorProxySnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusPolkitAgent {
+        map: FrameSharedFn<crate::dbus::PolkitAgentEvent, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusSystemdUnits {
+        bus: crate::dbus::DbusBus,
+        map: FrameSharedFn<crate::dbus::SystemdUnitsSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusTimedate {
+        map: FrameSharedFn<crate::dbus::TimedateSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusAccounts {
+        map: FrameSharedFn<crate::dbus::AccountsSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusFprintVerify {
+        username: String,
+        map: FrameSharedFn<crate::dbus::FprintEvent, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusGameMode {
+        map: FrameSharedFn<crate::dbus::GameModeSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusFwupd {
+        map: FrameSharedFn<crate::dbus::FwupdSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusCups {
+        map: FrameSharedFn<crate::dbus::CupsEvent, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusKdeConnect {
+        map: FrameSharedFn<crate::dbus::KdeConnectSnapshot, M>,
+    },
+    #[cfg(feature = "dbus")]
+    DbusColord {
+        map: FrameSharedFn<crate::dbus::ColordSnapshot, M>,
+    },
     #[cfg(feature = "global-shortcuts")]
     GlobalShortcuts {
         key: SubscriptionKey,
@@ -352,6 +402,30 @@ impl<M: 'static> Subscription<M> {
             DbusMpris {},
             #[cfg(feature = "dbus")]
             DbusActionResults {},
+            #[cfg(feature = "dbus")]
+            DbusNmSecretAgent {},
+            #[cfg(feature = "dbus")]
+            DbusSensors {},
+            #[cfg(feature = "dbus")]
+            DbusPolkitAgent {},
+            #[cfg(feature = "dbus")]
+            DbusSystemdUnits { bus },
+            #[cfg(feature = "dbus")]
+            DbusTimedate {},
+            #[cfg(feature = "dbus")]
+            DbusAccounts {},
+            #[cfg(feature = "dbus")]
+            DbusFprintVerify { username },
+            #[cfg(feature = "dbus")]
+            DbusGameMode {},
+            #[cfg(feature = "dbus")]
+            DbusFwupd {},
+            #[cfg(feature = "dbus")]
+            DbusCups {},
+            #[cfg(feature = "dbus")]
+            DbusKdeConnect {},
+            #[cfg(feature = "dbus")]
+            DbusColord {},
             #[cfg(feature = "idle-notify")]
             IdleNotify { key, timeout, input_only },
             #[cfg(feature = "clipboard")]

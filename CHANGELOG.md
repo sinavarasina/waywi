@@ -8,8 +8,26 @@ All notable changes to this project will be documented in this file.
 - **Extended `TouchEvent` and `ScrollEvent` fields (`input`)**:
   - `TouchEvent` now includes `phase: TouchPhase` (`Down`, `Move`, `Up`, `Cancel`), `shape: Option<(f32, f32)>`, `orientation: Option<f32>`, and `modifiers: Modifiers` (matching `wl_touch` full contact lifecycle).
   - `ScrollEvent` now includes `source: ScrollSource` (`Wheel`, `Finger`, `Continuous`, `WheelTilt`, `Unknown`), `stop_x: bool`, and `stop_y: bool` (matching `wl_pointer.axis_source` and `wl_pointer.axis_stop`), and now implements `Default`. Code constructing `TouchEvent` or `ScrollEvent` struct literals directly must populate these fields (or use `..Default::default()` for `ScrollEvent`).
+- **Extended D-Bus snapshot and option structs (`dbus`)**:
+  - `MprisSnapshot` now includes `rate: f64`, `minimum_rate: f64`, and `maximum_rate: f64` (dropping `Eq` on `MprisSnapshot`/`MprisEvent` due to `f64`, while preserving `PartialEq` and `Default`).
+  - `UDisksDrive` now includes `smart: Option<Box<UDisksSmartHealth>>` (dropping `Eq` on `UDisksDrive`/`UDisksSnapshot` due to `f64` temperature, while preserving `PartialEq` and `Default`).
+  - `NmActiveConnection` now includes `vpn: bool` and `vpn_state: Option<NmVpnState>`, and `WifiConnectOptions` now includes `enterprise: Option<WifiEnterpriseOptions>` (both implement `Default`).
 
 ### Added
+- **Comprehensive D-Bus desktop services & enhancements (`dbus`, `subscription`, `app`)**:
+  - **Polkit Authentication Agent & Authority (`dbus.polkit()`, `Dbus::polkit_agent`)**: Native `org.freedesktop.PolicyKit1.AuthenticationAgent` server driving `polkit-agent-helper-1` on background threads (`PolkitAuthRequest`, `PolkitAgentReply`, `PolkitAgentEvent`, `PolkitIdentity`) plus `PolkitClient::check_authorization_blocking`.
+  - **Hardware sensors (`dbus.sensors()`, `Dbus::sensors`)**: Zero-polling `net.hadess.SensorProxy` (`iio-sensor-proxy`) accelerometer orientation, ambient light, and proximity subscription with automatic claim/release lifecycle (`SensorOrientation`, `LightLevelUnit`, `SensorProxySnapshot`).
+  - **Expanded XDG Desktop Portals (`dbus.portal()`)**: Added race-free `Request.Response` support for `OpenURI` (`open_uri`, `open_file_uri`, `open_directory`), `Screenshot` (`screenshot_blocking`, `pick_color_blocking`), `FileChooser` (`open_file_blocking`, `save_file_blocking`), `Inhibit` (`inhibit_blocking`, `close_request`), `Trash` (`trash_file_blocking`), `Background` (`request_background_blocking`), and `ScreenCast` (`screencast_start_blocking`, `close_session`).
+  - **systemd, timedate1, hostname1 & locale1 (`dbus.systemd()`, `dbus.timedate()`, `dbus.hostname()`, `dbus.locale()`, `Dbus::systemd_units`, `Dbus::timedate`)**: User & system unit monitoring + `start_unit`/`stop_unit`/`restart_unit`/`reload_unit`/`enable_units`/`disable_units`/`daemon_reload`, timezone/NTP/RTC control, host/hardware metadata, and locale/X11 keymap configuration.
+  - **AccountsService, Fprintd, GameMode, Secret Service, fwupd & PackageKit**: Added `dbus.accounts()` / `Dbus::accounts`, `dbus.fprint()` / `Dbus::fprint_verify` (auto claim/verify/release), `dbus.gamemode()` / `Dbus::gamemode`, `dbus.secrets()` (`org.freedesktop.secrets` plain-session keyring search/read/store/delete), `dbus.fwupd()` / `Dbus::fwupd`, and `dbus.packagekit()` (`check_updates_blocking`).
+  - **CUPS, KDE Connect, Colord & Avahi**: Added `Dbus::cups` (`org.cups.cupsd.Notifier`), `dbus.kdeconnect()` / `Dbus::kdeconnect` (`ping`, `ring`, `share_url`, `share_text`), `dbus.colord()` / `Dbus::colord` (`make_profile_default`), and `dbus.avahi()` (`snapshot_blocking`, zero-polling `browse_services_blocking`).
+  - **Existing D-Bus module enhancements**:
+    - `NotificationsClient`: added client-side `OutgoingNotification`, `send`, `send_blocking`, and `close_notification`.
+    - `TrayClient`: added `about_to_show_blocking` and `submenu_layout_blocking`, invoking `com.canonical.dbusmenu.AboutToShow` before `GetLayout`.
+    - `MprisClient`: added `raise`, `quit`, `set_rate`, and `open_uri` plus playback rate metadata on `MprisSnapshot`.
+    - `NetworkManagerClient`: added VPN state/helpers (`NmVpnState`, `active_vpns`, `saved_vpns`, `activate_vpn`, `deactivate_vpn`), Wi-Fi Hotspot (`HotspotOptions`, `start_hotspot`), WPA-Enterprise (`WifiEnterpriseOptions`), and `Dbus::nm_secret_agent` / `reply_secret_agent`.
+    - `BluetoothClient`: added `connect_profile`, `disconnect_profile`, and `obex_send_file` (`org.bluez.obex`).
+    - `UDisksClient`: added ATA S.M.A.R.T. health (`UDisksSmartHealth`) and `UDisksFormatOptions` / `format_block`.
 - **Full Touchscreen (`wl_touch`) support (`input`, `wayland`, `reconcile`, `app`)**:
   - Added `TouchPhase`, `Element::on_touch`, `Surface::on_touch`, and `HeadlessRuntime::touch_surface`.
   - Implemented complete `TouchHandler` wiring (`down`, `motion`, `up`, same-frame atomic `shape` and `orientation` enrichment, and `cancel` draining all active contacts) with per-contact capture across `RetainedSurface` reconciliations.

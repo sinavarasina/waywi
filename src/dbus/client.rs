@@ -13,18 +13,32 @@ use crate::arena::FrameSharedFn;
 use crate::error::{Result, WaywiError};
 use crate::subscription::{Subscription, SubscriptionSpec};
 
+use super::accounts::{AccountsClient, AccountsSnapshot};
 use super::bluetooth::{BluetoothClient, BluetoothSnapshot};
+use super::fprint::FprintClient;
+use super::gamemode::{GameModeClient, GameModeSnapshot};
 use super::idle_privacy::{GeoClueClient, ScreenSaverClient};
 use super::logind::{LogindClient, LogindSnapshot};
 use super::modem::{ModemClient, ModemSnapshot};
 use super::mpris::{MprisClient, MprisSnapshot};
 use super::network_manager::{NetworkManagerClient, NetworkManagerSnapshot};
 use super::notifications::NotificationsClient;
+use super::polkit::PolkitClient;
 use super::portal_settings::PortalClient;
 use super::power_profiles::{PowerProfileSnapshot, PowerProfilesClient};
+use super::secrets::SecretsClient;
+use super::sensors::{SensorProxySnapshot, SensorsClient};
+use super::services::{
+    AvahiClient, ColordClient, ColordSnapshot, KdeConnectClient, KdeConnectSnapshot,
+};
+use super::systemd::{
+    HostnameClient, LocaleClient, SystemdClient, SystemdUnitsSnapshot, TimedateClient,
+    TimedateSnapshot,
+};
 use super::tray::{TrayClient, TrayEvent, TrayItemSnapshot};
 use super::types::{Dbus, DbusBus, DbusValue};
 use super::udisks::{UDisksClient, UDisksSnapshot};
+use super::updates::{FwupdClient, FwupdSnapshot, PackageKitClient};
 use super::upower::{UPowerClient, UPowerSnapshot};
 use super::worker::AsyncStopSignal;
 
@@ -706,37 +720,42 @@ pub(crate) struct DbusSnapshotCache {
     pub(crate) logind: RwLock<Option<LogindSnapshot>>,
     pub(crate) modem: RwLock<Option<ModemSnapshot>>,
     pub(crate) tray: RwLock<Option<Vec<TrayItemSnapshot>>>,
+    pub(crate) sensors: RwLock<Option<SensorProxySnapshot>>,
+    pub(crate) systemd_user: RwLock<Option<SystemdUnitsSnapshot>>,
+    pub(crate) systemd_system: RwLock<Option<SystemdUnitsSnapshot>>,
+    pub(crate) timedate: RwLock<Option<TimedateSnapshot>>,
+    pub(crate) accounts: RwLock<Option<AccountsSnapshot>>,
+    pub(crate) gamemode: RwLock<Option<GameModeSnapshot>>,
+    pub(crate) fwupd: RwLock<Option<FwupdSnapshot>>,
+    pub(crate) kdeconnect: RwLock<Option<KdeConnectSnapshot>>,
+    pub(crate) colord: RwLock<Option<ColordSnapshot>>,
 }
 
 impl DbusSnapshotCache {
     pub(crate) fn clear(&self) {
-        if let Ok(mut g) = self.mpris.write() {
-            *g = None;
+        fn clear_slot<T>(lock: &RwLock<Option<T>>) {
+            if let Ok(mut g) = lock.write() {
+                *g = None;
+            }
         }
-        if let Ok(mut g) = self.bluetooth.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.network_manager.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.upower.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.udisks.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.power_profiles.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.logind.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.modem.write() {
-            *g = None;
-        }
-        if let Ok(mut g) = self.tray.write() {
-            *g = None;
-        }
+        clear_slot(&self.mpris);
+        clear_slot(&self.bluetooth);
+        clear_slot(&self.network_manager);
+        clear_slot(&self.upower);
+        clear_slot(&self.udisks);
+        clear_slot(&self.power_profiles);
+        clear_slot(&self.logind);
+        clear_slot(&self.modem);
+        clear_slot(&self.tray);
+        clear_slot(&self.sensors);
+        clear_slot(&self.systemd_user);
+        clear_slot(&self.systemd_system);
+        clear_slot(&self.timedate);
+        clear_slot(&self.accounts);
+        clear_slot(&self.gamemode);
+        clear_slot(&self.fwupd);
+        clear_slot(&self.kdeconnect);
+        clear_slot(&self.colord);
     }
 
     pub(crate) fn apply_tray_event(&self, event: &TrayEvent) {
@@ -778,6 +797,8 @@ pub struct DbusClient {
     pub(crate) cache: Arc<DbusSnapshotCache>,
     pub(crate) notifications_state: Arc<super::notifications::NotificationServerState>,
     pub(crate) bluetooth_agent_pending: super::bluetooth::PendingAgentMap,
+    pub(crate) nm_secret_agent_pending: super::network_manager::PendingNmSecretMap,
+    pub(crate) polkit_agent_pending: super::polkit::PendingPolkitMap,
     cache_snapshots: bool,
     idle_disconnect: bool,
 }
@@ -809,6 +830,8 @@ impl DbusClient {
             cache: Arc::new(DbusSnapshotCache::default()),
             notifications_state: Arc::new(super::notifications::NotificationServerState::default()),
             bluetooth_agent_pending: Arc::new(Mutex::new(HashMap::new())),
+            nm_secret_agent_pending: Arc::new(Mutex::new(HashMap::new())),
+            polkit_agent_pending: Arc::new(Mutex::new(HashMap::new())),
             cache_snapshots,
             idle_disconnect,
         }
@@ -848,6 +871,17 @@ impl DbusClient {
             DbusBus::System => &self.shared_system,
         };
         connect_shared_bus(bus, slot)
+    }
+
+    /// Registers a cancellable deadline on the shared D-Bus timer coordinator (zero extra thread
+    /// per call). Always pair with [`Self::cancel_timeout`] once the awaited future completes.
+    pub(super) fn register_timeout(&self, timeout: Duration) -> (u64, AsyncStopSignal) {
+        self.action_pool.timer.register(timeout)
+    }
+
+    /// Cancels a pending deadline registered via [`Self::register_timeout`].
+    pub(super) fn cancel_timeout(&self, id: u64) {
+        self.action_pool.timer.cancel(id);
     }
 
     /// Schedules a bounded, timeout-protected asynchronous D-Bus action described by `spec`.
@@ -951,6 +985,111 @@ impl DbusClient {
     #[must_use]
     pub fn geoclue(&self) -> GeoClueClient<'_> {
         GeoClueClient(self)
+    }
+
+    /// Returns the `net.hadess.SensorProxy` (`iio-sensor-proxy`) domain handle.
+    #[inline]
+    #[must_use]
+    pub fn sensors(&self) -> SensorsClient<'_> {
+        SensorsClient(self)
+    }
+
+    /// Returns the `org.freedesktop.PolicyKit1` agent & authority domain handle.
+    #[inline]
+    #[must_use]
+    pub fn polkit(&self) -> PolkitClient<'_> {
+        PolkitClient(self)
+    }
+
+    /// Returns the `org.freedesktop.systemd1.Manager` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn systemd(&self) -> SystemdClient<'_> {
+        SystemdClient(self)
+    }
+
+    /// Returns the `org.freedesktop.timedate1` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn timedate(&self) -> TimedateClient<'_> {
+        TimedateClient(self)
+    }
+
+    /// Returns the `org.freedesktop.hostname1` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn hostname(&self) -> HostnameClient<'_> {
+        HostnameClient(self)
+    }
+
+    /// Returns the `org.freedesktop.locale1` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn locale(&self) -> LocaleClient<'_> {
+        LocaleClient(self)
+    }
+
+    /// Returns the `org.freedesktop.Accounts` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn accounts(&self) -> AccountsClient<'_> {
+        AccountsClient(self)
+    }
+
+    /// Returns the `net.reactivated.Fprint` fingerprint reader domain handle.
+    #[inline]
+    #[must_use]
+    pub fn fprint(&self) -> FprintClient<'_> {
+        FprintClient(self)
+    }
+
+    /// Returns the `com.feralinteractive.GameMode` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn gamemode(&self) -> GameModeClient<'_> {
+        GameModeClient(self)
+    }
+
+    /// Returns the `org.freedesktop.secrets` keyring domain handle.
+    #[inline]
+    #[must_use]
+    pub fn secrets(&self) -> SecretsClient<'_> {
+        SecretsClient(self)
+    }
+
+    /// Returns the `org.freedesktop.fwupd` firmware update domain handle.
+    #[inline]
+    #[must_use]
+    pub fn fwupd(&self) -> FwupdClient<'_> {
+        FwupdClient(self)
+    }
+
+    /// Returns the `org.freedesktop.PackageKit` package update domain handle.
+    #[inline]
+    #[must_use]
+    pub fn packagekit(&self) -> PackageKitClient<'_> {
+        PackageKitClient(self)
+    }
+
+    /// Returns the `org.kde.kdeconnect` domain handle.
+    #[inline]
+    #[must_use]
+    pub fn kdeconnect(&self) -> KdeConnectClient<'_> {
+        KdeConnectClient(self)
+    }
+
+    /// Returns the `org.freedesktop.ColorManager` (`colord`) domain handle.
+    #[inline]
+    #[must_use]
+    pub fn colord(&self) -> ColordClient<'_> {
+        ColordClient(self)
+    }
+
+    /// Returns the `org.freedesktop.Avahi.Server` mDNS domain handle.
+    #[inline]
+    #[must_use]
+    pub fn avahi(&self) -> AvahiClient<'_> {
+        AvahiClient(self)
     }
 
     // ---- Core raw D-Bus operations ----

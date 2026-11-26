@@ -293,17 +293,66 @@ impl TrayClient<'_> {
         self.call_sni_action(service, path, "Scroll", (delta, orientation.to_owned()))
     }
 
+    /// Notifies a `com.canonical.dbusmenu` provider that a menu (`item_id = 0` for root) is about
+    /// to be displayed, returning `true` when the provider reports that layout updates are needed.
+    pub fn about_to_show_blocking(
+        &self,
+        service: &str,
+        menu_path: &str,
+        item_id: i32,
+    ) -> Result<bool> {
+        let bus = validate_bus_name(service, "dbusmenu service")?;
+        let path = validate_object_path(menu_path, "dbusmenu menu_path")?;
+        let conn = self.0.async_connection(DbusBus::Session)?;
+        futures_lite::future::block_on(async move {
+            let reply = conn
+                .call_method(
+                    Some(bus.as_str()),
+                    path.as_str(),
+                    Some(DBUSMENU_IFACE),
+                    "AboutToShow",
+                    &(item_id,),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("dbusmenu AboutToShow failed: {e}")))?;
+            reply
+                .body()
+                .deserialize()
+                .map_err(|e| WaywiError::DbusError(e.to_string()))
+        })
+    }
+
     /// Reads top-level `com.canonical.dbusmenu` entries synchronously from a tray item's
-    /// `menu_path`.
+    /// `menu_path` (invoking `AboutToShow(0)` first per spec so dynamic menus refresh).
     pub fn menu_layout_blocking(
         &self,
         service: &str,
         menu_path: &str,
     ) -> Result<Vec<TrayMenuItem>> {
+        self.submenu_layout_blocking(service, menu_path, 0)
+    }
+
+    /// Reads `com.canonical.dbusmenu` child entries under `parent_id` synchronously (invoking
+    /// `AboutToShow(parent_id)` best-effort before `GetLayout`).
+    pub fn submenu_layout_blocking(
+        &self,
+        service: &str,
+        menu_path: &str,
+        parent_id: i32,
+    ) -> Result<Vec<TrayMenuItem>> {
         let bus = validate_bus_name(service, "dbusmenu service")?;
         let path = validate_object_path(menu_path, "dbusmenu menu_path")?;
         let conn = self.0.async_connection(DbusBus::Session)?;
         futures_lite::future::block_on(async move {
+            let _ = conn
+                .call_method(
+                    Some(bus.as_str()),
+                    path.as_str(),
+                    Some(DBUSMENU_IFACE),
+                    "AboutToShow",
+                    &(parent_id,),
+                )
+                .await;
             let empty_props: Vec<&str> = Vec::new();
             let reply = conn
                 .call_method(
@@ -311,7 +360,7 @@ impl TrayClient<'_> {
                     path.as_str(),
                     Some(DBUSMENU_IFACE),
                     "GetLayout",
-                    &(0i32, -1i32, empty_props),
+                    &(parent_id, -1i32, empty_props),
                 )
                 .await
                 .map_err(|e| WaywiError::DbusError(format!("dbusmenu GetLayout failed: {e}")))?;

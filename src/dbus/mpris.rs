@@ -76,7 +76,7 @@ impl MprisLoopStatus {
 }
 
 /// Typed snapshot of an MPRIS media player (`org.mpris.MediaPlayer2` + `org.mpris.MediaPlayer2.Player`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MprisSnapshot {
     pub service_name: String,
     pub identity: Option<String>,
@@ -85,6 +85,9 @@ pub struct MprisSnapshot {
     pub loop_status: MprisLoopStatus,
     pub shuffle: bool,
     pub volume_percent: Option<u8>,
+    pub rate: f64,
+    pub minimum_rate: f64,
+    pub maximum_rate: f64,
     pub track_id: Option<String>,
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -103,9 +106,42 @@ pub struct MprisSnapshot {
     pub can_quit: bool,
 }
 
+impl Default for MprisSnapshot {
+    fn default() -> Self {
+        Self {
+            service_name: String::new(),
+            identity: None,
+            desktop_entry: None,
+            status: MprisPlaybackStatus::default(),
+            loop_status: MprisLoopStatus::default(),
+            shuffle: false,
+            volume_percent: None,
+            rate: 1.0,
+            minimum_rate: 1.0,
+            maximum_rate: 1.0,
+            track_id: None,
+            title: None,
+            artist: None,
+            artists: Vec::new(),
+            album: None,
+            art_url: None,
+            length_us: None,
+            position_us: None,
+            can_go_next: false,
+            can_go_previous: false,
+            can_play: false,
+            can_pause: false,
+            can_seek: false,
+            can_control: false,
+            can_raise: false,
+            can_quit: false,
+        }
+    }
+}
+
 /// Events emitted by [`Dbus::mpris`] when observing session media players.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MprisEvent {
     /// Initial or updated aggregate list of active MPRIS players sorted by priority (`Playing` first).
     PlayersUpdated(Vec<MprisSnapshot>),
@@ -334,6 +370,77 @@ impl MprisClient<'_> {
             Value::from(shuffle),
         )
     }
+
+    /// Sets the playback speed multiplier (`org.mpris.MediaPlayer2.Player.Rate`, e.g. `1.0`, `1.5`).
+    pub fn set_rate(&self, destination: &str, rate: f64) -> Result<()> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(WaywiError::DbusError(
+                "MPRIS playback rate must be finite and positive".into(),
+            ));
+        }
+        self.0.set_property_zvariant(
+            DbusBus::Session,
+            destination,
+            MPRIS_OBJECT,
+            MPRIS_PLAYER_IFACE,
+            "Rate",
+            Value::from(rate),
+        )
+    }
+
+    /// Raises the player window via `org.mpris.MediaPlayer2.Raise`.
+    pub fn raise(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
+            DbusBus::Session,
+            destination,
+            MPRIS_OBJECT,
+            MPRIS_ROOT_IFACE,
+            "Raise",
+        )
+    }
+
+    /// Requests the media player to quit via `org.mpris.MediaPlayer2.Quit`.
+    pub fn quit(&self, destination: &str) -> Result<()> {
+        self.0.call_lane_method_unit(
+            DbusActionLane::Mpris,
+            DbusBus::Session,
+            destination,
+            MPRIS_OBJECT,
+            MPRIS_ROOT_IFACE,
+            "Quit",
+        )
+    }
+
+    /// Opens a media URI in `destination` via `org.mpris.MediaPlayer2.Player.OpenUri`.
+    pub fn open_uri(&self, destination: &str, uri: &str) -> Result<()> {
+        let dest = validate_bus_name(destination, "MPRIS destination")?;
+        if uri.trim().is_empty() {
+            return Err(WaywiError::DbusError("MPRIS URI cannot be empty".into()));
+        }
+        let target = dest.clone();
+        let uri_owned = uri.to_owned();
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::Mpris,
+                DbusBus::Session,
+                "Player.OpenUri",
+                target,
+            ),
+            move |conn| async move {
+                conn.call_method(
+                    Some(dest.as_str()),
+                    MPRIS_OBJECT,
+                    Some(MPRIS_PLAYER_IFACE),
+                    "OpenUri",
+                    &(uri_owned.as_str(),),
+                )
+                .await
+                .map_err(|e| WaywiError::DbusError(format!("Player.OpenUri failed: {e}")))?;
+                Ok(())
+            },
+        )
+    }
 }
 
 async fn list_mpris_names(conn: &zbus::Connection) -> Result<Vec<String>> {
@@ -389,6 +496,15 @@ pub(crate) fn parse_mpris_snapshot(
     let volume_percent = dict_f64(player_props, "Volume")
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|v| (v * 100.0).round().clamp(0.0, 255.0) as u8);
+    let rate = dict_f64(player_props, "Rate")
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+    let minimum_rate = dict_f64(player_props, "MinimumRate")
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
+    let maximum_rate = dict_f64(player_props, "MaximumRate")
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0);
     let position_us = dict_i64(player_props, "Position");
 
     let can_go_next = dict_bool(player_props, "CanGoNext").unwrap_or(false);
@@ -455,6 +571,9 @@ pub(crate) fn parse_mpris_snapshot(
         loop_status,
         shuffle,
         volume_percent,
+        rate,
+        minimum_rate,
+        maximum_rate,
         track_id,
         title,
         artist,

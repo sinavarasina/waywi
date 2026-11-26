@@ -128,6 +128,19 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         rt.sub_mgr.dbus_portal_settings.drain_into(msgs);
         rt.sub_mgr.dbus_mpris.drain_into(msgs);
         rt.sub_mgr.dbus_action_results.drain_into(msgs);
+        rt.sub_mgr.dbus_nm_secret_agent.drain_into(msgs);
+        rt.sub_mgr.dbus_sensors.drain_into(msgs);
+        rt.sub_mgr.dbus_polkit_agent.drain_into(msgs);
+        rt.sub_mgr.dbus_systemd_user.drain_into(msgs);
+        rt.sub_mgr.dbus_systemd_system.drain_into(msgs);
+        rt.sub_mgr.dbus_timedate.drain_into(msgs);
+        rt.sub_mgr.dbus_accounts.drain_into(msgs);
+        rt.sub_mgr.dbus_fprint_verify.drain_into(msgs);
+        rt.sub_mgr.dbus_gamemode.drain_into(msgs);
+        rt.sub_mgr.dbus_fwupd.drain_into(msgs);
+        rt.sub_mgr.dbus_cups.drain_into(msgs);
+        rt.sub_mgr.dbus_kdeconnect.drain_into(msgs);
+        rt.sub_mgr.dbus_colord.drain_into(msgs);
     }
 
     #[cfg(feature = "global-shortcuts")]

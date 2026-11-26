@@ -1,6 +1,8 @@
 //! System NetworkManager inspection, Wi-Fi management, and connection control (`org.freedesktop.NetworkManager`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
@@ -14,7 +16,7 @@ use super::client::{
     connect_shared_bus, validate_object_path,
 };
 use super::types::{Dbus, DbusBus};
-use super::worker::DbusWorkerHandle;
+use super::worker::{AsyncReplySlot, AsyncStopSignal, DbusWorkerHandle};
 use super::zvariant_helpers::{
     dict_bool, dict_bytes, dict_object_path, dict_str, dict_str_vec, dict_u8, dict_u32, get_all,
     unwrap_value,
@@ -23,13 +25,17 @@ use super::zvariant_helpers::{
 const NM_DEST: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
 const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
+const NM_AGENT_MGR_PATH: &str = "/org/freedesktop/NetworkManager/AgentManager";
+const NM_SECRET_AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
 const NM_IFACE: &str = "org.freedesktop.NetworkManager";
 const NM_SETTINGS_IFACE: &str = "org.freedesktop.NetworkManager.Settings";
 const NM_SETTINGS_CONN_IFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
+const NM_AGENT_MGR_IFACE: &str = "org.freedesktop.NetworkManager.AgentManager";
 const NM_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device";
 const NM_WIRELESS_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const NM_AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const NM_ACTIVE_IFACE: &str = "org.freedesktop.NetworkManager.Connection.Active";
+const NM_VPN_IFACE: &str = "org.freedesktop.NetworkManager.VPN.Connection";
 const NM_IP4_IFACE: &str = "org.freedesktop.NetworkManager.IP4Config";
 
 /// Minimum interval between expensive Wi-Fi AP / Settings refreshes on `PropertiesChanged` bursts.
@@ -136,6 +142,161 @@ pub enum NmWifiSecurity {
     Owe,
 }
 
+/// NetworkManager VPN connection state (`NMVpnConnectionState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NmVpnState {
+    #[default]
+    Unknown = 0,
+    Prepare = 1,
+    NeedAuth = 2,
+    Connect = 3,
+    IpConfigGet = 4,
+    Activated = 5,
+    Failed = 6,
+    Disconnected = 7,
+}
+
+impl NmVpnState {
+    #[must_use]
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            1 => Self::Prepare,
+            2 => Self::NeedAuth,
+            3 => Self::Connect,
+            4 => Self::IpConfigGet,
+            5 => Self::Activated,
+            6 => Self::Failed,
+            7 => Self::Disconnected,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// WPA-Enterprise (`802-1x`) authentication parameters for [`WifiConnectOptions::enterprise`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WifiEnterpriseOptions {
+    /// EAP method (e.g. `"peap"`, `"ttls"`, `"tls"`, `"pwd"`).
+    pub eap: String,
+    pub identity: String,
+    pub password: Option<String>,
+    pub anonymous_identity: Option<String>,
+    /// Phase-2 inner authentication (e.g. `"mschapv2"`, `"pap"`, `"gtc"`).
+    pub phase2_auth: Option<String>,
+    /// Optional CA certificate file path (encoded as `file://...` byte array per NM spec).
+    pub ca_cert_path: Option<String>,
+    pub domain_suffix_match: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub private_key_path: Option<String>,
+    pub private_key_password: Option<String>,
+}
+
+impl WifiEnterpriseOptions {
+    #[must_use]
+    pub fn new(eap: impl Into<String>, identity: impl Into<String>) -> Self {
+        Self {
+            eap: eap.into(),
+            identity: identity.into(),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    #[must_use]
+    pub fn anonymous_identity(mut self, anon: impl Into<String>) -> Self {
+        self.anonymous_identity = Some(anon.into());
+        self
+    }
+
+    #[must_use]
+    pub fn phase2_auth(mut self, phase2: impl Into<String>) -> Self {
+        self.phase2_auth = Some(phase2.into());
+        self
+    }
+
+    #[must_use]
+    pub fn ca_cert_path(mut self, path: impl Into<String>) -> Self {
+        self.ca_cert_path = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn domain_suffix_match(mut self, domain: impl Into<String>) -> Self {
+        self.domain_suffix_match = Some(domain.into());
+        self
+    }
+
+    #[must_use]
+    pub fn client_cert_path(mut self, path: impl Into<String>) -> Self {
+        self.client_cert_path = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn private_key_path(mut self, path: impl Into<String>) -> Self {
+        self.private_key_path = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn private_key_password(mut self, password: impl Into<String>) -> Self {
+        self.private_key_password = Some(password.into());
+        self
+    }
+}
+
+/// Options for [`NetworkManagerClient::start_hotspot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotspotOptions {
+    pub ssid: String,
+    pub password: Option<String>,
+    /// Frequency band (`"bg"` for 2.4 GHz or `"a"` for 5 GHz).
+    pub band: Option<String>,
+    pub channel: Option<u32>,
+    pub device_path: Option<String>,
+}
+
+impl HotspotOptions {
+    #[must_use]
+    pub fn new(ssid: impl Into<String>) -> Self {
+        Self {
+            ssid: ssid.into(),
+            password: None,
+            band: Some("bg".to_owned()),
+            channel: None,
+            device_path: None,
+        }
+    }
+
+    #[must_use]
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    #[must_use]
+    pub fn band(mut self, band: impl Into<String>) -> Self {
+        self.band = Some(band.into());
+        self
+    }
+
+    #[must_use]
+    pub fn channel(mut self, channel: u32) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    #[must_use]
+    pub fn device_path(mut self, path: impl Into<String>) -> Self {
+        self.device_path = Some(path.into());
+        self
+    }
+}
+
 /// Options for [`NetworkManagerClient::connect_wifi`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WifiConnectOptions {
@@ -144,6 +305,7 @@ pub struct WifiConnectOptions {
     pub security: Option<NmWifiSecurity>,
     pub hidden: bool,
     pub lock_bssid: bool,
+    pub enterprise: Option<WifiEnterpriseOptions>,
 }
 
 impl WifiConnectOptions {
@@ -161,6 +323,7 @@ impl WifiConnectOptions {
             security: Some(ap.security),
             hidden: false,
             lock_bssid: false,
+            enterprise: None,
         }
     }
 
@@ -191,6 +354,14 @@ impl WifiConnectOptions {
     #[must_use]
     pub fn lock_bssid(mut self, lock_bssid: bool) -> Self {
         self.lock_bssid = lock_bssid;
+        self
+    }
+
+    /// Configures WPA-Enterprise (`802-1x`) settings and sets `security` to [`NmWifiSecurity::WpaEap`].
+    #[must_use]
+    pub fn enterprise(mut self, enterprise: WifiEnterpriseOptions) -> Self {
+        self.security = Some(NmWifiSecurity::WpaEap);
+        self.enterprise = Some(enterprise);
         self
     }
 }
@@ -249,6 +420,8 @@ pub struct NmActiveConnection {
     pub devices: Vec<String>,
     pub default_v4: bool,
     pub default_v6: bool,
+    pub vpn: bool,
+    pub vpn_state: Option<NmVpnState>,
 }
 
 /// Snapshot of system NetworkManager connectivity, radios, devices, active connections, and Wi-Fi access points.
@@ -267,6 +440,56 @@ pub struct NetworkManagerSnapshot {
     pub saved_connections: Vec<NmSavedConnection>,
 }
 
+impl NetworkManagerSnapshot {
+    /// Iterates over currently active VPN connections (including WireGuard tunnels).
+    pub fn active_vpns(&self) -> impl Iterator<Item = &NmActiveConnection> {
+        self.active_connections
+            .iter()
+            .filter(|c| c.vpn || c.conn_type == "vpn" || c.conn_type == "wireguard")
+    }
+
+    /// Iterates over saved VPN / WireGuard connection profiles.
+    pub fn saved_vpns(&self) -> impl Iterator<Item = &NmSavedConnection> {
+        self.saved_connections
+            .iter()
+            .filter(|c| c.conn_type == "vpn" || c.conn_type == "wireguard")
+    }
+}
+
+/// Incoming secret prompt from NetworkManager (`org.freedesktop.NetworkManager.SecretAgent.GetSecrets`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NmSecretAgentRequest {
+    pub request_id: u64,
+    pub connection_path: String,
+    pub connection_id: String,
+    pub connection_type: String,
+    pub setting_name: String,
+    pub hints: Vec<String>,
+    pub flags: u32,
+}
+
+/// Application reply to a pending [`NmSecretAgentRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NmSecretAgentReply {
+    /// Supply secret key-value pairs for the requested `setting_name` (e.g. `("psk", "...")`).
+    Secrets(HashMap<String, String>),
+    /// User cancelled the secret prompt.
+    Cancelled,
+}
+
+/// Events emitted by [`Dbus::nm_secret_agent`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NmSecretAgentEvent {
+    Ready,
+    GetSecrets(NmSecretAgentRequest),
+    CancelGetSecrets {
+        connection_path: String,
+        setting_name: String,
+    },
+    Error(String),
+}
+
 impl Dbus {
     /// Subscribes to NetworkManager state, device, and Wi-Fi access-point changes on the system D-Bus.
     pub fn network_manager<M: 'static>(
@@ -274,6 +497,19 @@ impl Dbus {
     ) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::DbusNetworkManager {
+                map: FrameSharedFn::new(map),
+            },
+        }
+    }
+
+    /// Registers an interactive `org.freedesktop.NetworkManager.SecretAgent` on the system bus
+    /// (`AgentManager.Register("waywi")`) so the app can fulfill dynamic Wi-Fi / VPN secret
+    /// prompts via [`NetworkManagerClient::reply_secret_agent`].
+    pub fn nm_secret_agent<M: 'static>(
+        map: impl Fn(NmSecretAgentEvent) -> M + 'static,
+    ) -> Subscription<M> {
+        Subscription {
+            spec: SubscriptionSpec::DbusNmSecretAgent {
                 map: FrameSharedFn::new(map),
             },
         }
@@ -426,8 +662,11 @@ impl NetworkManagerClient<'_> {
         let ssid_owned = ssid.to_owned();
         let target = ssid_owned.clone();
         let pw_owned = options.password.clone();
+        let enterprise_owned = options.enterprise.clone();
         let security = options.security.unwrap_or_else(|| {
-            if pw_owned.as_deref().is_some_and(|p| !p.is_empty()) {
+            if enterprise_owned.is_some() {
+                NmWifiSecurity::WpaEap
+            } else if pw_owned.as_deref().is_some_and(|p| !p.is_empty()) {
                 NmWifiSecurity::WpaPsk
             } else {
                 NmWifiSecurity::Open
@@ -466,6 +705,7 @@ impl NetworkManagerClient<'_> {
                     .map_err(|e| WaywiError::DbusError(e.to_string()))?;
 
                 if pw_owned.is_none()
+                    && enterprise_owned.is_none()
                     && !hidden
                     && let Ok(saved) = list_saved_connections(&conn).await
                     && let Some(existing) = saved
@@ -495,11 +735,12 @@ impl NetworkManagerClient<'_> {
                     return Ok(DbusActionReply::ObjectPath(active_path.to_string()));
                 }
 
-                let settings = build_wifi_connection_settings(
+                let settings = build_wifi_connection_settings_with_enterprise(
                     &ssid_owned,
                     security,
                     pw_owned.as_deref(),
                     hidden,
+                    enterprise_owned.as_ref(),
                 );
                 let reply = conn
                     .call_method(
@@ -679,13 +920,158 @@ impl NetworkManagerClient<'_> {
             },
         )
     }
+
+    /// Starts a Wi-Fi AP hotspot (`mode = "ap"`, `ipv4.method = "shared"`) via
+    /// `AddAndActivateConnection`, emitting `DbusActionReply::ObjectPath(active_connection_path)`.
+    pub fn start_hotspot(&self, options: &HotspotOptions) -> Result<()> {
+        if options.ssid.is_empty() {
+            return Err(WaywiError::DbusError("Hotspot SSID cannot be empty".into()));
+        }
+        let dev_hint = match options.device_path.as_deref().filter(|s| !s.is_empty()) {
+            Some(p) => Some(validate_object_path(p, "Hotspot Wi-Fi device path")?),
+            None => None,
+        };
+        let opts = options.clone();
+        let target = opts.ssid.clone();
+        self.0.submit_lane_action(
+            LaneActionSpec::fast(
+                DbusActionLane::NetworkManager,
+                DbusBus::System,
+                "NetworkManager.StartHotspot",
+                target,
+            )
+            .with_dedup(format!("nm:hotspot:{}", opts.ssid))
+            .with_timeout(DBUS_SLOW_TIMEOUT),
+            move |conn| async move {
+                let dev_path = match dev_hint {
+                    Some(p) => p,
+                    None => find_first_wifi_device(&conn).await.ok_or_else(|| {
+                        WaywiError::DbusError("no Wi-Fi device managed by NetworkManager".into())
+                    })?,
+                };
+                let dev_obj = OwnedObjectPath::try_from(dev_path)
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let root_obj = OwnedObjectPath::try_from("/")
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                let settings = build_hotspot_settings(&opts);
+                let reply = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_PATH,
+                        Some(NM_IFACE),
+                        "AddAndActivateConnection",
+                        &(settings, &dev_obj, &root_obj),
+                    )
+                    .await
+                    .map_err(|e| WaywiError::DbusError(format!("StartHotspot failed: {e}")))?;
+                let (_profile_path, active_path): (OwnedObjectPath, OwnedObjectPath) = reply
+                    .body()
+                    .deserialize()
+                    .map_err(|e| WaywiError::DbusError(e.to_string()))?;
+                Ok(DbusActionReply::ObjectPath(active_path.to_string()))
+            },
+        )
+    }
+
+    /// Activates a saved VPN or WireGuard connection profile (`ActivateConnection` with `"/"`).
+    pub fn activate_vpn(&self, connection_path: &str) -> Result<()> {
+        self.activate_connection(connection_path, None)
+    }
+
+    /// Deactivates an active VPN or WireGuard connection (`DeactivateConnection`).
+    pub fn deactivate_vpn(&self, active_connection_path: &str) -> Result<()> {
+        self.deactivate_connection(active_connection_path)
+    }
+
+    /// Replies to a pending [`NmSecretAgentRequest`] emitted by [`Dbus::nm_secret_agent`].
+    pub fn reply_secret_agent(&self, request_id: u64, reply: NmSecretAgentReply) -> Result<()> {
+        let slot = self
+            .0
+            .nm_secret_agent_pending
+            .lock()
+            .map_err(|_| WaywiError::DbusError("NM secret agent pending lock poisoned".into()))?
+            .remove(&request_id)
+            .ok_or_else(|| {
+                WaywiError::DbusError(format!(
+                    "no pending NetworkManager secret agent request with id {request_id}"
+                ))
+            })?;
+        slot.resolve(reply);
+        Ok(())
+    }
 }
 
+pub(crate) fn build_hotspot_settings(
+    opts: &HotspotOptions,
+) -> HashMap<&'static str, HashMap<&'static str, Value<'_>>> {
+    let mut conn_sec: HashMap<&'static str, Value<'_>> = HashMap::new();
+    conn_sec.insert("id", Value::from(opts.ssid.as_str()));
+    conn_sec.insert("type", Value::from("802-11-wireless"));
+    conn_sec.insert("autoconnect", Value::from(false));
+
+    let mut wifi_sec: HashMap<&'static str, Value<'_>> = HashMap::new();
+    wifi_sec.insert("ssid", Value::from(opts.ssid.as_bytes().to_vec()));
+    wifi_sec.insert("mode", Value::from("ap"));
+    if let Some(ref band) = opts.band
+        && !band.is_empty()
+    {
+        wifi_sec.insert("band", Value::from(band.as_str()));
+    }
+    if let Some(ch) = opts.channel {
+        wifi_sec.insert("channel", Value::from(ch));
+    }
+
+    let mut ipv4: HashMap<&'static str, Value<'_>> = HashMap::new();
+    ipv4.insert("method", Value::from("shared"));
+
+    let mut ipv6: HashMap<&'static str, Value<'_>> = HashMap::new();
+    ipv6.insert("method", Value::from("ignore"));
+
+    let mut top: HashMap<&'static str, HashMap<&'static str, Value<'_>>> = HashMap::new();
+    top.insert("connection", conn_sec);
+    top.insert("802-11-wireless", wifi_sec);
+    top.insert("ipv4", ipv4);
+    top.insert("ipv6", ipv6);
+
+    if let Some(pw) = opts.password.as_deref().filter(|p| !p.is_empty()) {
+        let mut sec: HashMap<&'static str, Value<'_>> = HashMap::new();
+        sec.insert("key-mgmt", Value::from("wpa-psk"));
+        sec.insert("proto", Value::from(vec!["rsn"]));
+        sec.insert("pairwise", Value::from(vec!["ccmp"]));
+        sec.insert("group", Value::from(vec!["ccmp"]));
+        sec.insert("psk", Value::from(pw));
+        top.insert("802-11-wireless-security", sec);
+    }
+
+    top
+}
+
+#[cfg(test)]
 pub(crate) fn build_wifi_connection_settings<'a>(
     ssid: &'a str,
     security: NmWifiSecurity,
     password: Option<&'a str>,
     hidden: bool,
+) -> HashMap<&'static str, HashMap<&'static str, Value<'a>>> {
+    build_wifi_connection_settings_with_enterprise(ssid, security, password, hidden, None)
+}
+
+fn encode_nm_cert_path(path: &str) -> Vec<u8> {
+    let mut bytes = if path.starts_with("file://") {
+        path.as_bytes().to_vec()
+    } else {
+        format!("file://{path}").into_bytes()
+    };
+    bytes.push(0);
+    bytes
+}
+
+pub(crate) fn build_wifi_connection_settings_with_enterprise<'a>(
+    ssid: &'a str,
+    security: NmWifiSecurity,
+    password: Option<&'a str>,
+    hidden: bool,
+    enterprise: Option<&'a WifiEnterpriseOptions>,
 ) -> HashMap<&'static str, HashMap<&'static str, Value<'a>>> {
     let mut conn_sec: HashMap<&'static str, Value<'a>> = HashMap::new();
     conn_sec.insert("id", Value::from(ssid));
@@ -702,6 +1088,54 @@ pub(crate) fn build_wifi_connection_settings<'a>(
     let mut top: HashMap<&'static str, HashMap<&'static str, Value<'a>>> = HashMap::new();
     top.insert("connection", conn_sec);
     top.insert("802-11-wireless", wifi_sec);
+
+    if let Some(ent) = enterprise {
+        let mut sec: HashMap<&'static str, Value<'a>> = HashMap::new();
+        sec.insert("key-mgmt", Value::from("wpa-eap"));
+        top.insert("802-11-wireless-security", sec);
+
+        let mut eap_sec: HashMap<&'static str, Value<'a>> = HashMap::new();
+        let method = if ent.eap.is_empty() {
+            "peap"
+        } else {
+            ent.eap.as_str()
+        };
+        eap_sec.insert("eap", Value::from(vec![method]));
+        if !ent.identity.is_empty() {
+            eap_sec.insert("identity", Value::from(ent.identity.as_str()));
+        }
+        if let Some(pw) = ent
+            .password
+            .as_deref()
+            .or(password)
+            .filter(|p| !p.is_empty())
+        {
+            eap_sec.insert("password", Value::from(pw));
+        }
+        if let Some(ref anon) = ent.anonymous_identity {
+            eap_sec.insert("anonymous-identity", Value::from(anon.as_str()));
+        }
+        if let Some(ref p2) = ent.phase2_auth {
+            eap_sec.insert("phase2-auth", Value::from(p2.as_str()));
+        }
+        if let Some(ref ca) = ent.ca_cert_path {
+            eap_sec.insert("ca-cert", Value::from(encode_nm_cert_path(ca)));
+        }
+        if let Some(ref dom) = ent.domain_suffix_match {
+            eap_sec.insert("domain-suffix-match", Value::from(dom.as_str()));
+        }
+        if let Some(ref cc) = ent.client_cert_path {
+            eap_sec.insert("client-cert", Value::from(encode_nm_cert_path(cc)));
+        }
+        if let Some(ref pk) = ent.private_key_path {
+            eap_sec.insert("private-key", Value::from(encode_nm_cert_path(pk)));
+        }
+        if let Some(ref pkpw) = ent.private_key_password {
+            eap_sec.insert("private-key-password", Value::from(pkpw.as_str()));
+        }
+        top.insert("802-1x", eap_sec);
+        return top;
+    }
 
     let clean_pw = password.filter(|p| !p.is_empty());
     match (security, clean_pw) {
@@ -951,6 +1385,7 @@ fn finalize_access_points(by_ssid: HashMap<String, NmAccessPoint>) -> Vec<NmAcce
 fn parse_active_connection(
     object_path: String,
     ap: &HashMap<String, OwnedValue>,
+    vpn_state: Option<NmVpnState>,
 ) -> NmActiveConnection {
     NmActiveConnection {
         object_path,
@@ -962,6 +1397,8 @@ fn parse_active_connection(
         devices: dict_str_vec(ap, "Devices"),
         default_v4: dict_bool(ap, "Default").unwrap_or(false),
         default_v6: dict_bool(ap, "Default6").unwrap_or(false),
+        vpn: dict_bool(ap, "Vpn").unwrap_or(false),
+        vpn_state,
     }
 }
 
@@ -1046,7 +1483,17 @@ async fn read_nm_snapshot_cached(
         let Ok(active_conn) = get_all(conn, NM_DEST, &path, NM_ACTIVE_IFACE).await else {
             continue;
         };
-        let conn_info = parse_active_connection(path.clone(), &active_conn);
+        let is_vpn = dict_bool(&active_conn, "Vpn").unwrap_or(false);
+        let vpn_state = if is_vpn {
+            get_all(conn, NM_DEST, &path, NM_VPN_IFACE)
+                .await
+                .ok()
+                .and_then(|vp| dict_u32(&vp, "VpnState"))
+                .map(NmVpnState::from_u32)
+        } else {
+            None
+        };
+        let conn_info = parse_active_connection(path.clone(), &active_conn, vpn_state);
         if primary_path.as_deref() == Some(path.as_str()) && !conn_info.id.is_empty() {
             primary_id = Some(conn_info.id.clone());
         }
@@ -1249,6 +1696,216 @@ fn classify_nm_signal_refresh(msg: &zbus::Message, cache: &NmWorkerCache) -> (bo
     (refresh_settings, refresh_aps)
 }
 
+pub(crate) type NmSecretReplySlot = AsyncReplySlot<NmSecretAgentReply>;
+pub(crate) type PendingNmSecretMap = Arc<Mutex<HashMap<u64, Arc<NmSecretReplySlot>>>>;
+
+fn cancel_all_nm_secrets(pending: &PendingNmSecretMap) {
+    let slots: Vec<Arc<NmSecretReplySlot>> = match pending.lock() {
+        Ok(mut map) => map.drain().map(|(_, s)| s).collect(),
+        Err(poisoned) => poisoned.into_inner().drain().map(|(_, s)| s).collect(),
+    };
+    for slot in slots {
+        slot.resolve(NmSecretAgentReply::Cancelled);
+    }
+}
+
+struct NmSecretAgentIface {
+    next_id: AtomicU64,
+    sender: calloop::channel::Sender<NmSecretAgentEvent>,
+    pending: PendingNmSecretMap,
+    stop: AsyncStopSignal,
+}
+
+#[zbus::interface(name = "org.freedesktop.NetworkManager.SecretAgent")]
+impl NmSecretAgentIface {
+    async fn get_secrets(
+        &self,
+        connection: HashMap<String, HashMap<String, OwnedValue>>,
+        connection_path: ObjectPath<'_>,
+        setting_name: &str,
+        hints: Vec<String>,
+        flags: u32,
+    ) -> zbus::fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
+        let conn_sec = connection.get("connection");
+        let connection_id = conn_sec.and_then(|c| dict_str(c, "id")).unwrap_or_default();
+        let connection_type = conn_sec
+            .and_then(|c| dict_str(c, "type"))
+            .unwrap_or_default();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let slot = NmSecretReplySlot::new();
+        if let Ok(mut map) = self.pending.lock() {
+            map.insert(id, Arc::clone(&slot));
+        }
+        let _ = self
+            .sender
+            .send(NmSecretAgentEvent::GetSecrets(NmSecretAgentRequest {
+                request_id: id,
+                connection_path: connection_path.to_string(),
+                connection_id,
+                connection_type,
+                setting_name: setting_name.to_owned(),
+                hints,
+                flags,
+            }));
+
+        let reply = futures_lite::future::or(slot.wait(), async {
+            self.stop.wait_stopped().await;
+            None
+        })
+        .await
+        .unwrap_or(NmSecretAgentReply::Cancelled);
+
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&id);
+        }
+
+        match reply {
+            NmSecretAgentReply::Secrets(kv) => {
+                let mut inner: HashMap<String, OwnedValue> = HashMap::with_capacity(kv.len());
+                for (k, v) in kv {
+                    if let Ok(ov) = OwnedValue::try_from(Value::from(v)) {
+                        inner.insert(k, ov);
+                    }
+                }
+                let mut out = HashMap::new();
+                out.insert(setting_name.to_owned(), inner);
+                Ok(out)
+            }
+            NmSecretAgentReply::Cancelled => Err(zbus::fdo::Error::Failed(
+                "org.freedesktop.NetworkManager.SecretAgent.UserCanceled".into(),
+            )),
+        }
+    }
+
+    async fn cancel_get_secrets(
+        &self,
+        connection_path: ObjectPath<'_>,
+        setting_name: &str,
+    ) -> zbus::fdo::Result<()> {
+        let _ = self.sender.send(NmSecretAgentEvent::CancelGetSecrets {
+            connection_path: connection_path.to_string(),
+            setting_name: setting_name.to_owned(),
+        });
+        Ok(())
+    }
+
+    async fn save_secrets(
+        &self,
+        _connection: HashMap<String, HashMap<String, OwnedValue>>,
+        _connection_path: ObjectPath<'_>,
+    ) -> zbus::fdo::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_secrets(
+        &self,
+        _connection: HashMap<String, HashMap<String, OwnedValue>>,
+        _connection_path: ObjectPath<'_>,
+    ) -> zbus::fdo::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct NmSecretAgentWorker {
+    pending: PendingNmSecretMap,
+    handle: DbusWorkerHandle,
+}
+
+impl NmSecretAgentWorker {
+    pub(crate) fn spawn(
+        sender: calloop::channel::Sender<NmSecretAgentEvent>,
+        pending: PendingNmSecretMap,
+    ) -> Self {
+        let pending_thread = Arc::clone(&pending);
+        let handle = DbusWorkerHandle::spawn("waywi-dbus-nm-agent", move |stop_sig| {
+            futures_lite::future::block_on(async move {
+                let iface = NmSecretAgentIface {
+                    next_id: AtomicU64::new(1),
+                    sender: sender.clone(),
+                    pending: Arc::clone(&pending_thread),
+                    stop: stop_sig.clone(),
+                };
+                let conn_res = match zbus::connection::Builder::system() {
+                    Ok(b) => match b.serve_at(NM_SECRET_AGENT_PATH, iface) {
+                        Ok(b2) => b2.build().await,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+                let conn = match conn_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = sender.send(NmSecretAgentEvent::Error(format!(
+                            "failed to initialize NM SecretAgent server: {e}"
+                        )));
+                        return;
+                    }
+                };
+                if let Err(e) = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_AGENT_MGR_PATH,
+                        Some(NM_AGENT_MGR_IFACE),
+                        "Register",
+                        &("waywi",),
+                    )
+                    .await
+                {
+                    let _ = sender.send(NmSecretAgentEvent::Error(format!(
+                        "AgentManager.Register failed: {e}"
+                    )));
+                    return;
+                }
+                let _ = sender.send(NmSecretAgentEvent::Ready);
+
+                // Intercept incoming CancelGetSecrets calls directly on the raw stream so an
+                // in-flight GetSecrets `.await` wakes immediately even while zbus serializes
+                // ObjectServer method dispatch.
+                let mut raw_stream = zbus::MessageStream::from(&conn);
+                use futures_lite::StreamExt;
+                while !stop_sig.is_stopped() {
+                    let next =
+                        futures_lite::future::or(async { Some(raw_stream.next().await) }, async {
+                            stop_sig.wait_stopped().await;
+                            None
+                        })
+                        .await;
+                    let Some(Some(Ok(msg))) = next else {
+                        break;
+                    };
+                    let header = msg.header();
+                    if header.message_type() == zbus::message::Type::MethodCall
+                        && header.path().map(|p| p.as_str()) == Some(NM_SECRET_AGENT_PATH)
+                        && header.interface().map(|i| i.as_str())
+                            == Some("org.freedesktop.NetworkManager.SecretAgent")
+                        && header.member().map(|m| m.as_str()) == Some("CancelGetSecrets")
+                    {
+                        cancel_all_nm_secrets(&pending_thread);
+                    }
+                }
+                cancel_all_nm_secrets(&pending_thread);
+                let _ = conn
+                    .call_method(
+                        Some(NM_DEST),
+                        NM_AGENT_MGR_PATH,
+                        Some(NM_AGENT_MGR_IFACE),
+                        "Unregister",
+                        &(),
+                    )
+                    .await;
+            });
+        });
+        Self { pending, handle }
+    }
+}
+
+impl Drop for NmSecretAgentWorker {
+    fn drop(&mut self) {
+        self.handle.trigger_stop();
+        cancel_all_nm_secrets(&self.pending);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,5 +2009,82 @@ mod tests {
         assert_eq!(saved.id, "Corp_Staff");
         assert_eq!(saved.ssid.as_deref(), Some("Corp_Staff"));
         assert_eq!(saved.timestamp, 1_700_000_000);
+    }
+
+    #[test]
+    fn builds_wpa_enterprise_and_hotspot_settings_and_filters_vpns() {
+        let ent = WifiEnterpriseOptions::new("peap", "alice@corp.example")
+            .password("hunter2")
+            .phase2_auth("mschapv2")
+            .ca_cert_path("/etc/ssl/certs/corp.pem")
+            .domain_suffix_match("corp.example");
+        let ent_settings = build_wifi_connection_settings_with_enterprise(
+            "Eduroam",
+            NmWifiSecurity::WpaEap,
+            None,
+            false,
+            Some(&ent),
+        );
+        assert_eq!(
+            ent_settings["802-11-wireless-security"].get("key-mgmt"),
+            Some(&Value::from("wpa-eap"))
+        );
+        assert_eq!(
+            ent_settings["802-1x"].get("identity"),
+            Some(&Value::from("alice@corp.example"))
+        );
+        assert_eq!(
+            ent_settings["802-1x"].get("phase2-auth"),
+            Some(&Value::from("mschapv2"))
+        );
+
+        let hs = HotspotOptions::new("WayWi-AP")
+            .password("hotspot-pass")
+            .band("bg")
+            .channel(6);
+        let hs_settings = build_hotspot_settings(&hs);
+        assert_eq!(
+            hs_settings["802-11-wireless"].get("mode"),
+            Some(&Value::from("ap"))
+        );
+        assert_eq!(
+            hs_settings["ipv4"].get("method"),
+            Some(&Value::from("shared"))
+        );
+        assert_eq!(
+            hs_settings["802-11-wireless-security"].get("psk"),
+            Some(&Value::from("hotspot-pass"))
+        );
+
+        let snap = NetworkManagerSnapshot {
+            active_connections: vec![
+                NmActiveConnection {
+                    id: "wg0".into(),
+                    conn_type: "wireguard".into(),
+                    vpn: false,
+                    ..Default::default()
+                },
+                NmActiveConnection {
+                    id: "corp-vpn".into(),
+                    conn_type: "vpn".into(),
+                    vpn: true,
+                    vpn_state: Some(NmVpnState::Activated),
+                    ..Default::default()
+                },
+                NmActiveConnection {
+                    id: "home-wifi".into(),
+                    conn_type: "802-11-wireless".into(),
+                    ..Default::default()
+                },
+            ],
+            saved_connections: vec![NmSavedConnection {
+                id: "corp-vpn".into(),
+                conn_type: "vpn".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(snap.active_vpns().count(), 2);
+        assert_eq!(snap.saved_vpns().count(), 1);
     }
 }

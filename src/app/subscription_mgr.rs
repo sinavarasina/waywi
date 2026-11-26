@@ -326,6 +326,48 @@ pub(crate) struct SubscriptionManager<M> {
     #[cfg(feature = "dbus")]
     pub(crate) dbus_action_results:
         BroadcastSlot<crate::dbus::DbusActionResult, crate::dbus::DbusActionResultWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_nm_secret_agent:
+        BroadcastSlot<crate::dbus::NmSecretAgentEvent, crate::dbus::NmSecretAgentWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_sensors:
+        BroadcastSlot<crate::dbus::SensorProxySnapshot, crate::dbus::SensorsWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_polkit_agent:
+        BroadcastSlot<crate::dbus::PolkitAgentEvent, crate::dbus::PolkitAgentWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_systemd_user:
+        BroadcastSlot<crate::dbus::SystemdUnitsSnapshot, crate::dbus::SystemdUnitsWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_systemd_system:
+        BroadcastSlot<crate::dbus::SystemdUnitsSnapshot, crate::dbus::SystemdUnitsWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_timedate:
+        BroadcastSlot<crate::dbus::TimedateSnapshot, crate::dbus::ServiceWatchWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_accounts:
+        BroadcastSlot<crate::dbus::AccountsSnapshot, crate::dbus::ServiceWatchWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_fprint_verify:
+        BroadcastSlot<crate::dbus::FprintEvent, crate::dbus::FprintVerifyWorker, M>,
+    #[cfg(feature = "dbus")]
+    dbus_fprint_username: Option<String>,
+    #[cfg(feature = "dbus")]
+    dbus_fprint_active_username: Option<String>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_gamemode:
+        BroadcastSlot<crate::dbus::GameModeSnapshot, crate::dbus::ServiceWatchWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_fwupd:
+        BroadcastSlot<crate::dbus::FwupdSnapshot, crate::dbus::ServiceWatchWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_cups: BroadcastSlot<crate::dbus::CupsEvent, crate::dbus::CupsWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_kdeconnect:
+        BroadcastSlot<crate::dbus::KdeConnectSnapshot, crate::dbus::ServiceWatchWorker, M>,
+    #[cfg(feature = "dbus")]
+    pub(crate) dbus_colord:
+        BroadcastSlot<crate::dbus::ColordSnapshot, crate::dbus::ServiceWatchWorker, M>,
     #[cfg(feature = "global-shortcuts")]
     pub(crate) global_shortcut_subs: Vec<GlobalShortcutSub<M>>,
     #[cfg(feature = "global-shortcuts")]
@@ -406,6 +448,36 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             dbus_mpris: BroadcastSlot::new(),
             #[cfg(feature = "dbus")]
             dbus_action_results: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_nm_secret_agent: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_sensors: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_polkit_agent: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_systemd_user: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_systemd_system: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_timedate: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_accounts: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_fprint_verify: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_fprint_username: None,
+            #[cfg(feature = "dbus")]
+            dbus_fprint_active_username: None,
+            #[cfg(feature = "dbus")]
+            dbus_gamemode: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_fwupd: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_cups: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_kdeconnect: BroadcastSlot::new(),
+            #[cfg(feature = "dbus")]
+            dbus_colord: BroadcastSlot::new(),
             #[cfg(feature = "global-shortcuts")]
             global_shortcut_subs: Vec::new(),
             #[cfg(feature = "global-shortcuts")]
@@ -475,6 +547,20 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_portal_settings.clear_subs();
             self.dbus_mpris.clear_subs();
             self.dbus_action_results.clear_subs();
+            self.dbus_nm_secret_agent.clear_subs();
+            self.dbus_sensors.clear_subs();
+            self.dbus_polkit_agent.clear_subs();
+            self.dbus_systemd_user.clear_subs();
+            self.dbus_systemd_system.clear_subs();
+            self.dbus_timedate.clear_subs();
+            self.dbus_accounts.clear_subs();
+            self.dbus_fprint_verify.clear_subs();
+            self.dbus_fprint_username = None;
+            self.dbus_gamemode.clear_subs();
+            self.dbus_fwupd.clear_subs();
+            self.dbus_cups.clear_subs();
+            self.dbus_kdeconnect.clear_subs();
+            self.dbus_colord.clear_subs();
         }
         #[cfg(feature = "global-shortcuts")]
         self.global_shortcut_subs.clear();
@@ -601,6 +687,58 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(feature = "dbus")]
                 SubscriptionSpec::DbusActionResults { map } => {
                     self.dbus_action_results.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusNmSecretAgent { map } => {
+                    self.dbus_nm_secret_agent.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusSensors { map } => {
+                    self.dbus_sensors.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusPolkitAgent { map } => {
+                    self.dbus_polkit_agent.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusSystemdUnits { bus, map } => match bus {
+                    crate::dbus::DbusBus::Session => self.dbus_systemd_user.subs.push(map.clone()),
+                    crate::dbus::DbusBus::System => self.dbus_systemd_system.subs.push(map.clone()),
+                },
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusTimedate { map } => {
+                    self.dbus_timedate.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusAccounts { map } => {
+                    self.dbus_accounts.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusFprintVerify { username, map } => {
+                    if self.dbus_fprint_username.is_none() {
+                        self.dbus_fprint_username = Some(username.clone());
+                    }
+                    self.dbus_fprint_verify.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusGameMode { map } => {
+                    self.dbus_gamemode.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusFwupd { map } => {
+                    self.dbus_fwupd.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusCups { map } => {
+                    self.dbus_cups.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusKdeConnect { map } => {
+                    self.dbus_kdeconnect.subs.push(map.clone());
+                }
+                #[cfg(feature = "dbus")]
+                SubscriptionSpec::DbusColord { map } => {
+                    self.dbus_colord.subs.push(map.clone());
                 }
                 #[cfg(feature = "global-shortcuts")]
                 SubscriptionSpec::GlobalShortcuts {
@@ -1019,6 +1157,207 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 move |tx| crate::dbus::DbusActionResultWorker::spawn(tx, action_outbox),
             );
         }
+        {
+            let nm_pending = std::sync::Arc::clone(&dbus_client.nm_secret_agent_pending);
+            self.dbus_nm_secret_agent.sync_worker(
+                loop_handle,
+                |_| {},
+                move |tx| crate::dbus::NmSecretAgentWorker::spawn(tx, nm_pending),
+            );
+        }
+        {
+            if !self.dbus_sensors.is_active()
+                && let Ok(mut g) = dbus_client.cache.sensors.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_sensors.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.sensors.write() {
+                        *g = Some(*ev);
+                    }
+                },
+                crate::dbus::SensorsWorker::spawn,
+            );
+        }
+        {
+            let pk_pending = std::sync::Arc::clone(&dbus_client.polkit_agent_pending);
+            self.dbus_polkit_agent.sync_worker(
+                loop_handle,
+                |_| {},
+                move |tx| crate::dbus::PolkitAgentWorker::spawn(tx, pk_pending),
+            );
+        }
+        {
+            if !self.dbus_systemd_user.is_active()
+                && let Ok(mut g) = dbus_client.cache.systemd_user.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_systemd_user.sync_shared_worker(
+                loop_handle,
+                &sess_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.systemd_user.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                |tx, bus| {
+                    crate::dbus::SystemdUnitsWorker::spawn(crate::dbus::DbusBus::Session, tx, bus)
+                },
+            );
+        }
+        {
+            if !self.dbus_systemd_system.is_active()
+                && let Ok(mut g) = dbus_client.cache.systemd_system.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_systemd_system.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.systemd_system.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                |tx, bus| {
+                    crate::dbus::SystemdUnitsWorker::spawn(crate::dbus::DbusBus::System, tx, bus)
+                },
+            );
+        }
+        {
+            if !self.dbus_timedate.is_active()
+                && let Ok(mut g) = dbus_client.cache.timedate.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_timedate.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.timedate.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_timedate_worker,
+            );
+        }
+        {
+            if !self.dbus_accounts.is_active()
+                && let Ok(mut g) = dbus_client.cache.accounts.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_accounts.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.accounts.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_accounts_worker,
+            );
+        }
+        {
+            if self.dbus_fprint_active_username != self.dbus_fprint_username {
+                self.dbus_fprint_verify.cleanup(loop_handle);
+                self.dbus_fprint_active_username = self.dbus_fprint_username.clone();
+            }
+            let username = self.dbus_fprint_username.clone().unwrap_or_default();
+            self.dbus_fprint_verify.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                |_| {},
+                move |tx, bus| crate::dbus::FprintVerifyWorker::spawn(username, tx, bus),
+            );
+        }
+        {
+            if !self.dbus_gamemode.is_active()
+                && let Ok(mut g) = dbus_client.cache.gamemode.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_gamemode.sync_shared_worker(
+                loop_handle,
+                &sess_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.gamemode.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_gamemode_worker,
+            );
+        }
+        {
+            if !self.dbus_fwupd.is_active()
+                && let Ok(mut g) = dbus_client.cache.fwupd.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_fwupd.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.fwupd.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_fwupd_worker,
+            );
+        }
+        self.dbus_cups.sync_shared_worker(
+            loop_handle,
+            &sys_bus,
+            |_| {},
+            crate::dbus::CupsWorker::spawn,
+        );
+        {
+            if !self.dbus_kdeconnect.is_active()
+                && let Ok(mut g) = dbus_client.cache.kdeconnect.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_kdeconnect.sync_shared_worker(
+                loop_handle,
+                &sess_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.kdeconnect.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_kdeconnect_worker,
+            );
+        }
+        {
+            if !self.dbus_colord.is_active()
+                && let Ok(mut g) = dbus_client.cache.colord.write()
+            {
+                *g = None;
+            }
+            let cache = std::sync::Arc::clone(&dbus_client.cache);
+            self.dbus_colord.sync_shared_worker(
+                loop_handle,
+                &sys_bus,
+                move |ev| {
+                    if cache_enabled && let Ok(mut g) = cache.colord.write() {
+                        *g = Some(ev.clone());
+                    }
+                },
+                crate::dbus::spawn_colord_worker,
+            );
+        }
     }
 
     #[cfg(feature = "control-ipc")]
@@ -1118,6 +1457,20 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             self.dbus_portal_settings.cleanup(loop_handle);
             self.dbus_mpris.cleanup(loop_handle);
             self.dbus_action_results.cleanup(loop_handle);
+            self.dbus_nm_secret_agent.cleanup(loop_handle);
+            self.dbus_sensors.cleanup(loop_handle);
+            self.dbus_polkit_agent.cleanup(loop_handle);
+            self.dbus_systemd_user.cleanup(loop_handle);
+            self.dbus_systemd_system.cleanup(loop_handle);
+            self.dbus_timedate.cleanup(loop_handle);
+            self.dbus_accounts.cleanup(loop_handle);
+            self.dbus_fprint_verify.cleanup(loop_handle);
+            self.dbus_fprint_active_username = None;
+            self.dbus_gamemode.cleanup(loop_handle);
+            self.dbus_fwupd.cleanup(loop_handle);
+            self.dbus_cups.cleanup(loop_handle);
+            self.dbus_kdeconnect.cleanup(loop_handle);
+            self.dbus_colord.cleanup(loop_handle);
         }
         #[cfg(feature = "global-shortcuts")]
         {
