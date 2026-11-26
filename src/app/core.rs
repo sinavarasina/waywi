@@ -12,7 +12,11 @@ use crate::effect::context::ClipboardSetter;
 use crate::effect::{ActivationCallback, AssetCallback, AsyncAssetWorker, EffectCtx};
 use crate::error::Result;
 use crate::geometry::{LogicalSize, Point, ScaleFactor};
-use crate::input::Modifiers;
+use crate::input::tablet::map_stylus_button_to_mouse;
+use crate::input::{
+    GestureEvent, Modifiers, MouseButton, TabletEvent, TabletToolEventKind, TabletToolId,
+    TouchEvent, TouchPhase,
+};
 use crate::reconcile::surface::ReconcileReport;
 use crate::reconcile::{PointerDispatch, ReconcileTargets, Reconciler, RetainedSurfaceKey};
 use crate::render::{
@@ -51,6 +55,10 @@ pub(crate) struct CoreEngine<M: Clone + 'static> {
     pub(crate) timers: TimerScheduler<M>,
     pub(crate) configured_sizes: HashMap<RetainedSurfaceKey, LogicalSize>,
     pub(crate) surface_scales: HashMap<RetainedSurfaceKey, ScaleFactor>,
+    pub(crate) primary_touch_id: Option<i32>,
+    pub(crate) claimed_touch_ids: Vec<i32>,
+    pub(crate) claimed_tablet_tools: Vec<TabletToolId>,
+    pub(crate) fallback_down_tablet_tools: Vec<TabletToolId>,
     pub(crate) quit_requested: bool,
 
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
@@ -134,6 +142,10 @@ impl<M: Clone + 'static> CoreEngine<M> {
             timers: TimerScheduler::new(),
             configured_sizes: HashMap::new(),
             surface_scales: HashMap::new(),
+            primary_touch_id: None,
+            claimed_touch_ids: Vec::new(),
+            claimed_tablet_tools: Vec::new(),
+            fallback_down_tablet_tools: Vec::new(),
             quit_requested: false,
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
             audio_client: crate::audio::AudioClient::new(),
@@ -415,6 +427,294 @@ impl<M: Clone + 'static> CoreEngine<M> {
             out_msgs.push_back(msg);
             dispatched = true;
         }
+        dispatched
+    }
+
+    /// Dispatches a multi-touch contact event to matching `on_touch` handlers, falling back
+    /// the unclaimed primary contact to pointer down/move/up so buttons and sliders work on
+    /// touchscreens without double-firing.
+    pub(crate) fn dispatch_touch(
+        &mut self,
+        key: RetainedSurfaceKey,
+        event: TouchEvent,
+        out_msgs: &mut VecDeque<M>,
+    ) -> bool {
+        let Some(surf) = self.reconciler.surfaces.get_mut(&key) else {
+            if matches!(event.phase, TouchPhase::Up | TouchPhase::Cancel) {
+                self.claimed_touch_ids.retain(|id| *id != event.id);
+                if self.primary_touch_id == Some(event.id) {
+                    self.primary_touch_id = None;
+                }
+            }
+            return false;
+        };
+
+        let mut dispatched = false;
+        let td = surf.dispatch_touch(event);
+        if let Some(msg) = td.on_node {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+        if let Some(msg) = td.on_surface {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+
+        match event.phase {
+            TouchPhase::Down => {
+                if td.handled_by_touch {
+                    if !self.claimed_touch_ids.contains(&event.id) {
+                        self.claimed_touch_ids.push(event.id);
+                    }
+                } else {
+                    if self.primary_touch_id.is_none() {
+                        self.primary_touch_id = Some(event.id);
+                    }
+                    if self.primary_touch_id == Some(event.id) {
+                        let ptr = surf.dispatch_pointer_down_at(
+                            event.position,
+                            MouseButton::Left,
+                            event.modifiers,
+                        );
+                        dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                    }
+                }
+            }
+            TouchPhase::Move => {
+                if !self.claimed_touch_ids.contains(&event.id)
+                    && self.primary_touch_id == Some(event.id)
+                {
+                    dispatched |= self.dispatch_pointer_move(
+                        key,
+                        event.position,
+                        event.modifiers,
+                        true,
+                        out_msgs,
+                    );
+                }
+            }
+            TouchPhase::Up | TouchPhase::Cancel => {
+                let was_claimed = if let Some(idx) =
+                    self.claimed_touch_ids.iter().position(|id| *id == event.id)
+                {
+                    self.claimed_touch_ids.swap_remove(idx);
+                    true
+                } else {
+                    false
+                };
+                let was_primary = self.primary_touch_id == Some(event.id);
+                if was_primary {
+                    self.primary_touch_id = None;
+                }
+                if !was_claimed && was_primary {
+                    let ptr = surf.dispatch_pointer_up_at(
+                        event.position,
+                        MouseButton::Left,
+                        event.modifiers,
+                    );
+                    let leave_msg = surf.update_hover(None).and_then(|tr| tr.on_leave);
+                    dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                    if let Some(msg) = leave_msg {
+                        out_msgs.push_back(msg);
+                        dispatched = true;
+                    }
+                }
+            }
+        }
+
+        dispatched
+    }
+
+    /// Dispatches a touchpad multi-finger gesture event to hit-tested element and surface
+    /// `on_gesture` handlers.
+    pub(crate) fn dispatch_gesture(
+        &self,
+        key: RetainedSurfaceKey,
+        event: GestureEvent,
+        out_msgs: &mut VecDeque<M>,
+    ) -> bool {
+        let Some(surf) = self.reconciler.surfaces.get(&key) else {
+            return false;
+        };
+        let gd = surf.dispatch_gesture(event);
+        let mut dispatched = false;
+        if let Some(msg) = gd.on_node {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+        if let Some(msg) = gd.on_surface {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+        dispatched
+    }
+
+    /// Dispatches a pen tablet tool or pad event to matching `on_tablet` handlers, falling
+    /// back unclaimed stylus actions to pointer hover/down/move/up so standard buttons and
+    /// sliders keep working even when a compositor disables pointer emulation for `tablet-v2`.
+    pub(crate) fn dispatch_tablet(
+        &mut self,
+        key: RetainedSurfaceKey,
+        event: TabletEvent,
+        out_msgs: &mut VecDeque<M>,
+    ) -> bool {
+        let Some(surf) = self.reconciler.surfaces.get_mut(&key) else {
+            if let TabletEvent::Tool(ref tool_ev) = event
+                && matches!(
+                    tool_ev.kind,
+                    TabletToolEventKind::Up | TabletToolEventKind::ProximityOut
+                )
+            {
+                self.claimed_tablet_tools
+                    .retain(|id| *id != tool_ev.tool_id);
+                self.fallback_down_tablet_tools
+                    .retain(|id| *id != tool_ev.tool_id);
+            }
+            return false;
+        };
+
+        let td = surf.dispatch_tablet(event);
+        let mut dispatched = false;
+        if let Some(msg) = td.on_node {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+        if let Some(msg) = td.on_surface {
+            out_msgs.push_back(msg);
+            dispatched = true;
+        }
+
+        let TabletEvent::Tool(tool_ev) = event else {
+            return dispatched;
+        };
+
+        let tool_id = tool_ev.tool_id;
+        let is_fallback_down = self.fallback_down_tablet_tools.contains(&tool_id);
+        let is_claimed = self.claimed_tablet_tools.contains(&tool_id);
+
+        match tool_ev.kind {
+            TabletToolEventKind::ProximityIn => {
+                if !td.handled_by_tablet && !is_claimed {
+                    dispatched |= self.dispatch_pointer_move(
+                        key,
+                        tool_ev.position,
+                        tool_ev.modifiers,
+                        false,
+                        out_msgs,
+                    );
+                }
+            }
+            TabletToolEventKind::Motion => {
+                if is_fallback_down || (!td.handled_by_tablet && !is_claimed) {
+                    dispatched |= self.dispatch_pointer_move(
+                        key,
+                        tool_ev.position,
+                        tool_ev.modifiers,
+                        true,
+                        out_msgs,
+                    );
+                }
+            }
+            TabletToolEventKind::Down => {
+                if td.handled_by_tablet {
+                    self.fallback_down_tablet_tools.retain(|id| *id != tool_id);
+                    if !self.claimed_tablet_tools.contains(&tool_id) {
+                        self.claimed_tablet_tools.push(tool_id);
+                    }
+                } else {
+                    self.claimed_tablet_tools.retain(|id| *id != tool_id);
+                    if !self.fallback_down_tablet_tools.contains(&tool_id) {
+                        self.fallback_down_tablet_tools.push(tool_id);
+                    }
+                    let ptr = surf.dispatch_pointer_down_at(
+                        tool_ev.position,
+                        MouseButton::Left,
+                        tool_ev.modifiers,
+                    );
+                    dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                }
+            }
+            TabletToolEventKind::Up => {
+                let was_claimed = if let Some(idx) = self
+                    .claimed_tablet_tools
+                    .iter()
+                    .position(|id| *id == tool_id)
+                {
+                    self.claimed_tablet_tools.swap_remove(idx);
+                    true
+                } else {
+                    false
+                };
+                let was_fallback_down = if let Some(idx) = self
+                    .fallback_down_tablet_tools
+                    .iter()
+                    .position(|id| *id == tool_id)
+                {
+                    self.fallback_down_tablet_tools.swap_remove(idx);
+                    true
+                } else {
+                    false
+                };
+                if was_fallback_down || (!was_claimed && !td.handled_by_tablet) {
+                    let ptr = surf.dispatch_pointer_up_at(
+                        tool_ev.position,
+                        MouseButton::Left,
+                        tool_ev.modifiers,
+                    );
+                    dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                }
+            }
+            TabletToolEventKind::ProximityOut => {
+                let was_claimed = if let Some(idx) = self
+                    .claimed_tablet_tools
+                    .iter()
+                    .position(|id| *id == tool_id)
+                {
+                    self.claimed_tablet_tools.swap_remove(idx);
+                    true
+                } else {
+                    false
+                };
+                let was_fallback_down = if let Some(idx) = self
+                    .fallback_down_tablet_tools
+                    .iter()
+                    .position(|id| *id == tool_id)
+                {
+                    self.fallback_down_tablet_tools.swap_remove(idx);
+                    true
+                } else {
+                    false
+                };
+                if was_fallback_down {
+                    let ptr = surf.dispatch_pointer_up_at(
+                        tool_ev.position,
+                        MouseButton::Left,
+                        tool_ev.modifiers,
+                    );
+                    dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                }
+                if (was_fallback_down || (!was_claimed && !td.handled_by_tablet))
+                    && let Some(surf) = self.reconciler.surfaces.get_mut(&key)
+                    && let Some(tr) = surf.update_hover(None)
+                    && let Some(msg) = tr.on_leave
+                {
+                    out_msgs.push_back(msg);
+                    dispatched = true;
+                }
+            }
+            TabletToolEventKind::Button { button, pressed } => {
+                if !is_claimed && !td.handled_by_tablet {
+                    let mb = map_stylus_button_to_mouse(button);
+                    let ptr = if pressed {
+                        surf.dispatch_pointer_down_at(tool_ev.position, mb, tool_ev.modifiers)
+                    } else {
+                        surf.dispatch_pointer_up_at(tool_ev.position, mb, tool_ev.modifiers)
+                    };
+                    dispatched |= self.dispatch_pointer_result(ptr, out_msgs);
+                }
+            }
+        }
+
         dispatched
     }
 }

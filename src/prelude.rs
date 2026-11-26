@@ -25,10 +25,13 @@ pub use crate::image::{
     AssetId, AssetRetention, Image, ImageAsset, ImageFilter, ImageFit, SourceRect,
 };
 pub use crate::input::{
-    ElementKey, ImeConfig, ImeContentHint, ImeContentPurpose, ImeEvent, ImePreedit,
-    ImeSurroundingText, IntoElementKey, Key, KeyChord, KeyEvent, KeyboardLayout,
-    KeyboardLayoutInfo, Modifiers, MouseButton, PointerEvent, ScrollEvent, ScrollState,
-    TextInputOutcome, TextInputState, TouchEvent,
+    ElementKey, GestureEvent, GestureKind, GesturePhase, ImeConfig, ImeContentHint,
+    ImeContentPurpose, ImeEvent, ImePreedit, ImeSurroundingText, IntoElementKey, Key, KeyChord,
+    KeyEvent, KeyboardLayout, KeyboardLayoutInfo, Modifiers, MouseButton, PointerEvent,
+    ScrollEvent, ScrollSource, ScrollState, TabletEvent, TabletId, TabletPadAxisSource,
+    TabletPadEvent, TabletPadEventKind, TabletPadId, TabletToolAxes, TabletToolEvent,
+    TabletToolEventKind, TabletToolId, TabletToolType, TextInputOutcome, TextInputState,
+    TouchEvent, TouchPhase,
 };
 pub use crate::render::{
     Align, Border, Canvas, Clip, Color, Column, CornerRadius, Element, Group, Painter, PathBuilder,

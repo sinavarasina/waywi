@@ -1275,3 +1275,519 @@ fn surface_memo_and_nested_element_memo_invalidate_on_configure_resize() {
         Some(LogicalSize::new(640.logical_px(), 480.logical_px()))
     );
 }
+
+#[test]
+fn touch_capture_multitouch_and_primary_pointer_drag_fallback() {
+    type TouchLogEntry = (i32, TouchPhase, f32, Option<(f32, f32)>, Option<f32>);
+
+    #[derive(Default)]
+    struct TouchState {
+        touch_log: Vec<TouchLogEntry>,
+        clicks: usize,
+        ptr_downs: usize,
+        ptr_moves: Vec<f32>,
+        ptr_ups: usize,
+    }
+
+    #[derive(Clone)]
+    enum TouchMsg {
+        CanvasTouch(TouchEvent),
+        ButtonClick,
+        ButtonDown,
+        SurfaceMove(f32),
+        SurfaceUp,
+    }
+
+    struct TouchApp;
+    impl Application for TouchApp {
+        type State = TouchState;
+        type Message = TouchMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(TouchState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                TouchMsg::CanvasTouch(ev) => state.touch_log.push((
+                    ev.id,
+                    ev.phase,
+                    ev.local_position.x.0,
+                    ev.shape,
+                    ev.orientation,
+                )),
+                TouchMsg::ButtonClick => state.clicks += 1,
+                TouchMsg::ButtonDown => state.ptr_downs += 1,
+                TouchMsg::SurfaceMove(x) => state.ptr_moves.push(x),
+                TouchMsg::SurfaceUp => state.ptr_ups += 1,
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("touch-win")
+                    .size((240.logical_px(), 100.logical_px()))
+                    .on_pointer_move(|e| Some(TouchMsg::SurfaceMove(e.position.x.0)))
+                    .on_pointer_up(|_| Some(TouchMsg::SurfaceUp))
+                    .child(
+                        Row::new()
+                            .gap(10.logical_px())
+                            .child(
+                                Rect::new()
+                                    .key("canvas")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_touch(TouchMsg::CanvasTouch),
+                            )
+                            .child(
+                                Rect::new()
+                                    .key("slider-btn")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::GREEN)
+                                    .on_click(TouchMsg::ButtonClick)
+                                    .on_pointer_down(|_| TouchMsg::ButtonDown),
+                            ),
+                    ),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<TouchApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+
+    // Multi-touch contacts on canvas: id=1 stays captured even when dragging over the button.
+    let make_touch = |id, phase, x, shape, orientation| TouchEvent {
+        id,
+        phase,
+        position: Point::new(LogicalPx(x), LogicalPx(40.0)),
+        local_position: Point::ZERO,
+        shape,
+        orientation,
+        modifiers: Modifiers::empty(),
+    };
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(1, TouchPhase::Down, 20.0, Some((10.0, 6.0)), Some(30.0)),
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(2, TouchPhase::Down, 50.0, Some((8.0, 8.0)), Some(0.0)),
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(1, TouchPhase::Move, 160.0, Some((10.0, 6.0)), Some(30.0)),
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(1, TouchPhase::Up, 160.0, Some((10.0, 6.0)), Some(30.0)),
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(2, TouchPhase::Cancel, 50.0, Some((8.0, 8.0)), Some(0.0)),
+    ));
+    rt.step().unwrap();
+
+    assert_eq!(rt.state().touch_log.len(), 5);
+    assert_eq!(
+        rt.state().touch_log[0],
+        (1, TouchPhase::Down, 20.0, Some((10.0, 6.0)), Some(30.0))
+    );
+    assert_eq!(
+        rt.state().touch_log[2],
+        (1, TouchPhase::Move, 160.0, Some((10.0, 6.0)), Some(30.0))
+    );
+    assert_eq!(rt.state().touch_log[4].1, TouchPhase::Cancel);
+    // Claimed contacts must never double-fire pointer fallback.
+    assert_eq!(rt.state().clicks, 0);
+    assert_eq!(rt.state().ptr_downs, 0);
+    assert!(rt.state().ptr_moves.is_empty());
+    assert_eq!(rt.state().ptr_ups, 0);
+
+    // Unclaimed primary touch on slider/button falls back cleanly to click + drag + release.
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(3, TouchPhase::Down, 140.0, None, None)
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(3, TouchPhase::Move, 180.0, None, None)
+    ));
+    assert!(rt.touch_surface(
+        "touch-win",
+        make_touch(3, TouchPhase::Up, 180.0, None, None)
+    ));
+    rt.step().unwrap();
+
+    assert_eq!(rt.state().clicks, 1);
+    assert_eq!(rt.state().ptr_downs, 1);
+    assert_eq!(rt.state().ptr_moves, vec![180.0]);
+    assert_eq!(rt.state().ptr_ups, 1);
+}
+
+#[test]
+fn scroll_metadata_and_gesture_dispatch() {
+    #[derive(Default)]
+    struct PadState {
+        scrolls: Vec<(ScrollSource, f32, bool, bool, bool)>,
+        node_gestures: Vec<(GesturePhase, GestureKind, u32, f32)>,
+        surf_gestures: Vec<(GesturePhase, f32)>,
+    }
+
+    #[derive(Clone)]
+    enum PadMsg {
+        Scroll(ScrollEvent),
+        NodeGesture(GestureEvent),
+        SurfaceGesture(GestureEvent),
+    }
+
+    struct PadApp;
+    impl Application for PadApp {
+        type State = PadState;
+        type Message = PadMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(PadState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                PadMsg::Scroll(e) => state.scrolls.push((
+                    e.source,
+                    e.delta_y,
+                    e.stop_x,
+                    e.stop_y,
+                    e.modifiers.contains(Modifiers::CTRL),
+                )),
+                PadMsg::NodeGesture(g) => {
+                    state
+                        .node_gestures
+                        .push((g.phase, g.kind, g.fingers, g.local_position.x.0))
+                }
+                PadMsg::SurfaceGesture(g) => state.surf_gestures.push((g.phase, g.position.x.0)),
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("pad-win")
+                    .size((200.logical_px(), 120.logical_px()))
+                    .on_gesture(|g| Some(PadMsg::SurfaceGesture(g)))
+                    .child(
+                        Rect::new()
+                            .key("viewport")
+                            .position(Position::absolute(20.logical_px(), 10.logical_px()))
+                            .size((150.logical_px(), 100.logical_px()))
+                            .fill(Color::GRAY)
+                            .on_scroll(PadMsg::Scroll)
+                            .on_gesture(PadMsg::NodeGesture),
+                    ),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<PadApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+
+    assert!(rt.scroll_surface_event(
+        "pad-win",
+        ScrollEvent {
+            position: Point::new(LogicalPx(50.0), LogicalPx(40.0)),
+            local_position: Point::ZERO,
+            delta_x: 0.0,
+            delta_y: 3.5,
+            discrete_x: 0,
+            discrete_y: 0,
+            source: ScrollSource::Finger,
+            stop_x: false,
+            stop_y: false,
+            modifiers: Modifiers::CTRL,
+        },
+    ));
+    assert!(rt.scroll_surface_event(
+        "pad-win",
+        ScrollEvent {
+            position: Point::new(LogicalPx(50.0), LogicalPx(40.0)),
+            local_position: Point::ZERO,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            discrete_x: 0,
+            discrete_y: 0,
+            source: ScrollSource::Finger,
+            stop_x: false,
+            stop_y: true,
+            modifiers: Modifiers::empty(),
+        },
+    ));
+    assert!(rt.gesture_surface(
+        "pad-win",
+        GestureEvent {
+            kind: GestureKind::Pinch {
+                dx: 1.0,
+                dy: -2.0,
+                scale: 1.25,
+                rotation: 12.0,
+            },
+            phase: GesturePhase::Update,
+            fingers: 2,
+            position: Point::new(LogicalPx(70.0), LogicalPx(50.0)),
+            local_position: Point::ZERO,
+            modifiers: Modifiers::empty(),
+        },
+    ));
+    rt.step().unwrap();
+
+    assert_eq!(
+        rt.state().scrolls,
+        vec![
+            (ScrollSource::Finger, 3.5, false, false, true),
+            (ScrollSource::Finger, 0.0, false, true, false),
+        ]
+    );
+    assert_eq!(rt.state().node_gestures.len(), 1);
+    assert_eq!(rt.state().node_gestures[0].0, GesturePhase::Update);
+    assert_eq!(rt.state().node_gestures[0].2, 2);
+    assert_eq!(rt.state().node_gestures[0].3, 50.0); // 70 - 20 offset
+    assert_eq!(rt.state().surf_gestures, vec![(GesturePhase::Update, 70.0)]);
+}
+
+#[test]
+fn tablet_stroke_capture_mixed_toolbar_fallback_and_pad() {
+    #[derive(Default)]
+    struct TabState {
+        canvas_strokes: Vec<(TabletToolEventKind, f32, f32)>,
+        pad_events: Vec<TabletPadEventKind>,
+        toolbar_clicks: usize,
+        toolbar_hovered: usize,
+        toolbar_left: usize,
+        toolbar_down_buttons: Vec<MouseButton>,
+        surf_moves: Vec<f32>,
+        surf_ups: usize,
+    }
+
+    #[derive(Clone)]
+    enum TabMsg {
+        Canvas(TabletEvent),
+        PadSurf(TabletEvent),
+        ToolbarClick,
+        ToolbarHover,
+        ToolbarLeave,
+        ToolbarDown(MouseButton),
+        SurfaceMove(f32),
+        SurfaceUp,
+    }
+
+    struct TabApp;
+    impl Application for TabApp {
+        type State = TabState;
+        type Message = TabMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(TabState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                TabMsg::Canvas(TabletEvent::Tool(ev)) => {
+                    state
+                        .canvas_strokes
+                        .push((ev.kind, ev.local_position.x.0, ev.axes.pressure));
+                }
+                TabMsg::Canvas(TabletEvent::Pad(_)) => {}
+                TabMsg::PadSurf(TabletEvent::Pad(p)) => state.pad_events.push(p.kind),
+                TabMsg::PadSurf(TabletEvent::Tool(_)) => {}
+                TabMsg::ToolbarClick => state.toolbar_clicks += 1,
+                TabMsg::ToolbarHover => state.toolbar_hovered += 1,
+                TabMsg::ToolbarLeave => state.toolbar_left += 1,
+                TabMsg::ToolbarDown(btn) => state.toolbar_down_buttons.push(btn),
+                TabMsg::SurfaceMove(x) => state.surf_moves.push(x),
+                TabMsg::SurfaceUp => state.surf_ups += 1,
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("studio")
+                    .size((240.logical_px(), 100.logical_px()))
+                    .on_pointer_move(|e| Some(TabMsg::SurfaceMove(e.position.x.0)))
+                    .on_pointer_up(|_| Some(TabMsg::SurfaceUp))
+                    .child(
+                        Row::new()
+                            .gap(10.logical_px())
+                            .child(
+                                Rect::new()
+                                    .key("draw-canvas")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::WHITE)
+                                    .on_tablet(TabMsg::Canvas),
+                            )
+                            .child(
+                                Rect::new()
+                                    .key("toolbar-btn")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_click(TabMsg::ToolbarClick)
+                                    .on_hover(TabMsg::ToolbarHover)
+                                    .on_leave(TabMsg::ToolbarLeave)
+                                    .on_pointer_down(|e| {
+                                        TabMsg::ToolbarDown(e.button.unwrap_or(MouseButton::Left))
+                                    }),
+                            ),
+                    ),
+            );
+            s.push(
+                Surface::window("pad-only")
+                    .size((100.logical_px(), 40.logical_px()))
+                    .on_tablet(|ev| Some(TabMsg::PadSurf(ev))),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<TabApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+
+    let tool_ev = |kind, x, pressure, tip_down| {
+        TabletEvent::Tool(TabletToolEvent {
+            tool_id: TabletToolId(1),
+            tablet_id: Some(TabletId(1)),
+            tool_type: TabletToolType::Pen,
+            hardware_serial: 0x1234,
+            hardware_id_wacom: 0x5678,
+            kind,
+            position: Point::new(LogicalPx(x), LogicalPx(50.0)),
+            local_position: Point::ZERO,
+            axes: TabletToolAxes {
+                pressure,
+                ..Default::default()
+            },
+            tip_down,
+            modifiers: Modifiers::empty(),
+        })
+    };
+
+    // Stroke starting on canvas stays captured even when moving over toolbar.
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Down, 25.0, 0.5, true)
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Motion, 150.0, 0.9, true)
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Up, 150.0, 0.0, false)
+    ));
+    rt.step().unwrap();
+
+    assert_eq!(
+        rt.state().canvas_strokes,
+        vec![
+            (TabletToolEventKind::Down, 25.0, 0.5),
+            (TabletToolEventKind::Motion, 150.0, 0.9),
+            (TabletToolEventKind::Up, 150.0, 0.0),
+        ]
+    );
+    assert_eq!(rt.state().toolbar_clicks, 0);
+    assert!(rt.state().surf_moves.is_empty());
+
+    // Stylus interacting with toolbar falls back cleanly to hover, click, drag (even across
+    // canvas), right-click barrel button, release, and proximity-out leave.
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::ProximityIn, 150.0, 0.0, false)
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Down, 150.0, 0.6, true)
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Motion, 40.0, 0.6, true)
+    ));
+    assert!(rt.tablet_surface("studio", tool_ev(TabletToolEventKind::Up, 40.0, 0.0, false)));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::Motion, 150.0, 0.0, false)
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(
+            TabletToolEventKind::Button {
+                button: 0x14b,
+                pressed: true,
+            },
+            150.0,
+            0.0,
+            false,
+        )
+    ));
+    assert!(rt.tablet_surface(
+        "studio",
+        tool_ev(TabletToolEventKind::ProximityOut, 150.0, 0.0, false)
+    ));
+    rt.step().unwrap();
+
+    assert_eq!(rt.state().toolbar_hovered, 2);
+    assert_eq!(rt.state().toolbar_clicks, 2); // tip down + barrel button down
+    assert_eq!(
+        rt.state().toolbar_down_buttons,
+        vec![MouseButton::Left, MouseButton::Right]
+    );
+    assert_eq!(rt.state().surf_moves, vec![40.0, 150.0]);
+    assert_eq!(rt.state().surf_ups, 1);
+    assert_eq!(rt.state().toolbar_left, 2);
+
+    // Express-key pad events route directly to Surface::on_tablet.
+    assert!(rt.tablet_surface(
+        "pad-only",
+        TabletEvent::Pad(TabletPadEvent {
+            pad_id: TabletPadId(1),
+            tablet_id: Some(TabletId(1)),
+            kind: TabletPadEventKind::Dial {
+                dial: 0,
+                delta: 1.0,
+                value120: 120,
+            },
+            modifiers: Modifiers::empty(),
+        })
+    ));
+    rt.step().unwrap();
+    assert_eq!(
+        rt.state().pad_events,
+        vec![TabletPadEventKind::Dial {
+            dial: 0,
+            delta: 1.0,
+            value120: 120,
+        }]
+    );
+}

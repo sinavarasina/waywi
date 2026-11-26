@@ -2,7 +2,9 @@ use crate::accessibility::{AccessibleProps, AccessibleRole};
 use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
 use crate::geometry::{Edges, Length, LogicalPx, Size};
-use crate::input::{ElementKey, ImeConfig, ImeEvent, KeyEvent, PointerEvent};
+use crate::input::{
+    ElementKey, GestureEvent, ImeConfig, ImeEvent, KeyEvent, PointerEvent, TabletEvent, TouchEvent,
+};
 use crate::render::{Color, Element, begin_memo_check, set_memo_surface_hash};
 use crate::text::SharedStr;
 
@@ -39,6 +41,9 @@ pub struct Surface<M = ()> {
     pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
+    pub(crate) on_touch: Option<FrameSharedFn<TouchEvent, Option<M>>>,
+    pub(crate) on_gesture: Option<FrameSharedFn<GestureEvent, Option<M>>>,
+    pub(crate) on_tablet: Option<FrameSharedFn<TabletEvent, Option<M>>>,
     pub(crate) memo_hit: bool,
 }
 
@@ -102,6 +107,9 @@ impl<M: 'static> Surface<M> {
             on_ime: None,
             on_pointer_move: None,
             on_pointer_up: None,
+            on_touch: None,
+            on_gesture: None,
+            on_tablet: None,
             memo_hit: false,
         }
     }
@@ -346,6 +354,33 @@ impl<M: 'static> Surface<M> {
         self
     }
 
+    /// Subscribes to surface-level touchscreen events (`Down`, `Move`, `Up`, `Cancel`).
+    pub fn on_touch<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(TouchEvent) -> Option<M> + 'static,
+    {
+        self.on_touch = Some(FrameSharedFn::new(handler));
+        self
+    }
+
+    /// Subscribes to multi-finger touchpad gestures (`zwp_pointer_gestures_v1`: swipe, pinch, hold).
+    pub fn on_gesture<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(GestureEvent) -> Option<M> + 'static,
+    {
+        self.on_gesture = Some(FrameSharedFn::new(handler));
+        self
+    }
+
+    /// Subscribes to graphics tablet stylus and express-key pad events (`zwp_tablet_manager_v2`).
+    pub fn on_tablet<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(TabletEvent) -> Option<M> + 'static,
+    {
+        self.on_tablet = Some(FrameSharedFn::new(handler));
+        self
+    }
+
     /// Maps emitted surface and child messages into a parent message type `N`.
     pub fn map<N: 'static, F>(self, f: F) -> Surface<N>
     where
@@ -370,6 +405,9 @@ impl<M: 'static> Surface<M> {
         let on_ime = map_opt(self.on_ime, &mapper);
         let on_pointer_move = map_opt(self.on_pointer_move, &mapper);
         let on_pointer_up = map_opt(self.on_pointer_up, &mapper);
+        let on_touch = map_opt(self.on_touch, &mapper);
+        let on_gesture = map_opt(self.on_gesture, &mapper);
+        let on_tablet = map_opt(self.on_tablet, &mapper);
         Surface {
             key: self.key,
             kind: self.kind,
@@ -395,6 +433,9 @@ impl<M: 'static> Surface<M> {
             on_ime,
             on_pointer_move,
             on_pointer_up,
+            on_touch,
+            on_gesture,
+            on_tablet,
             memo_hit: self.memo_hit,
         }
     }

@@ -12,9 +12,23 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 
 use crate::geometry::{LogicalSize, ScaleFactor};
-use crate::input::{Key, Modifiers, MouseButton};
+#[cfg(feature = "pointer-gestures")]
+use crate::input::GestureEvent;
+#[cfg(feature = "tablet")]
+use crate::input::TabletEvent;
+use crate::input::{Key, Modifiers, MouseButton, ScrollSource, TouchEvent};
 use crate::reconcile::{RetainedSurfaceKey, SurfaceSpec};
 use crate::wayland::shm_pool::SurfaceShmPool;
+
+/// Tracked per-contact state for an active `wl_touch` contact point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveTouch {
+    pub(crate) key: RetainedSurfaceKey,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) shape: Option<(f32, f32)>,
+    pub(crate) orientation: Option<f32>,
+}
 
 /// User data attached to each `xdg_activation_token_v1` request.
 #[derive(Debug, Clone)]
@@ -155,21 +169,24 @@ pub(crate) enum WaylandEvent {
         dy: f32,
         discrete_x: i32,
         discrete_y: i32,
+        source: ScrollSource,
+        stop_x: bool,
+        stop_y: bool,
         modifiers: Modifiers,
     },
-    TouchDown {
+    Touch {
         key: RetainedSurfaceKey,
-        id: i32,
-        x: f32,
-        y: f32,
+        event: TouchEvent,
     },
-    TouchMotion {
-        id: i32,
-        x: f32,
-        y: f32,
+    #[cfg(feature = "pointer-gestures")]
+    Gesture {
+        key: RetainedSurfaceKey,
+        event: GestureEvent,
     },
-    TouchUp {
-        id: i32,
+    #[cfg(feature = "tablet")]
+    Tablet {
+        key: RetainedSurfaceKey,
+        event: TabletEvent,
     },
     KeyboardKey {
         key: RetainedSurfaceKey,

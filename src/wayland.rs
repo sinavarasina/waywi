@@ -8,9 +8,13 @@ pub(crate) mod idle;
 pub(crate) mod ime;
 pub(crate) mod layer_shell;
 pub(crate) mod output;
+#[cfg(feature = "pointer-gestures")]
+pub(crate) mod pointer_gestures;
 pub(crate) mod seat;
 pub(crate) mod shm_pool;
 pub(crate) mod surface_state;
+#[cfg(feature = "tablet")]
+pub(crate) mod tablet;
 pub(crate) mod xdg_shell;
 
 pub(crate) use connection::WaylandState;

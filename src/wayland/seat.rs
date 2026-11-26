@@ -4,8 +4,9 @@ use smithay_client_toolkit::seat::keyboard::{
 use smithay_client_toolkit::seat::pointer::{
     AxisScroll, PointerEvent as SctkPointerEvent, PointerEventKind,
 };
+use wayland_client::protocol::wl_pointer;
 
-use crate::input::{Key, Modifiers, MouseButton};
+use crate::input::{Key, Modifiers, MouseButton, ScrollSource};
 
 /// Converts SCTK XKB modifiers into WayWi [`Modifiers`].
 #[must_use]
@@ -58,6 +59,18 @@ pub(crate) fn scroll_delta(axis: &AxisScroll) -> (f32, i32) {
     (delta, discrete)
 }
 
+/// Maps Wayland `wl_pointer::AxisSource` into [`ScrollSource`].
+#[must_use]
+pub(crate) fn map_scroll_source(source: Option<wl_pointer::AxisSource>) -> ScrollSource {
+    match source {
+        Some(wl_pointer::AxisSource::Wheel) => ScrollSource::Wheel,
+        Some(wl_pointer::AxisSource::Finger) => ScrollSource::Finger,
+        Some(wl_pointer::AxisSource::Continuous) => ScrollSource::Continuous,
+        Some(wl_pointer::AxisSource::WheelTilt) => ScrollSource::WheelTilt,
+        _ => ScrollSource::Unknown,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum MappedPointerAction {
     Enter {
@@ -82,6 +95,9 @@ pub(crate) enum MappedPointerAction {
         dy: f32,
         discrete_x: i32,
         discrete_y: i32,
+        source: ScrollSource,
+        stop_x: bool,
+        stop_y: bool,
     },
 }
 
@@ -108,6 +124,7 @@ pub(crate) fn map_pointer_event(ev: &SctkPointerEvent) -> MappedPointerAction {
         PointerEventKind::Axis {
             horizontal,
             vertical,
+            source,
             ..
         } => {
             let (dx, discrete_x) = scroll_delta(horizontal);
@@ -119,7 +136,54 @@ pub(crate) fn map_pointer_event(ev: &SctkPointerEvent) -> MappedPointerAction {
                 dy,
                 discrete_x,
                 discrete_y,
+                source: map_scroll_source(*source),
+                stop_x: horizontal.stop,
+                stop_y: vertical.stop,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_source_and_axis_delta_mapping() {
+        assert_eq!(
+            map_scroll_source(Some(wl_pointer::AxisSource::Wheel)),
+            ScrollSource::Wheel
+        );
+        assert_eq!(
+            map_scroll_source(Some(wl_pointer::AxisSource::Finger)),
+            ScrollSource::Finger
+        );
+        assert_eq!(
+            map_scroll_source(Some(wl_pointer::AxisSource::Continuous)),
+            ScrollSource::Continuous
+        );
+        assert_eq!(
+            map_scroll_source(Some(wl_pointer::AxisSource::WheelTilt)),
+            ScrollSource::WheelTilt
+        );
+        assert_eq!(map_scroll_source(None), ScrollSource::Unknown);
+
+        let smooth = AxisScroll {
+            absolute: 25.0,
+            discrete: 0,
+            stop: false,
+            value120: 0,
+            ..AxisScroll::default()
+        };
+        assert_eq!(scroll_delta(&smooth), (2.5, 0));
+
+        let stop_only = AxisScroll {
+            absolute: 0.0,
+            discrete: 0,
+            stop: true,
+            value120: 0,
+            ..AxisScroll::default()
+        };
+        assert_eq!(scroll_delta(&stop_only), (0.0, 0));
     }
 }

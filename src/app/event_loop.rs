@@ -15,7 +15,6 @@ use wayland_client::{Connection, QueueHandle};
 use crate::capabilities::Capability;
 use crate::effect::{ActivationCallback, EffectCtx};
 use crate::error::{Result, WaywiError};
-use crate::geometry::Point;
 #[cfg(feature = "accessibility")]
 use crate::reconcile::RetainedSurfaceKey;
 use crate::text::SharedStr;
@@ -30,7 +29,6 @@ pub(crate) struct LoopRuntime<M: Clone + 'static> {
     pub(crate) qh: QueueHandle<WaylandState>,
     pub(crate) loop_handle: LoopHandle<'static, WaylandState>,
     pub(crate) core: CoreEngine<M>,
-    pub(crate) touch_positions: HashMap<i32, Point>,
     pub(crate) next_activation_req_id: u64,
     pub(crate) pending_activation_callbacks: HashMap<u64, ActivationCallback<M>>,
     pub(crate) inbox: Rc<RefCell<LoopInbox<M>>>,
@@ -94,7 +92,6 @@ impl<M: Clone + 'static> LoopRuntime<M> {
             qh,
             loop_handle,
             core,
-            touch_positions: HashMap::new(),
             next_activation_req_id: 1,
             pending_activation_callbacks: HashMap::new(),
             inbox: Rc::new(RefCell::new(LoopInbox::default())),

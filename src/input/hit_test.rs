@@ -32,6 +32,21 @@ impl<M: 'static> HitTestNode<M> {
         }
     }
 
+    /// Projects a surface-local point into this element's local coordinate space without clamping
+    /// to bounds (used for captured touch/stylus drags that leave the element's bounding rect).
+    #[must_use]
+    pub(crate) fn surface_point_to_local(&self, p: Point) -> Point {
+        if let Some(inv) = self.inverse_affine {
+            let un_transformed = inv.transform_point(p);
+            Point::new(
+                un_transformed.x - self.local_rect.x,
+                un_transformed.y - self.local_rect.y,
+            )
+        } else {
+            Point::new(p.x - self.local_rect.x, p.y - self.local_rect.y)
+        }
+    }
+
     #[must_use]
     pub(crate) fn contains_surface_point(&self, p: Point) -> Option<Point> {
         if !self.visible || !self.input_enabled {
@@ -95,4 +110,28 @@ pub(crate) fn hit_test_scroll<M: 'static>(
     point: Point,
 ) -> Option<(&HitTestNode<M>, Point)> {
     hit_test_where(nodes, point, |n| n.handlers.on_scroll.is_some())
+}
+
+/// Hit-tests surface-local `point` against retained nodes that bind `on_touch`.
+pub(crate) fn hit_test_touch<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    hit_test_where(nodes, point, |n| n.handlers.on_touch.is_some())
+}
+
+/// Hit-tests surface-local `point` against retained nodes that bind `on_gesture`.
+pub(crate) fn hit_test_gesture<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    hit_test_where(nodes, point, |n| n.handlers.on_gesture.is_some())
+}
+
+/// Hit-tests surface-local `point` against retained nodes that bind `on_tablet`.
+pub(crate) fn hit_test_tablet<M: 'static>(
+    nodes: &[HitTestNode<M>],
+    point: Point,
+) -> Option<(&HitTestNode<M>, Point)> {
+    hit_test_where(nodes, point, |n| n.handlers.on_tablet.is_some())
 }

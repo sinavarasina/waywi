@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking Changes
+- **Extended `TouchEvent` and `ScrollEvent` fields (`input`)**:
+  - `TouchEvent` now includes `phase: TouchPhase` (`Down`, `Move`, `Up`, `Cancel`), `shape: Option<(f32, f32)>`, `orientation: Option<f32>`, and `modifiers: Modifiers` (matching `wl_touch` full contact lifecycle).
+  - `ScrollEvent` now includes `source: ScrollSource` (`Wheel`, `Finger`, `Continuous`, `WheelTilt`, `Unknown`), `stop_x: bool`, and `stop_y: bool` (matching `wl_pointer.axis_source` and `wl_pointer.axis_stop`), and now implements `Default`. Code constructing `TouchEvent` or `ScrollEvent` struct literals directly must populate these fields (or use `..Default::default()` for `ScrollEvent`).
+
+### Added
+- **Full Touchscreen (`wl_touch`) support (`input`, `wayland`, `reconcile`, `app`)**:
+  - Added `TouchPhase`, `Element::on_touch`, `Surface::on_touch`, and `HeadlessRuntime::touch_surface`.
+  - Implemented complete `TouchHandler` wiring (`down`, `motion`, `up`, same-frame atomic `shape` and `orientation` enrichment, and `cancel` draining all active contacts) with per-contact capture across `RetainedSurface` reconciliations.
+  - Added primary-touch pointer fallback: unclaimed primary contacts automatically drive `on_click`, `on_click_sound`, `on_pointer_down`, `on_pointer_move`, and `on_pointer_up` (so standard buttons and sliders drag smoothly on touchscreens without double-firing when claimed by `on_touch`).
+- **Touchpad scroll metadata & `zwp_pointer_gestures_v1` (`input`, `wayland`, `capabilities`, `reconcile`, `app`)**:
+  - Added `ScrollSource`, `stop_x`/`stop_y` kinetic-scroll stop flags on `ScrollEvent`, and `HeadlessRuntime::scroll_surface_event`.
+  - Added opt-in Cargo feature `pointer-gestures`, `Capability::PointerGestures`, `GesturePhase`, `GestureKind` (`Swipe`, `Pinch`, `Hold`), `GestureEvent`, `Element::on_gesture`, `Surface::on_gesture`, `HeadlessRuntime::gesture_surface`, and full `zwp_pointer_gestures_v1` (v1..=3) protocol support.
+- **Native Pen Tablet / Stylus & Pad (`zwp_tablet_manager_v2`) support (`input`, `wayland`, `capabilities`, `reconcile`, `app`)**:
+  - Added opt-in Cargo feature `tablet`, `Capability::TabletInput`, `TabletId`, `TabletToolId`, `TabletPadId`, `TabletToolType`, `TabletToolAxes` (`pressure`, `distance`, `tilt`, `rotation`, `slider`, `wheel_degrees`, `wheel_clicks`), `TabletToolEventKind`, `TabletToolEvent`, `TabletPadAxisSource`, `TabletPadEventKind` (`Enter`, `Leave`, `Button`, `ModeSwitch`, `Ring`, `Strip`, `Dial`), `TabletPadEvent`, `TabletEvent`, `Element::on_tablet`, `Surface::on_tablet`, and `HeadlessRuntime::tablet_surface`.
+  - Implemented full `zwp_tablet_manager_v2` (v1..=2) protocol binding with frame-atomic stylus tool batching, per-tool stroke capture, proper `destroy()` lifecycle on `removed` and drop, and automatic pointer fallback (hover, left-click/drag, barrel buttons -> right/middle/side) for unclaimed stylus actions on standard widgets.
+
 ## [0.2.2] - 2026-11-25
 
 ### Fixed

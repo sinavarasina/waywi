@@ -219,6 +219,30 @@ macro_rules! impl_common_builders {
             self.common.handlers.set_on_scroll(handler);
             self
         }
+
+        pub fn on_touch<F>(mut self, handler: F) -> Self
+        where
+            F: Fn($crate::input::TouchEvent) -> M + 'static,
+        {
+            self.common.handlers.set_on_touch(handler);
+            self
+        }
+
+        pub fn on_gesture<F>(mut self, handler: F) -> Self
+        where
+            F: Fn($crate::input::GestureEvent) -> M + 'static,
+        {
+            self.common.handlers.set_on_gesture(handler);
+            self
+        }
+
+        pub fn on_tablet<F>(mut self, handler: F) -> Self
+        where
+            F: Fn($crate::input::TabletEvent) -> M + 'static,
+        {
+            self.common.handlers.set_on_tablet(handler);
+            self
+        }
     };
 }
 

@@ -27,6 +27,8 @@ features = [
     "clipboard",
     "idle-notify",
     "ime",
+    "pointer-gestures",
+    "tablet",
     "control-ipc",
     "hyprland-ipc",
     "sway-ipc",
@@ -56,6 +58,8 @@ fractional-scale = ["dep:wayland-protocols"]
 clipboard = ["dep:wayland-protocols", "dep:wayland-protocols-wlr"]
 idle-notify = ["dep:wayland-protocols"]
 ime = ["dep:wayland-protocols"]
+pointer-gestures = ["dep:wayland-protocols"]
+tablet = ["dep:wayland-protocols"]
 control-ipc = ["calloop/signals"]
 hyprland-ipc = ["dep:serde", "dep:serde_json"]
 sway-ipc = ["dep:serde", "dep:serde_json"]

@@ -68,6 +68,10 @@ pub enum Capability {
     TextInput,
     /// Active seat XKB keyboard layout inspection.
     KeyboardLayout,
+    /// Wayland `zwp_pointer_gestures_v1` multi-finger touchpad gestures (`pointer-gestures` feature + compositor support).
+    PointerGestures,
+    /// Wayland `zwp_tablet_manager_v2` graphics tablet / stylus / pad support (`tablet` feature + compositor support).
+    TabletInput,
 }
 
 /// Snapshot of runtime and compile-time capabilities exposed by [`App`](crate::app::App) and
@@ -144,7 +148,7 @@ impl Capabilities {
     /// Updates Wayland protocol and seat capabilities from a live [`Capabilities`] snapshot
     /// without clobbering runtime-probed IPC, GPU, audio, or accessibility flags.
     pub(crate) fn refresh_wayland_from(&mut self, wl_caps: &Self) {
-        const WAYLAND_CAPS: [Capability; 13] = [
+        const WAYLAND_CAPS: [Capability; 15] = [
             Capability::Wayland,
             Capability::LayerShell,
             Capability::XdgShell,
@@ -155,6 +159,8 @@ impl Capabilities {
             Capability::KeyboardInput,
             Capability::KeyboardLayout,
             Capability::TouchInput,
+            Capability::PointerGestures,
+            Capability::TabletInput,
             Capability::IdleNotify,
             Capability::Clipboard,
             Capability::TextInput,

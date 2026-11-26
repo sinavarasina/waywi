@@ -30,7 +30,7 @@ use crate::wayland::layer_shell::{apply_layer_spec, create_layer_surface};
 use crate::wayland::output::collect_outputs;
 use crate::wayland::shm_pool::{AcquireSlot, SurfaceShmPool};
 use crate::wayland::surface_state::{
-    ActivationRequestData, LiveWaylandSurface, SurfaceRole, WaylandEvent,
+    ActivationRequestData, ActiveTouch, LiveWaylandSurface, SurfaceRole, WaylandEvent,
 };
 use crate::wayland::xdg_shell::{
     apply_xdg_spec, create_xdg_popup, create_xdg_window, reposition_xdg_popup,
@@ -57,6 +57,10 @@ pub(crate) struct WaylandState {
     pub(crate) clipboard: crate::wayland::clipboard::WaylandClipboardState,
     #[cfg(feature = "ime")]
     pub(crate) ime: crate::wayland::ime::WaylandImeState,
+    #[cfg(feature = "pointer-gestures")]
+    pub(crate) pointer_gestures: crate::wayland::pointer_gestures::WaylandPointerGesturesState,
+    #[cfg(feature = "tablet")]
+    pub(crate) tablet: crate::wayland::tablet::WaylandTabletState,
 
     pub(crate) outputs: Vec<OutputInfo>,
     pub(crate) output_handles: HashMap<crate::display::OutputId, wl_output::WlOutput>,
@@ -71,7 +75,8 @@ pub(crate) struct WaylandState {
     pub(crate) has_touch: bool,
     pub(crate) focused_keyboard_surface: Option<RetainedSurfaceKey>,
     pub(crate) last_input_serial: Option<(wl_seat::WlSeat, u32, wl_surface::WlSurface)>,
-    pub(crate) active_touches: HashMap<i32, RetainedSurfaceKey>,
+    pub(crate) last_pointer_pos: HashMap<RetainedSurfaceKey, crate::geometry::Point>,
+    pub(crate) active_touches: HashMap<i32, ActiveTouch>,
     pub(crate) modifiers: Modifiers,
     pub(crate) keyboard_layouts: Vec<String>,
     pub(crate) keyboard_layout_index: u32,
@@ -113,6 +118,11 @@ impl WaylandState {
         let clipboard = crate::wayland::clipboard::WaylandClipboardState::bind(&globals, &qh);
         #[cfg(feature = "ime")]
         let ime = crate::wayland::ime::WaylandImeState::bind(&globals, &qh);
+        #[cfg(feature = "pointer-gestures")]
+        let pointer_gestures =
+            crate::wayland::pointer_gestures::WaylandPointerGesturesState::bind(&globals, &qh);
+        #[cfg(feature = "tablet")]
+        let tablet = crate::wayland::tablet::WaylandTabletState::bind(&globals, &qh);
 
         let output_state = OutputState::new(&globals, &qh);
         let seat_state = SeatState::new(&globals, &qh);
@@ -137,6 +147,10 @@ impl WaylandState {
             clipboard,
             #[cfg(feature = "ime")]
             ime,
+            #[cfg(feature = "pointer-gestures")]
+            pointer_gestures,
+            #[cfg(feature = "tablet")]
+            tablet,
             outputs: Vec::new(),
             output_handles: HashMap::new(),
             surfaces: HashMap::new(),
@@ -149,6 +163,7 @@ impl WaylandState {
             has_touch: false,
             focused_keyboard_surface: None,
             last_input_serial: None,
+            last_pointer_pos: HashMap::new(),
             active_touches: HashMap::new(),
             modifiers: Modifiers::empty(),
             keyboard_layouts: Vec::new(),
@@ -163,11 +178,14 @@ impl WaylandState {
         queue.roundtrip(&mut state).map_err(|e| {
             WaywiError::WaylandConnection(format!("second wayland roundtrip failed: {e}"))
         })?;
-        #[cfg(feature = "ime")]
+        #[cfg(any(feature = "ime", feature = "tablet"))]
         {
             let seats: Vec<_> = state.seat_state.seats().collect();
             for seat in seats {
+                #[cfg(feature = "ime")]
                 state.ime.add_seat(&seat, &qh);
+                #[cfg(feature = "tablet")]
+                state.tablet.add_seat(&seat, &qh);
             }
         }
         state.refresh_outputs();
@@ -245,6 +263,17 @@ impl WaylandState {
         caps.set(Capability::TextInput, self.ime.is_supported());
         #[cfg(not(feature = "ime"))]
         caps.set(Capability::TextInput, false);
+        #[cfg(feature = "pointer-gestures")]
+        caps.set(
+            Capability::PointerGestures,
+            self.pointer_gestures.is_supported(),
+        );
+        #[cfg(not(feature = "pointer-gestures"))]
+        caps.set(Capability::PointerGestures, false);
+        #[cfg(feature = "tablet")]
+        caps.set(Capability::TabletInput, self.tablet.is_supported());
+        #[cfg(not(feature = "tablet"))]
+        caps.set(Capability::TabletInput, false);
         #[cfg(feature = "pipewire")]
         caps.set(
             Capability::PipeWire,
@@ -533,6 +562,10 @@ impl WaylandState {
             self.surface_by_obj.remove(&surf.wl_surface_id);
             #[cfg(feature = "ime")]
             self.ime.clear_surface(&surf.wl_surface_id);
+            #[cfg(feature = "pointer-gestures")]
+            self.pointer_gestures.clear_surface(key);
+            #[cfg(feature = "tablet")]
+            self.tablet.clear_surface(&surf.wl_surface_id);
             if self.focused_keyboard_surface == Some(key) {
                 self.focused_keyboard_surface = None;
             }
@@ -543,7 +576,8 @@ impl WaylandState {
             {
                 self.last_input_serial = None;
             }
-            self.active_touches.retain(|_, v| *v != key);
+            self.last_pointer_pos.remove(&key);
+            self.active_touches.retain(|_, v| v.key != key);
             // Detach buffer for SHM toplevel/layer surfaces before dropping; skip null-buffer
             // commits for xdg_popup (xdg-shell rule), compositor-closed layers, or GPU-bound
             // surfaces (whose swapchain has already been torn down).

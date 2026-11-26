@@ -12,9 +12,11 @@ use smithay_client_toolkit::seat::{Capability as SeatCapability, SeatHandler, Se
 use wayland_client::protocol::{wl_keyboard, wl_pointer, wl_seat, wl_surface, wl_touch};
 use wayland_client::{Connection, Proxy, QueueHandle};
 
+use crate::geometry::{LogicalPx, Point};
+use crate::input::{TouchEvent, TouchPhase};
 use crate::wayland::connection::WaylandState;
 use crate::wayland::seat::{MappedPointerAction, map_key_event, map_modifiers, map_pointer_event};
-use crate::wayland::surface_state::WaylandEvent;
+use crate::wayland::surface_state::{ActiveTouch, WaylandEvent};
 
 impl SeatHandler for WaylandState {
     fn seat_state(&mut self) -> &mut SeatState {
@@ -24,7 +26,9 @@ impl SeatHandler for WaylandState {
     fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         #[cfg(feature = "ime")]
         self.ime.add_seat(&seat, qh);
-        #[cfg(not(feature = "ime"))]
+        #[cfg(feature = "tablet")]
+        self.tablet.add_seat(&seat, qh);
+        #[cfg(not(any(feature = "ime", feature = "tablet")))]
         let _ = (qh, seat);
     }
 
@@ -44,6 +48,8 @@ impl SeatHandler for WaylandState {
             }
             SeatCapability::Pointer => {
                 if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
+                    #[cfg(feature = "pointer-gestures")]
+                    self.pointer_gestures.add_pointer(&ptr, qh);
                     self.pointers.push(ptr);
                     self.has_pointer = true;
                 }
@@ -73,6 +79,8 @@ impl SeatHandler for WaylandState {
                 self.has_keyboard = false;
             }
             SeatCapability::Pointer => {
+                #[cfg(feature = "pointer-gestures")]
+                self.pointer_gestures.clear_all_pointers();
                 for ptr in self.pointers.drain(..) {
                     ptr.release();
                 }
@@ -91,7 +99,9 @@ impl SeatHandler for WaylandState {
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         #[cfg(feature = "ime")]
         self.ime.remove_seat(&seat);
-        #[cfg(not(feature = "ime"))]
+        #[cfg(feature = "tablet")]
+        self.tablet.remove_seat(&seat);
+        #[cfg(not(any(feature = "ime", feature = "tablet")))]
         let _ = seat;
     }
 }
@@ -115,6 +125,8 @@ impl PointerHandler for WaylandState {
             }
             match map_pointer_event(ev) {
                 MappedPointerAction::Enter { x, y } => {
+                    self.last_pointer_pos
+                        .insert(key, Point::new(LogicalPx(x), LogicalPx(y)));
                     self.events.push_back(WaylandEvent::PointerEnter {
                         key,
                         x,
@@ -123,9 +135,12 @@ impl PointerHandler for WaylandState {
                     });
                 }
                 MappedPointerAction::Leave => {
+                    self.last_pointer_pos.remove(&key);
                     self.events.push_back(WaylandEvent::PointerLeave { key });
                 }
                 MappedPointerAction::Motion { x, y } => {
+                    self.last_pointer_pos
+                        .insert(key, Point::new(LogicalPx(x), LogicalPx(y)));
                     self.events.push_back(WaylandEvent::PointerMotion {
                         key,
                         x,
@@ -139,6 +154,8 @@ impl PointerHandler for WaylandState {
                     button,
                     pressed,
                 } => {
+                    self.last_pointer_pos
+                        .insert(key, Point::new(LogicalPx(x), LogicalPx(y)));
                     self.events.push_back(WaylandEvent::PointerButton {
                         key,
                         x,
@@ -155,7 +172,12 @@ impl PointerHandler for WaylandState {
                     dy,
                     discrete_x,
                     discrete_y,
+                    source,
+                    stop_x,
+                    stop_y,
                 } => {
+                    self.last_pointer_pos
+                        .insert(key, Point::new(LogicalPx(x), LogicalPx(y)));
                     self.events.push_back(WaylandEvent::PointerScroll {
                         key,
                         x,
@@ -164,6 +186,9 @@ impl PointerHandler for WaylandState {
                         dy,
                         discrete_x,
                         discrete_y,
+                        source,
+                        stop_x,
+                        stop_y,
                         modifiers: self.modifiers,
                     });
                 }
@@ -316,12 +341,30 @@ impl TouchHandler for WaylandState {
             if let Some(seat) = self.seat_state.seats().next() {
                 self.last_input_serial = Some((seat, serial, surface));
             }
-            self.active_touches.insert(id, key);
-            self.events.push_back(WaylandEvent::TouchDown {
-                key,
+            let x = position.0 as f32;
+            let y = position.1 as f32;
+            let pos = Point::new(LogicalPx(x), LogicalPx(y));
+            self.active_touches.insert(
                 id,
-                x: position.0 as f32,
-                y: position.1 as f32,
+                ActiveTouch {
+                    key,
+                    x,
+                    y,
+                    shape: None,
+                    orientation: None,
+                },
+            );
+            self.events.push_back(WaylandEvent::Touch {
+                key,
+                event: TouchEvent {
+                    id,
+                    phase: TouchPhase::Down,
+                    position: pos,
+                    local_position: pos,
+                    shape: None,
+                    orientation: None,
+                    modifiers: self.modifiers,
+                },
             });
         }
     }
@@ -335,8 +378,20 @@ impl TouchHandler for WaylandState {
         _time: u32,
         id: i32,
     ) {
-        if self.active_touches.remove(&id).is_some() {
-            self.events.push_back(WaylandEvent::TouchUp { id });
+        if let Some(active) = self.active_touches.remove(&id) {
+            let pos = Point::new(LogicalPx(active.x), LogicalPx(active.y));
+            self.events.push_back(WaylandEvent::Touch {
+                key: active.key,
+                event: TouchEvent {
+                    id,
+                    phase: TouchPhase::Up,
+                    position: pos,
+                    local_position: pos,
+                    shape: active.shape,
+                    orientation: active.orientation,
+                    modifiers: self.modifiers,
+                },
+            });
         }
     }
 
@@ -349,11 +404,24 @@ impl TouchHandler for WaylandState {
         id: i32,
         position: (f64, f64),
     ) {
-        if self.active_touches.contains_key(&id) {
-            self.events.push_back(WaylandEvent::TouchMotion {
-                id,
-                x: position.0 as f32,
-                y: position.1 as f32,
+        if let Some(active) = self.active_touches.get_mut(&id) {
+            active.x = position.0 as f32;
+            active.y = position.1 as f32;
+            let pos = Point::new(LogicalPx(active.x), LogicalPx(active.y));
+            let key = active.key;
+            let shape = active.shape;
+            let orientation = active.orientation;
+            self.events.push_back(WaylandEvent::Touch {
+                key,
+                event: TouchEvent {
+                    id,
+                    phase: TouchPhase::Move,
+                    position: pos,
+                    local_position: pos,
+                    shape,
+                    orientation,
+                    modifiers: self.modifiers,
+                },
             });
         }
     }
@@ -363,10 +431,23 @@ impl TouchHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
-        _id: i32,
-        _major: f64,
-        _minor: f64,
+        id: i32,
+        major: f64,
+        minor: f64,
     ) {
+        let shape = Some((major as f32, minor as f32));
+        if let Some(active) = self.active_touches.get_mut(&id) {
+            active.shape = shape;
+        }
+        // Enrich any same-frame queued Touch event for this contact atomically.
+        for ev in self.events.iter_mut().rev() {
+            if let WaylandEvent::Touch { event, .. } = ev
+                && event.id == id
+            {
+                event.shape = shape;
+                break;
+            }
+        }
     }
 
     fn orientation(
@@ -374,10 +455,41 @@ impl TouchHandler for WaylandState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _touch: &wl_touch::WlTouch,
-        _id: i32,
-        _orientation: f64,
+        id: i32,
+        orientation: f64,
     ) {
+        let orient = Some(orientation as f32);
+        if let Some(active) = self.active_touches.get_mut(&id) {
+            active.orientation = orient;
+        }
+        // Enrich any same-frame queued Touch event for this contact atomically.
+        for ev in self.events.iter_mut().rev() {
+            if let WaylandEvent::Touch { event, .. } = ev
+                && event.id == id
+            {
+                event.orientation = orient;
+                break;
+            }
+        }
     }
 
-    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {}
+    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        let modifiers = self.modifiers;
+        let cancelled: Vec<(i32, ActiveTouch)> = self.active_touches.drain().collect();
+        for (id, active) in cancelled {
+            let pos = Point::new(LogicalPx(active.x), LogicalPx(active.y));
+            self.events.push_back(WaylandEvent::Touch {
+                key: active.key,
+                event: TouchEvent {
+                    id,
+                    phase: TouchPhase::Cancel,
+                    position: pos,
+                    local_position: pos,
+                    shape: active.shape,
+                    orientation: active.orientation,
+                    modifiers,
+                },
+            });
+        }
+    }
 }

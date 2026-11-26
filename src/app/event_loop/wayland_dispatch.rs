@@ -55,18 +55,6 @@ fn dispatch_pointer_button<M: Clone + 'static>(
         .dispatch_pointer_result(dispatch, &mut rt.inbox.borrow_mut().messages);
 }
 
-fn dispatch_touch_tap<M: Clone + 'static>(
-    rt: &LoopRuntime<M>,
-    key: RetainedSurfaceKey,
-    pos: Point,
-) {
-    if let Some(surf) = rt.core.reconciler.surfaces.get(&key) {
-        let dispatch = surf.dispatch_click_at(pos);
-        rt.core
-            .dispatch_pointer_result(dispatch, &mut rt.inbox.borrow_mut().messages);
-    }
-}
-
 fn dispatch_scroll<M: Clone + 'static>(
     rt: &LoopRuntime<M>,
     key: RetainedSurfaceKey,
@@ -227,6 +215,9 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                 dy,
                 discrete_x,
                 discrete_y,
+                source,
+                stop_x,
+                stop_y,
                 modifiers,
             } => {
                 dispatch_scroll(
@@ -239,21 +230,26 @@ pub(crate) fn drain_wayland_events<M: Clone + 'static>(
                         delta_y: dy,
                         discrete_x,
                         discrete_y,
+                        source,
+                        stop_x,
+                        stop_y,
                         modifiers,
                     },
                 );
             }
-            WaylandEvent::TouchDown { key, id, x, y } => {
-                let pos = Point::new(LogicalPx(x), LogicalPx(y));
-                rt.touch_positions.insert(id, pos);
-                dispatch_touch_tap(rt, key, pos);
+            WaylandEvent::Touch { key, event } => {
+                let mut guard = rt.inbox.borrow_mut();
+                rt.core.dispatch_touch(key, event, &mut guard.messages);
             }
-            WaylandEvent::TouchMotion { id, x, y } => {
-                rt.touch_positions
-                    .insert(id, Point::new(LogicalPx(x), LogicalPx(y)));
+            #[cfg(feature = "pointer-gestures")]
+            WaylandEvent::Gesture { key, event } => {
+                let mut guard = rt.inbox.borrow_mut();
+                rt.core.dispatch_gesture(key, event, &mut guard.messages);
             }
-            WaylandEvent::TouchUp { id } => {
-                rt.touch_positions.remove(&id);
+            #[cfg(feature = "tablet")]
+            WaylandEvent::Tablet { key, event } => {
+                let mut guard = rt.inbox.borrow_mut();
+                rt.core.dispatch_tablet(key, event, &mut guard.messages);
             }
             WaylandEvent::KeyboardKey {
                 key,

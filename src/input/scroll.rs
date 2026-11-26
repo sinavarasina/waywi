@@ -210,6 +210,9 @@ mod tests {
             delta_y,
             discrete_x: 0,
             discrete_y,
+            source: super::super::events::ScrollSource::Unknown,
+            stop_x: false,
+            stop_y: false,
             modifiers: Modifiers::empty(),
         }
     }

@@ -274,6 +274,8 @@ impl<M: Clone + 'static> Reconciler<M> {
         let is_new = prev_opt.is_none();
         let mut prev_roots = Vec::new();
         let mut prev_hovered = None;
+        let mut prev_touch_captures = Vec::new();
+        let mut prev_tablet_captures = Vec::new();
         let mut config_dirty = true;
         let mut full_redraw = true;
         let mut prev_needs_redraw = false;
@@ -304,6 +306,8 @@ impl<M: Clone + 'static> Reconciler<M> {
             prev_selective_rects = prev.selective_input_rects;
             prev_roots = prev.roots;
             prev_hovered = prev.hovered_node;
+            prev_touch_captures = prev.touch_captures;
+            prev_tablet_captures = prev.tablet_captures;
         }
 
         let mut anim_deadline: Option<Instant> = None;
@@ -351,6 +355,8 @@ impl<M: Clone + 'static> Reconciler<M> {
         let needs_redraw = prev_needs_redraw || full_redraw || !dirty_rects.is_empty();
 
         let hovered_node = prev_hovered.filter(|id| hit_nodes.iter().any(|n| n.node_id == *id));
+        prev_touch_captures.retain(|(_, id)| hit_nodes.iter().any(|n| n.node_id == *id));
+        prev_tablet_captures.retain(|(_, id)| hit_nodes.iter().any(|n| n.node_id == *id));
 
         let retained = RetainedSurface {
             spec,
@@ -364,6 +370,11 @@ impl<M: Clone + 'static> Reconciler<M> {
             on_ime: surf.on_ime,
             on_pointer_move: surf.on_pointer_move,
             on_pointer_up: surf.on_pointer_up,
+            on_touch: surf.on_touch,
+            on_gesture: surf.on_gesture,
+            on_tablet: surf.on_tablet,
+            touch_captures: prev_touch_captures,
+            tablet_captures: prev_tablet_captures,
             dirty_logical_rects: dirty_rects,
             needs_redraw,
             full_redraw,

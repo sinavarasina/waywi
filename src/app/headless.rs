@@ -6,7 +6,10 @@ use crate::display::OutputInfo;
 use crate::effect::ActivationCallback;
 use crate::error::{Result, WaywiError};
 use crate::geometry::{LogicalPx, LogicalSize, Point};
-use crate::input::{ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, ScrollEvent};
+use crate::input::{
+    GestureEvent, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, ScrollEvent, ScrollSource,
+    TabletEvent, TouchEvent,
+};
 use crate::reconcile::RetainedSurfaceKey;
 use crate::render::{FrameScene, RenderBackend, RendererPreference};
 use crate::surface::SurfaceKey;
@@ -328,24 +331,78 @@ impl<A: Application> HeadlessRuntime<A> {
         delta: (f32, f32),
         discrete: (i32, i32),
     ) -> bool {
-        let pos = Point::new(LogicalPx(x), LogicalPx(y));
-        let msg = self.surface_by_key(surface_key).and_then(|surf| {
-            surf.dispatch_scroll_at(ScrollEvent {
-                position: pos,
+        self.scroll_surface_event(
+            surface_key,
+            ScrollEvent {
+                position: Point::new(LogicalPx(x), LogicalPx(y)),
                 local_position: Point::ZERO,
                 delta_x: delta.0,
                 delta_y: delta.1,
                 discrete_x: discrete.0,
                 discrete_y: discrete.1,
+                source: ScrollSource::Unknown,
+                stop_x: false,
+                stop_y: false,
                 modifiers: Modifiers::empty(),
-            })
-        });
+            },
+        )
+    }
+
+    /// Simulates a full [`ScrollEvent`] (including [`ScrollSource`], `stop_x`/`stop_y`, and
+    /// modifiers) on a surface.
+    pub fn scroll_surface_event(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: ScrollEvent,
+    ) -> bool {
+        let msg = self
+            .surface_by_key(surface_key)
+            .and_then(|surf| surf.dispatch_scroll_at(event));
         if let Some(m) = msg {
             self.inbox.push_back(m);
             true
         } else {
             false
         }
+    }
+
+    /// Simulates a multi-touch [`TouchEvent`] on a surface (routing to `on_touch` handlers with
+    /// per-contact capture, and falling back unclaimed primary contacts to pointer events).
+    pub fn touch_surface(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: TouchEvent,
+    ) -> bool {
+        let Some(rk) = self.surface_key_match(surface_key) else {
+            return false;
+        };
+        self.core.dispatch_touch(rk, event, &mut self.inbox)
+    }
+
+    /// Simulates a touchpad multi-finger [`GestureEvent`] on a surface.
+    pub fn gesture_surface(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: GestureEvent,
+    ) -> bool {
+        let Some(rk) = self.surface_key_match(surface_key) else {
+            return false;
+        };
+        self.core.dispatch_gesture(rk, event, &mut self.inbox)
+    }
+
+    /// Simulates a pen tablet / stylus / pad [`TabletEvent`] on a surface (routing to `on_tablet`
+    /// handlers with per-tool capture, and falling back unclaimed stylus actions to pointer
+    /// events).
+    pub fn tablet_surface(
+        &mut self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+        event: TabletEvent,
+    ) -> bool {
+        let Some(rk) = self.surface_key_match(surface_key) else {
+            return false;
+        };
+        self.core.dispatch_tablet(rk, event, &mut self.inbox)
     }
 
     /// Simulates a keyboard key event targeting the surface's `on_key` handler.

@@ -4,6 +4,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wayland_client::Connection;
+#[cfg(feature = "pointer-gestures")]
+use wayland_protocols::wp::pointer_gestures::zv1::server::{
+    zwp_pointer_gesture_hold_v1, zwp_pointer_gesture_pinch_v1, zwp_pointer_gesture_swipe_v1,
+    zwp_pointer_gestures_v1,
+};
+#[cfg(feature = "tablet")]
+use wayland_protocols::wp::tablet::zv2::server::{
+    zwp_tablet_manager_v2, zwp_tablet_pad_dial_v2, zwp_tablet_pad_group_v2, zwp_tablet_pad_ring_v2,
+    zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
+    zwp_tablet_v2,
+};
 #[cfg(feature = "ime")]
 use wayland_protocols::wp::text_input::zv3::server::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
@@ -15,7 +26,8 @@ use wayland_protocols::xdg::shell::server::{
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::backend::ClientData;
 use wayland_server::protocol::{
-    wl_buffer, wl_compositor, wl_output, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface, wl_touch,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
@@ -70,6 +82,8 @@ struct MockXdgTrace {
     layer_closed_sent: usize,
     buffer_commits: usize,
     frame_callbacks_created: usize,
+    #[cfg(feature = "tablet")]
+    tablet_removed_destroyed: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -77,6 +91,15 @@ struct MockServerConfig {
     enable_xdg_shell: bool,
     enable_layer_shell: bool,
     enable_xdg_activation: bool,
+    enable_touch: bool,
+    send_touch_sequence: bool,
+    send_touchpad_sequence: bool,
+    #[cfg(feature = "pointer-gestures")]
+    enable_pointer_gestures: bool,
+    #[cfg(feature = "tablet")]
+    enable_tablet: bool,
+    #[cfg(feature = "tablet")]
+    send_tablet_sequence: bool,
     simulate_output_hotplug_on_two_layers: bool,
     #[cfg(feature = "ime")]
     enable_ime: bool,
@@ -114,6 +137,37 @@ struct MockCompositor {
     >,
     pending_token_app_id: Option<String>,
     xdg_trace: Arc<Mutex<MockXdgTrace>>,
+    enable_touch: bool,
+    send_touch_sequence: bool,
+    touch_sequence_sent: bool,
+    send_touchpad_sequence: bool,
+    touchpad_sequence_sent: bool,
+    wl_pointer_res: Option<wl_pointer::WlPointer>,
+    wl_touch_res: Option<wl_touch::WlTouch>,
+    #[cfg(feature = "pointer-gestures")]
+    swipe_res: Option<zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1>,
+    #[cfg(feature = "pointer-gestures")]
+    pinch_res: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
+    #[cfg(feature = "pointer-gestures")]
+    hold_res: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
+    #[cfg(feature = "tablet")]
+    send_tablet_sequence: bool,
+    #[cfg(feature = "tablet")]
+    tablet_sequence_sent: bool,
+    #[cfg(feature = "tablet")]
+    tablet_res: Option<zwp_tablet_v2::ZwpTabletV2>,
+    #[cfg(feature = "tablet")]
+    tool_res: Option<zwp_tablet_tool_v2::ZwpTabletToolV2>,
+    #[cfg(feature = "tablet")]
+    pad_res: Option<zwp_tablet_pad_v2::ZwpTabletPadV2>,
+    #[cfg(feature = "tablet")]
+    pad_group_res: Option<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2>,
+    #[cfg(feature = "tablet")]
+    pad_ring_res: Option<zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2>,
+    #[cfg(feature = "tablet")]
+    pad_strip_res: Option<zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2>,
+    #[cfg(feature = "tablet")]
+    pad_dial_res: Option<zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2>,
     #[cfg(feature = "ime")]
     text_inputs: Vec<zwp_text_input_v3::ZwpTextInputV3>,
     #[cfg(feature = "ime")]
@@ -339,7 +393,7 @@ impl Dispatch<wl_output::WlOutput, ()> for MockCompositor {
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for MockCompositor {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<wl_seat::WlSeat>,
@@ -347,7 +401,11 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for MockCompositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let seat = data_init.init(resource, ());
-        seat.capabilities(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard);
+        let mut caps = wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard;
+        if state.enable_touch {
+            caps |= wl_seat::Capability::Touch;
+        }
+        seat.capabilities(caps);
         if seat.version() >= 2 {
             seat.name("seat0".into());
         }
@@ -356,7 +414,7 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for MockCompositor {
 
 impl Dispatch<wl_seat::WlSeat, ()> for MockCompositor {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &wl_seat::WlSeat,
         request: wl_seat::Request,
@@ -366,13 +424,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for MockCompositor {
     ) {
         match request {
             wl_seat::Request::GetPointer { id } => {
-                data_init.init(id, ());
+                let ptr = data_init.init(id, ());
+                state.wl_pointer_res = Some(ptr);
             }
             wl_seat::Request::GetKeyboard { id } => {
                 data_init.init(id, ());
             }
             wl_seat::Request::GetTouch { id } => {
-                data_init.init(id, ());
+                let touch = data_init.init(id, ());
+                state.wl_touch_res = Some(touch);
             }
             _ => {}
         }
@@ -739,6 +799,330 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for MockComposi
     }
 }
 
+#[cfg(feature = "pointer-gestures")]
+impl GlobalDispatch<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+#[cfg(feature = "pointer-gestures")]
+impl Dispatch<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
+        request: zwp_pointer_gestures_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zwp_pointer_gestures_v1::Request::GetSwipeGesture { id, .. } => {
+                state.swipe_res = Some(data_init.init(id, ()));
+            }
+            zwp_pointer_gestures_v1::Request::GetPinchGesture { id, .. } => {
+                state.pinch_res = Some(data_init.init(id, ()));
+            }
+            zwp_pointer_gestures_v1::Request::GetHoldGesture { id, .. } => {
+                state.hold_res = Some(data_init.init(id, ()));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "pointer-gestures")]
+impl Dispatch<zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+        _request: zwp_pointer_gesture_swipe_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "pointer-gestures")]
+impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+        _request: zwp_pointer_gesture_pinch_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "pointer-gestures")]
+impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
+        _request: zwp_pointer_gesture_hold_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl GlobalDispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for MockCompositor {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        _resource: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
+        request: zwp_tablet_manager_v2::Request,
+        _data: &(),
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwp_tablet_manager_v2::Request::GetTabletSeat { tablet_seat, .. } = request {
+            let tseat = data_init.init(tablet_seat, ());
+            let ver = tseat.version();
+
+            let tablet = client
+                .create_resource::<zwp_tablet_v2::ZwpTabletV2, (), MockCompositor>(dh, ver, ())
+                .expect("create tablet");
+            tseat.tablet_added(&tablet);
+            tablet.name("Mock Pen Tablet".into());
+            tablet.id(0x056a, 0x0357);
+            tablet.done();
+
+            let tool = client
+                .create_resource::<zwp_tablet_tool_v2::ZwpTabletToolV2, (), MockCompositor>(
+                    dh,
+                    ver,
+                    (),
+                )
+                .expect("create tool");
+            tseat.tool_added(&tool);
+            tool._type(zwp_tablet_tool_v2::Type::Pen);
+            tool.hardware_serial(0x0000_0001, 0x0000_0042);
+            tool.hardware_id_wacom(0x0000_0000, 0x0000_0822);
+            tool.capability(zwp_tablet_tool_v2::Capability::Tilt);
+            tool.capability(zwp_tablet_tool_v2::Capability::Distance);
+            tool.capability(zwp_tablet_tool_v2::Capability::Rotation);
+            tool.capability(zwp_tablet_tool_v2::Capability::Slider);
+            tool.capability(zwp_tablet_tool_v2::Capability::Wheel);
+            tool.done();
+
+            let pad = client
+                .create_resource::<zwp_tablet_pad_v2::ZwpTabletPadV2, (), MockCompositor>(
+                    dh,
+                    ver,
+                    (),
+                )
+                .expect("create pad");
+            tseat.pad_added(&pad);
+            pad.buttons(4);
+
+            let group = client
+                .create_resource::<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, (), MockCompositor>(
+                    dh,
+                    ver,
+                    (),
+                )
+                .expect("create pad group");
+            pad.group(&group);
+            group.buttons(vec![0, 0, 0, 0]);
+            group.modes(2);
+
+            let ring = client
+                .create_resource::<zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, (), MockCompositor>(
+                    dh,
+                    ver,
+                    (),
+                )
+                .expect("create pad ring");
+            group.ring(&ring);
+
+            let strip = client
+                .create_resource::<zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, (), MockCompositor>(
+                    dh,
+                    ver,
+                    (),
+                )
+                .expect("create pad strip");
+            group.strip(&strip);
+
+            let dial = if ver >= 2 {
+                let d = client
+                    .create_resource::<zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, (), MockCompositor>(
+                        dh,
+                        ver,
+                        (),
+                    )
+                    .expect("create pad dial");
+                group.dial(&d);
+                Some(d)
+            } else {
+                None
+            };
+            group.done();
+            pad.done();
+
+            state.tablet_res = Some(tablet);
+            state.tool_res = Some(tool);
+            state.pad_res = Some(pad);
+            state.pad_group_res = Some(group);
+            state.pad_ring_res = Some(ring);
+            state.pad_strip_res = Some(strip);
+            state.pad_dial_res = dial;
+        }
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        _request: zwp_tablet_seat_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_v2::ZwpTabletV2, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_v2::ZwpTabletV2,
+        request: zwp_tablet_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if matches!(request, zwp_tablet_v2::Request::Destroy) {
+            state.xdg_trace.lock().unwrap().tablet_removed_destroyed += 1;
+        }
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        request: zwp_tablet_tool_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if matches!(request, zwp_tablet_tool_v2::Request::Destroy) {
+            state.xdg_trace.lock().unwrap().tablet_removed_destroyed += 1;
+        }
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for MockCompositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+        request: zwp_tablet_pad_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if matches!(request, zwp_tablet_pad_v2::Request::Destroy) {
+            state.xdg_trace.lock().unwrap().tablet_removed_destroyed += 1;
+        }
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+        _request: zwp_tablet_pad_group_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+        _request: zwp_tablet_pad_ring_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+        _request: zwp_tablet_pad_strip_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
+#[cfg(feature = "tablet")]
+impl Dispatch<zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()> for MockCompositor {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+        _request: zwp_tablet_pad_dial_v2::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
 #[cfg(feature = "ime")]
 impl GlobalDispatch<zwp_text_input_manager_v3::ZwpTextInputManagerV3, ()> for MockCompositor {
     fn bind(
@@ -908,6 +1292,17 @@ fn spawn_mock_compositor_configured(
         if cfg.enable_xdg_activation {
             dh.create_global::<MockCompositor, xdg_activation_v1::XdgActivationV1, _>(1, ());
         }
+        #[cfg(feature = "pointer-gestures")]
+        if cfg.enable_pointer_gestures {
+            dh.create_global::<MockCompositor, zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _>(
+                3,
+                (),
+            );
+        }
+        #[cfg(feature = "tablet")]
+        if cfg.enable_tablet {
+            dh.create_global::<MockCompositor, zwp_tablet_manager_v2::ZwpTabletManagerV2, _>(2, ());
+        }
         #[cfg(feature = "ime")]
         if cfg.enable_ime {
             dh.create_global::<MockCompositor, zwp_text_input_manager_v3::ZwpTextInputManagerV3, _>(
@@ -935,6 +1330,37 @@ fn spawn_mock_compositor_configured(
             xdg_surface_to_wl: std::collections::HashMap::new(),
             pending_token_app_id: None,
             xdg_trace: xdg_trace_srv,
+            enable_touch: cfg.enable_touch,
+            send_touch_sequence: cfg.send_touch_sequence,
+            touch_sequence_sent: false,
+            send_touchpad_sequence: cfg.send_touchpad_sequence,
+            touchpad_sequence_sent: false,
+            wl_pointer_res: None,
+            wl_touch_res: None,
+            #[cfg(feature = "pointer-gestures")]
+            swipe_res: None,
+            #[cfg(feature = "pointer-gestures")]
+            pinch_res: None,
+            #[cfg(feature = "pointer-gestures")]
+            hold_res: None,
+            #[cfg(feature = "tablet")]
+            send_tablet_sequence: cfg.send_tablet_sequence,
+            #[cfg(feature = "tablet")]
+            tablet_sequence_sent: false,
+            #[cfg(feature = "tablet")]
+            tablet_res: None,
+            #[cfg(feature = "tablet")]
+            tool_res: None,
+            #[cfg(feature = "tablet")]
+            pad_res: None,
+            #[cfg(feature = "tablet")]
+            pad_group_res: None,
+            #[cfg(feature = "tablet")]
+            pad_ring_res: None,
+            #[cfg(feature = "tablet")]
+            pad_strip_res: None,
+            #[cfg(feature = "tablet")]
+            pad_dial_res: None,
             #[cfg(feature = "ime")]
             text_inputs: Vec::new(),
             #[cfg(feature = "ime")]
@@ -951,6 +1377,152 @@ fn spawn_mock_compositor_configured(
         };
         while !stop_srv.load(Ordering::Relaxed) {
             let _ = display.dispatch_clients(&mut state);
+            if state.send_touch_sequence
+                && !state.touch_sequence_sent
+                && state.xdg_trace.lock().unwrap().buffer_commits >= 1
+                && let (Some(touch), Some(surf)) =
+                    (state.wl_touch_res.as_ref(), state.last_wl_surface.as_ref())
+            {
+                state.touch_sequence_sent = true;
+                // Contact 1 on touch canvas [0..100, 0..100] with shape + orientation.
+                touch.down(10, 100, surf, 1, 20.0, 20.0);
+                touch.shape(1, 12.5, 8.0);
+                touch.orientation(1, 45.0);
+                touch.frame();
+                touch.motion(110, 1, 60.0, 25.0);
+                touch.frame();
+                touch.up(11, 120, 1);
+                touch.frame();
+
+                // Contact 2 on unclaimed button/slider [110..210, 0..100] -> drag + cancel fallback.
+                touch.down(12, 130, surf, 2, 150.0, 20.0);
+                touch.frame();
+                touch.motion(140, 2, 175.0, 20.0);
+                touch.frame();
+                touch.cancel();
+            }
+            if state.send_touchpad_sequence
+                && !state.touchpad_sequence_sent
+                && state.xdg_trace.lock().unwrap().buffer_commits >= 1
+                && let (Some(ptr), Some(surf)) = (
+                    state.wl_pointer_res.as_ref(),
+                    state.last_wl_surface.as_ref(),
+                )
+            {
+                #[cfg(feature = "pointer-gestures")]
+                let gestures_ready = state.swipe_res.is_some()
+                    && state.pinch_res.is_some()
+                    && state.hold_res.is_some();
+                #[cfg(not(feature = "pointer-gestures"))]
+                let gestures_ready = true;
+                if gestures_ready {
+                    state.touchpad_sequence_sent = true;
+                    ptr.enter(20, surf, 50.0, 40.0);
+                    ptr.frame();
+                    ptr.axis_source(wl_pointer::AxisSource::Finger);
+                    ptr.axis(200, wl_pointer::Axis::VerticalScroll, 20.0);
+                    ptr.frame();
+                    ptr.axis_source(wl_pointer::AxisSource::Finger);
+                    ptr.axis_stop(210, wl_pointer::Axis::VerticalScroll);
+                    ptr.frame();
+
+                    #[cfg(feature = "pointer-gestures")]
+                    if let (Some(swipe), Some(pinch), Some(hold)) = (
+                        state.swipe_res.as_ref(),
+                        state.pinch_res.as_ref(),
+                        state.hold_res.as_ref(),
+                    ) {
+                        swipe.begin(21, 220, surf, 3);
+                        swipe.update(225, 10.0, -5.0);
+                        swipe.end(22, 230, 0);
+
+                        pinch.begin(23, 240, surf, 2);
+                        pinch.update(245, 1.0, 2.0, 1.5, 15.0);
+                        pinch.end(24, 250, 1);
+
+                        hold.begin(25, 260, surf, 3);
+                        hold.end(26, 270, 0);
+                    }
+                }
+            }
+            #[cfg(feature = "tablet")]
+            if state.send_tablet_sequence
+                && !state.tablet_sequence_sent
+                && state.xdg_trace.lock().unwrap().buffer_commits >= 1
+                && let (
+                    Some(tablet),
+                    Some(tool),
+                    Some(pad),
+                    Some(group),
+                    Some(ring),
+                    Some(strip),
+                    Some(surf),
+                ) = (
+                    state.tablet_res.as_ref(),
+                    state.tool_res.as_ref(),
+                    state.pad_res.as_ref(),
+                    state.pad_group_res.as_ref(),
+                    state.pad_ring_res.as_ref(),
+                    state.pad_strip_res.as_ref(),
+                    state.last_wl_surface.as_ref(),
+                )
+            {
+                state.tablet_sequence_sent = true;
+                // Stylus stroke on canvas [0..100, 0..100]
+                tool.proximity_in(30, tablet, surf);
+                tool.motion(30.0, 30.0);
+                tool.distance(16384);
+                tool.frame(300);
+
+                tool.down(31);
+                tool.pressure(32768);
+                tool.tilt(10.0, -5.0);
+                tool.rotation(90.0);
+                tool.slider(32768);
+                tool.frame(310);
+
+                tool.motion(45.0, 35.0);
+                tool.pressure(65535);
+                tool.wheel(15.0, 1);
+                tool.frame(320);
+
+                tool.button(32, 0x14b, zwp_tablet_tool_v2::ButtonState::Pressed);
+                tool.frame(330);
+
+                tool.up();
+                tool.proximity_out();
+                tool.frame(340);
+
+                // Stylus tap on toolbar button [110..210, 0..100] (no on_tablet -> pointer fallback)
+                tool.proximity_in(33, tablet, surf);
+                tool.motion(150.0, 30.0);
+                tool.down(34);
+                tool.frame(350);
+                tool.up();
+                tool.proximity_out();
+                tool.frame(360);
+
+                // Pad events (enter, button, mode_switch, ring, strip, dial, leave)
+                pad.enter(35, tablet, surf);
+                pad.button(370, 0, zwp_tablet_pad_v2::ButtonState::Pressed);
+                group.mode_switch(375, 36, 1);
+                ring.source(zwp_tablet_pad_ring_v2::Source::Finger);
+                ring.angle(180.0);
+                ring.frame(380);
+                strip.source(zwp_tablet_pad_strip_v2::Source::Finger);
+                strip.position(32768);
+                strip.frame(385);
+                if let Some(dial) = state.pad_dial_res.as_ref() {
+                    dial.delta(120);
+                    dial.frame(390);
+                }
+                pad.leave(37, surf);
+
+                // Removal lifecycle: client must issue destroy() for pad, tool, tablet.
+                pad.removed();
+                tool.removed();
+                tablet.removed();
+            }
             if state.simulate_output_hotplug_on_two_layers
                 && !state.hotplug_triggered
                 && state.layer_surfaces.len() >= 2
@@ -1614,5 +2186,461 @@ fn socketpair_layer_closed_and_output_hotplug_recreates_memo_surfaces_without_qu
         "frame_pending pacing violated: commits={} frame_callbacks={}",
         trace.buffer_commits,
         trace.frame_callbacks_created
+    );
+}
+
+#[test]
+fn socketpair_wl_touch_multitouch_shape_orientation_cancel_and_drag_fallback() {
+    use waywi::prelude::*;
+
+    type TouchWireEntry = (i32, TouchPhase, f32, Option<(f32, f32)>, Option<f32>);
+    type FirstDownMeta = (Option<(f32, f32)>, Option<f32>);
+
+    #[derive(Default)]
+    struct TouchWireState {
+        touch_events: Vec<TouchWireEntry>,
+        btn_clicks: usize,
+        btn_downs: usize,
+        surf_moves: Vec<f32>,
+        surf_ups: usize,
+    }
+
+    #[derive(Clone)]
+    enum TouchWireMsg {
+        CanvasTouch(TouchEvent),
+        BtnClick,
+        BtnDown,
+        SurfMove(f32),
+        SurfUp,
+        TimeoutQuit,
+    }
+
+    type TouchSummary = (usize, usize, usize, usize, usize);
+    static GOT_TOUCH_CAP: AtomicBool = AtomicBool::new(false);
+    static SUMMARY: Mutex<Option<TouchSummary>> = Mutex::new(None);
+    static FIRST_DOWN: Mutex<Option<FirstDownMeta>> = Mutex::new(None);
+
+    struct TouchWireApp;
+    impl Application for TouchWireApp {
+        type State = TouchWireState;
+        type Message = TouchWireMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            GOT_TOUCH_CAP.store(
+                ctx.capabilities().has(Capability::TouchInput),
+                Ordering::Relaxed,
+            );
+            ctx.after(Duration::from_millis(250), TouchWireMsg::TimeoutQuit);
+            Ok(TouchWireState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                TouchWireMsg::CanvasTouch(ev) => {
+                    if ev.phase == TouchPhase::Down && ev.id == 1 {
+                        *FIRST_DOWN.lock().unwrap() = Some((ev.shape, ev.orientation));
+                    }
+                    state.touch_events.push((
+                        ev.id,
+                        ev.phase,
+                        ev.local_position.x.0,
+                        ev.shape,
+                        ev.orientation,
+                    ));
+                }
+                TouchWireMsg::BtnClick => state.btn_clicks += 1,
+                TouchWireMsg::BtnDown => state.btn_downs += 1,
+                TouchWireMsg::SurfMove(x) => state.surf_moves.push(x),
+                TouchWireMsg::SurfUp => {
+                    state.surf_ups += 1;
+                    *SUMMARY.lock().unwrap() = Some((
+                        state.touch_events.len(),
+                        state.btn_clicks,
+                        state.btn_downs,
+                        state.surf_moves.len(),
+                        state.surf_ups,
+                    ));
+                    ctx.quit();
+                }
+                TouchWireMsg::TimeoutQuit => {
+                    *SUMMARY.lock().unwrap() = Some((
+                        state.touch_events.len(),
+                        state.btn_clicks,
+                        state.btn_downs,
+                        state.surf_moves.len(),
+                        state.surf_ups,
+                    ));
+                    ctx.quit();
+                }
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("touch-wire")
+                    .size((240.logical_px(), 100.logical_px()))
+                    .on_pointer_move(|e| Some(TouchWireMsg::SurfMove(e.position.x.0)))
+                    .on_pointer_up(|_| Some(TouchWireMsg::SurfUp))
+                    .child(
+                        Row::new()
+                            .gap(10.logical_px())
+                            .child(
+                                Rect::new()
+                                    .key("touch-canvas")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_touch(TouchWireMsg::CanvasTouch),
+                            )
+                            .child(
+                                Rect::new()
+                                    .key("touch-btn")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::GREEN)
+                                    .on_click(TouchWireMsg::BtnClick)
+                                    .on_pointer_down(|_| TouchWireMsg::BtnDown),
+                            ),
+                    ),
+            );
+            s
+        }
+    }
+
+    GOT_TOUCH_CAP.store(false, Ordering::Relaxed);
+    *SUMMARY.lock().unwrap() = None;
+    *FIRST_DOWN.lock().unwrap() = None;
+
+    let (conn, stop, srv, _, _) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_touch: true,
+        send_touch_sequence: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<TouchWireApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "TouchWireApp failed: {res:?}");
+    assert!(GOT_TOUCH_CAP.load(Ordering::Relaxed));
+    assert_eq!(
+        *FIRST_DOWN.lock().unwrap(),
+        Some((Some((12.5, 8.0)), Some(45.0)))
+    );
+    assert_eq!(*SUMMARY.lock().unwrap(), Some((3, 1, 1, 1, 1)));
+}
+
+#[cfg(feature = "pointer-gestures")]
+#[test]
+fn socketpair_touchpad_axis_metadata_and_pointer_gestures_v1() {
+    use waywi::prelude::*;
+
+    #[derive(Default)]
+    struct GestureWireState {
+        scrolls: Vec<(ScrollSource, f32, bool)>,
+        gestures: Vec<(GesturePhase, u32)>,
+    }
+
+    #[derive(Clone)]
+    enum GestureWireMsg {
+        Scroll(ScrollEvent),
+        Gesture(GestureEvent),
+        TimeoutQuit,
+    }
+
+    static GOT_GESTURE_CAP: AtomicBool = AtomicBool::new(false);
+    static SCROLL_RES: Mutex<Vec<(ScrollSource, f32, bool)>> = Mutex::new(Vec::new());
+    static GESTURE_RES: Mutex<Vec<(GesturePhase, GestureKind, u32, f32)>> = Mutex::new(Vec::new());
+
+    struct GestureWireApp;
+    impl Application for GestureWireApp {
+        type State = GestureWireState;
+        type Message = GestureWireMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            GOT_GESTURE_CAP.store(
+                ctx.capabilities().has(Capability::PointerGestures),
+                Ordering::Relaxed,
+            );
+            ctx.after(Duration::from_millis(250), GestureWireMsg::TimeoutQuit);
+            Ok(GestureWireState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                GestureWireMsg::Scroll(e) => {
+                    state.scrolls.push((e.source, e.delta_y, e.stop_y));
+                    SCROLL_RES
+                        .lock()
+                        .unwrap()
+                        .push((e.source, e.delta_y, e.stop_y));
+                }
+                GestureWireMsg::Gesture(g) => {
+                    state.gestures.push((g.phase, g.fingers));
+                    GESTURE_RES
+                        .lock()
+                        .unwrap()
+                        .push((g.phase, g.kind, g.fingers, g.position.x.0));
+                    if state.gestures.len() >= 8 {
+                        ctx.quit();
+                    }
+                }
+                GestureWireMsg::TimeoutQuit => ctx.quit(),
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("gesture-wire")
+                    .size((200.logical_px(), 120.logical_px()))
+                    .child(
+                        Rect::new()
+                            .key("touchpad-area")
+                            .size((200.logical_px(), 120.logical_px()))
+                            .fill(Color::GRAY)
+                            .on_scroll(GestureWireMsg::Scroll)
+                            .on_gesture(GestureWireMsg::Gesture),
+                    ),
+            );
+            s
+        }
+    }
+
+    GOT_GESTURE_CAP.store(false, Ordering::Relaxed);
+    SCROLL_RES.lock().unwrap().clear();
+    GESTURE_RES.lock().unwrap().clear();
+
+    let (conn, stop, srv, _, _) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_pointer_gestures: true,
+        send_touchpad_sequence: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<GestureWireApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "GestureWireApp failed: {res:?}");
+    assert!(GOT_GESTURE_CAP.load(Ordering::Relaxed));
+    assert_eq!(
+        *SCROLL_RES.lock().unwrap(),
+        vec![
+            (ScrollSource::Finger, 2.0, false),
+            (ScrollSource::Finger, 0.0, true),
+        ]
+    );
+    let gestures = GESTURE_RES.lock().unwrap();
+    assert_eq!(gestures.len(), 8, "gestures={gestures:?}");
+    assert_eq!(gestures[0].0, GesturePhase::Begin);
+    assert_eq!(gestures[1].1, GestureKind::Swipe { dx: 10.0, dy: -5.0 });
+    assert_eq!(gestures[2].0, GesturePhase::End);
+    assert_eq!(
+        gestures[4].1,
+        GestureKind::Pinch {
+            dx: 1.0,
+            dy: 2.0,
+            scale: 1.5,
+            rotation: 15.0
+        }
+    );
+    assert_eq!(gestures[5].0, GesturePhase::Cancelled);
+    assert_eq!(gestures[6].1, GestureKind::Hold);
+    assert_eq!(gestures[7].0, GesturePhase::End);
+    assert_eq!(gestures[0].3, 50.0);
+}
+
+#[cfg(feature = "tablet")]
+#[test]
+fn socketpair_tablet_v2_stylus_frame_axes_fallback_and_pad() {
+    use waywi::prelude::*;
+
+    #[derive(Clone)]
+    enum TabWireMsg {
+        Canvas(TabletEvent),
+        PadSurf(TabletEvent),
+        ToolbarClick,
+        TimeoutQuit,
+    }
+
+    static GOT_TAB_CAP: AtomicBool = AtomicBool::new(false);
+    static TOOL_EVENTS: Mutex<Vec<TabletToolEvent>> = Mutex::new(Vec::new());
+    static PAD_EVENTS: Mutex<Vec<TabletPadEventKind>> = Mutex::new(Vec::new());
+    static TOOLBAR_CLICKS: Mutex<usize> = Mutex::new(0);
+
+    struct TabWireApp;
+    impl Application for TabWireApp {
+        type State = ();
+        type Message = TabWireMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            GOT_TAB_CAP.store(
+                ctx.capabilities().has(Capability::TabletInput),
+                Ordering::Relaxed,
+            );
+            ctx.after(Duration::from_millis(300), TabWireMsg::TimeoutQuit);
+            Ok(())
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                TabWireMsg::Canvas(TabletEvent::Tool(ev)) => {
+                    TOOL_EVENTS.lock().unwrap().push(ev);
+                }
+                TabWireMsg::Canvas(TabletEvent::Pad(_)) => {}
+                TabWireMsg::PadSurf(TabletEvent::Pad(p)) => {
+                    let is_leave = matches!(p.kind, TabletPadEventKind::Leave);
+                    PAD_EVENTS.lock().unwrap().push(p.kind);
+                    if is_leave {
+                        // Give one short beat for removed->destroy requests to flush.
+                        ctx.after(Duration::from_millis(20), TabWireMsg::TimeoutQuit);
+                    }
+                }
+                TabWireMsg::PadSurf(TabletEvent::Tool(_)) => {}
+                TabWireMsg::ToolbarClick => {
+                    *TOOLBAR_CLICKS.lock().unwrap() += 1;
+                }
+                TabWireMsg::TimeoutQuit => ctx.quit(),
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("tablet-wire")
+                    .size((240.logical_px(), 100.logical_px()))
+                    .on_tablet(|ev| match ev {
+                        TabletEvent::Pad(_) => Some(TabWireMsg::PadSurf(ev)),
+                        TabletEvent::Tool(_) => None,
+                    })
+                    .child(
+                        Row::new()
+                            .gap(10.logical_px())
+                            .child(
+                                Rect::new()
+                                    .key("tab-canvas")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::WHITE)
+                                    .on_tablet(TabWireMsg::Canvas),
+                            )
+                            .child(
+                                Rect::new()
+                                    .key("tab-toolbar")
+                                    .size((100.logical_px(), 100.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_click(TabWireMsg::ToolbarClick),
+                            ),
+                    ),
+            );
+            s
+        }
+    }
+
+    GOT_TAB_CAP.store(false, Ordering::Relaxed);
+    TOOL_EVENTS.lock().unwrap().clear();
+    PAD_EVENTS.lock().unwrap().clear();
+    *TOOLBAR_CLICKS.lock().unwrap() = 0;
+
+    let (conn, stop, srv, _, trace) = spawn_mock_compositor_configured(MockServerConfig {
+        enable_xdg_shell: true,
+        enable_tablet: true,
+        send_tablet_sequence: true,
+        ..MockServerConfig::default()
+    });
+    let res = App::new().run_on_connection::<TabWireApp>(conn);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+    assert!(res.is_ok(), "TabWireApp failed: {res:?}");
+    assert!(GOT_TAB_CAP.load(Ordering::Relaxed));
+
+    let tool_evs = TOOL_EVENTS.lock().unwrap();
+    assert_eq!(tool_evs.len(), 6, "tool_evs={tool_evs:?}");
+    assert_eq!(tool_evs[0].kind, TabletToolEventKind::ProximityIn);
+    assert_eq!(tool_evs[0].tool_type, TabletToolType::Pen);
+    assert_eq!(tool_evs[0].hardware_serial, (1u64 << 32) | 0x42);
+    assert_eq!(tool_evs[0].hardware_id_wacom, 0x0822);
+    assert!((tool_evs[0].axes.distance - (16384.0 / 65535.0)).abs() < 1e-4);
+
+    assert_eq!(tool_evs[1].kind, TabletToolEventKind::Down);
+    assert!((tool_evs[1].axes.pressure - (32768.0 / 65535.0)).abs() < 1e-4);
+    assert_eq!(tool_evs[1].axes.tilt, (10.0, -5.0));
+    assert_eq!(tool_evs[1].axes.rotation, 90.0);
+    assert!((tool_evs[1].axes.slider - (32768.0 / 65535.0)).abs() < 1e-4);
+
+    assert_eq!(tool_evs[2].kind, TabletToolEventKind::Motion);
+    assert_eq!(tool_evs[2].position.x.0, 45.0);
+    assert_eq!(tool_evs[2].axes.pressure, 1.0);
+    assert_eq!(tool_evs[2].axes.wheel_degrees, 15.0);
+    assert_eq!(tool_evs[2].axes.wheel_clicks, 1);
+
+    assert_eq!(
+        tool_evs[3].kind,
+        TabletToolEventKind::Button {
+            button: 0x14b,
+            pressed: true,
+        }
+    );
+    assert_eq!(tool_evs[4].kind, TabletToolEventKind::Up);
+    assert_eq!(tool_evs[5].kind, TabletToolEventKind::ProximityOut);
+
+    // WAIT: surface has `.on_tablet` for Pad only, let's verify toolbar fallback!
+    assert_eq!(*TOOLBAR_CLICKS.lock().unwrap(), 1);
+
+    let pad_evs = PAD_EVENTS.lock().unwrap();
+    assert_eq!(pad_evs.len(), 7, "pad_evs={pad_evs:?}");
+    assert_eq!(pad_evs[0], TabletPadEventKind::Enter);
+    assert_eq!(
+        pad_evs[1],
+        TabletPadEventKind::Button {
+            button: 0,
+            pressed: true,
+        }
+    );
+    assert_eq!(
+        pad_evs[2],
+        TabletPadEventKind::ModeSwitch { group: 0, mode: 1 }
+    );
+    assert_eq!(
+        pad_evs[3],
+        TabletPadEventKind::Ring {
+            ring: 0,
+            angle: Some(180.0),
+            source: TabletPadAxisSource::Finger,
+            stopped: false,
+        }
+    );
+    assert!(matches!(
+        pad_evs[4],
+        TabletPadEventKind::Strip {
+            strip: 0,
+            position: Some(p),
+            source: TabletPadAxisSource::Finger,
+            stopped: false,
+        } if (p - (32768.0 / 65535.0)).abs() < 1e-4
+    ));
+    assert_eq!(
+        pad_evs[5],
+        TabletPadEventKind::Dial {
+            dial: 0,
+            delta: 1.0,
+            value120: 120,
+        }
+    );
+    assert_eq!(pad_evs[6], TabletPadEventKind::Leave);
+    assert!(
+        trace.lock().unwrap().tablet_removed_destroyed >= 3,
+        "expected pad/tool/tablet destroy requests after removed events"
     );
 }

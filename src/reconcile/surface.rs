@@ -5,8 +5,9 @@ use crate::arena::FrameSharedFn;
 use crate::display::OutputId;
 use crate::geometry::{Bounds, BufferRect, Edges, LogicalPx, LogicalSize, Point, ScaleFactor};
 use crate::input::{
-    HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, NodeId, PointerEvent,
-    ScrollEvent, hit_test, hit_test_scroll,
+    GestureEvent, HitTestNode, ImeConfig, ImeEvent, KeyEvent, Modifiers, MouseButton, NodeId,
+    PointerEvent, ScrollEvent, TabletEvent, TabletToolEventKind, TabletToolId, TouchEvent,
+    TouchPhase, hit_test, hit_test_gesture, hit_test_scroll, hit_test_tablet, hit_test_touch,
 };
 use crate::render::{Color, DrawCommand, RetainedNode};
 use crate::surface::types::PopupSpec;
@@ -56,6 +57,13 @@ pub(crate) struct RetainedSurface<M> {
     pub(crate) on_ime: Option<FrameSharedFn<ImeEvent, Option<M>>>,
     pub(crate) on_pointer_move: Option<FrameSharedFn<PointerEvent, Option<M>>>,
     pub(crate) on_pointer_up: Option<FrameSharedFn<PointerEvent, Option<M>>>,
+    pub(crate) on_touch: Option<FrameSharedFn<TouchEvent, Option<M>>>,
+    pub(crate) on_gesture: Option<FrameSharedFn<GestureEvent, Option<M>>>,
+    pub(crate) on_tablet: Option<FrameSharedFn<TabletEvent, Option<M>>>,
+    /// Per-contact touch capture (`touch_id -> NodeId`) preserving delivery across drags.
+    pub(crate) touch_captures: Vec<(i32, NodeId)>,
+    /// Per-tool tip-down capture (`tool_id -> NodeId`) preserving stylus strokes across drags.
+    pub(crate) tablet_captures: Vec<(TabletToolId, NodeId)>,
     pub(crate) dirty_logical_rects: Vec<Bounds>,
     pub(crate) needs_redraw: bool,
     pub(crate) full_redraw: bool,
@@ -171,6 +179,146 @@ impl<M: 'static> RetainedSurface<M> {
         let on_scroll = node.handlers.on_scroll.as_ref()?;
         event.local_position = local;
         Some(on_scroll.call(event))
+    }
+
+    /// Dispatches a multi-touch contact event with per-contact capture to matching element and
+    /// surface `on_touch` handlers.
+    pub(crate) fn dispatch_touch(&mut self, mut event: TouchEvent) -> TouchDispatch<M> {
+        let target_node_id = match event.phase {
+            TouchPhase::Down => {
+                self.touch_captures.retain(|(id, _)| *id != event.id);
+                if let Some((node, local)) = hit_test_touch(&self.hit_nodes, event.position) {
+                    let nid = node.node_id;
+                    self.touch_captures.push((event.id, nid));
+                    event.local_position = local;
+                    Some(nid)
+                } else {
+                    None
+                }
+            }
+            TouchPhase::Move => self
+                .touch_captures
+                .iter()
+                .find(|(id, _)| *id == event.id)
+                .map(|(_, nid)| *nid),
+            TouchPhase::Up | TouchPhase::Cancel => self
+                .touch_captures
+                .iter()
+                .position(|(id, _)| *id == event.id)
+                .map(|idx| self.touch_captures.swap_remove(idx).1),
+        };
+
+        let on_node = target_node_id.and_then(|nid| {
+            let node = self.hit_nodes.iter().find(|n| n.node_id == nid)?;
+            let handler = node.handlers.on_touch.as_ref()?;
+            let mut node_ev = event;
+            if event.phase != TouchPhase::Down {
+                node_ev.local_position = node.surface_point_to_local(event.position);
+            }
+            Some(handler.call(node_ev))
+        });
+
+        let on_surface = self.on_touch.as_ref().and_then(|h| {
+            let mut surf_ev = event;
+            surf_ev.local_position = event.position;
+            h.call(surf_ev)
+        });
+
+        TouchDispatch {
+            handled_by_touch: target_node_id.is_some() || on_surface.is_some(),
+            on_node,
+            on_surface,
+        }
+    }
+
+    /// Dispatches a multi-finger touchpad gesture to hit-tested element and surface `on_gesture`
+    /// handlers.
+    pub(crate) fn dispatch_gesture(&self, event: GestureEvent) -> GestureDispatch<M> {
+        let on_node =
+            hit_test_gesture(&self.hit_nodes, event.position).and_then(|(node, local)| {
+                let handler = node.handlers.on_gesture.as_ref()?;
+                let mut node_ev = event;
+                node_ev.local_position = local;
+                Some(handler.call(node_ev))
+            });
+        let on_surface = self.on_gesture.as_ref().and_then(|h| {
+            let mut surf_ev = event;
+            surf_ev.local_position = event.position;
+            h.call(surf_ev)
+        });
+        GestureDispatch {
+            on_node,
+            on_surface,
+        }
+    }
+
+    /// Dispatches a pen tablet tool or pad event with per-tool tip-down capture to matching
+    /// element and surface `on_tablet` handlers.
+    pub(crate) fn dispatch_tablet(&mut self, event: TabletEvent) -> TabletDispatch<M> {
+        match event {
+            TabletEvent::Pad(_) => {
+                let on_surface = self.on_tablet.as_ref().and_then(|h| h.call(event));
+                TabletDispatch {
+                    handled_by_tablet: on_surface.is_some(),
+                    on_node: None,
+                    on_surface,
+                }
+            }
+            TabletEvent::Tool(tool_ev) => {
+                let captured_id = match tool_ev.kind {
+                    TabletToolEventKind::Down => {
+                        self.tablet_captures
+                            .retain(|(id, _)| *id != tool_ev.tool_id);
+                        if let Some((node, _)) = hit_test_tablet(&self.hit_nodes, tool_ev.position)
+                        {
+                            self.tablet_captures.push((tool_ev.tool_id, node.node_id));
+                            Some(node.node_id)
+                        } else {
+                            None
+                        }
+                    }
+                    TabletToolEventKind::Up | TabletToolEventKind::ProximityOut => self
+                        .tablet_captures
+                        .iter()
+                        .position(|(id, _)| *id == tool_ev.tool_id)
+                        .map(|idx| self.tablet_captures.swap_remove(idx).1),
+                    _ => self
+                        .tablet_captures
+                        .iter()
+                        .find(|(id, _)| *id == tool_ev.tool_id)
+                        .map(|(_, nid)| *nid),
+                };
+
+                let target = if let Some(nid) = captured_id {
+                    self.hit_nodes
+                        .iter()
+                        .find(|n| n.node_id == nid)
+                        .map(|n| (n, n.surface_point_to_local(tool_ev.position)))
+                } else {
+                    hit_test_tablet(&self.hit_nodes, tool_ev.position)
+                };
+
+                let has_node = target.is_some();
+                let on_node = target.and_then(|(node, local)| {
+                    let handler = node.handlers.on_tablet.as_ref()?;
+                    let mut node_ev = tool_ev;
+                    node_ev.local_position = local;
+                    Some(handler.call(TabletEvent::Tool(node_ev)))
+                });
+
+                let on_surface = self.on_tablet.as_ref().and_then(|h| {
+                    let mut surf_ev = tool_ev;
+                    surf_ev.local_position = tool_ev.position;
+                    h.call(TabletEvent::Tool(surf_ev))
+                });
+
+                TabletDispatch {
+                    handled_by_tablet: has_node || on_surface.is_some(),
+                    on_node,
+                    on_surface,
+                }
+            }
+        }
     }
 
     /// Updates hover state at `pos` and optionally evaluates node/surface `on_pointer_move`.
@@ -329,6 +477,28 @@ pub(crate) struct PointerMoveDispatch<M> {
     pub(crate) hover: Option<HoverTransition<M>>,
     pub(crate) on_node_move: Option<M>,
     pub(crate) on_surface_move: Option<M>,
+}
+
+/// Output of touchscreen contact dispatch on a [`RetainedSurface`].
+pub(crate) struct TouchDispatch<M> {
+    /// `true` when an element or surface `on_touch` handler claimed this contact.
+    pub(crate) handled_by_touch: bool,
+    pub(crate) on_node: Option<M>,
+    pub(crate) on_surface: Option<M>,
+}
+
+/// Output of touchpad multi-finger gesture dispatch on a [`RetainedSurface`].
+pub(crate) struct GestureDispatch<M> {
+    pub(crate) on_node: Option<M>,
+    pub(crate) on_surface: Option<M>,
+}
+
+/// Output of graphics tablet tool/pad dispatch on a [`RetainedSurface`].
+pub(crate) struct TabletDispatch<M> {
+    /// `true` when an element or surface `on_tablet` handler claimed this event.
+    pub(crate) handled_by_tablet: bool,
+    pub(crate) on_node: Option<M>,
+    pub(crate) on_surface: Option<M>,
 }
 
 /// Output of one reconciliation pass across all declared surfaces.
