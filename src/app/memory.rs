@@ -1,6 +1,30 @@
 use crate::asset::AssetRetention;
 use crate::surface::BufferRetention;
 
+/// GPU sub-allocator memory policy forwarded to `wgpu::MemoryHints` when `renderer-gpu` is active.
+///
+/// On Vulkan (the primary Linux Wayland GPU backend), `wgpu`'s default `Performance` hint allocates
+/// 128–256 MiB device-local blocks and 64–128 MiB host blocks up front. For 2D desktop UI tools
+/// (especially on integrated GPUs with unified memory), smaller sub-allocator blocks avoid large
+/// upfront RAM/VRAM reservations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuMemoryPolicy {
+    /// Favor smaller sub-allocator blocks (8–64 MiB device, 4–32 MiB host).
+    ///
+    /// Default for [`MemoryConfig::balanced()`].
+    #[default]
+    MemoryUsage,
+    /// Clamped minimal sub-allocator blocks (4–16 MiB device, 2–8 MiB host).
+    ///
+    /// Default for [`MemoryConfig::low_memory()`].
+    Minimal,
+    /// Favor larger sub-allocator blocks (128–256 MiB device, 64–128 MiB host) to minimize
+    /// allocator churn under heavy dynamic GPU workloads.
+    ///
+    /// Default for [`MemoryConfig::high_throughput()`].
+    Performance,
+}
+
 /// Runtime memory and cache configuration applied to [`App`](super::App) and
 /// [`HeadlessRuntime`](super::HeadlessRuntime).
 ///
@@ -21,6 +45,14 @@ pub struct MemoryConfig {
     pub text_max_cached_buffers: usize,
     /// Number of unreferenced frames before a shaped text buffer is evicted.
     pub text_stale_frame_age: u64,
+    /// Maximum number of unique mmapped system font files retained in `cosmic-text`'s `FontSystem`
+    /// before WayWi automatically rebuilds `FontSystem` from the unmapped metadata database at the
+    /// end of the frame (preserving warm shaped-buffer and glyph caches).
+    ///
+    /// Protects long-running panels/daemons from permanent ~300+ MiB RSS inflation after a single
+    /// unknown Unicode codepoint triggers an exhaustive font fallback scan. Set to `0` to disable
+    /// automatic reclamation and rebuild only on explicit [`EffectCtx::trim_memory`](crate::EffectCtx::trim_memory).
+    pub text_max_mapped_font_files: usize,
     /// Whether to load system Fontconfig/fontdb fonts at text engine startup.
     pub load_system_fonts: bool,
     /// Maximum reusable software scratch byte capacity retained after a frame completes.
@@ -31,6 +63,8 @@ pub struct MemoryConfig {
     pub gpu_cache_max_bytes: usize,
     /// Number of unreferenced frames before a cached GPU image texture is evicted.
     pub gpu_stale_frame_age: u64,
+    /// GPU device sub-allocator block size policy when `renderer-gpu` is active.
+    pub gpu_memory_policy: GpuMemoryPolicy,
     /// Maximum decoded SFX PCM buffer cache budget in [`AudioPlayer`](crate::audio::AudioPlayer).
     pub sound_cache_max_bytes: usize,
     /// Maximum cached entries in [`XdgIconLookup`](crate::desktop::XdgIconLookup).
@@ -58,11 +92,13 @@ impl MemoryConfig {
             arena_max_retain_bytes: 256 * 1024,
             text_max_cached_buffers: 256,
             text_stale_frame_age: 60,
+            text_max_mapped_font_files: 32,
             load_system_fonts: true,
             software_scratch_max_bytes: 512 * 1024,
             canvas_cache_max_bytes: 8 * 1024 * 1024,
             gpu_cache_max_bytes: 32 * 1024 * 1024,
             gpu_stale_frame_age: 120,
+            gpu_memory_policy: GpuMemoryPolicy::MemoryUsage,
             sound_cache_max_bytes: 8 * 1024 * 1024,
             icon_lookup_max_entries: 2048,
             dbus_cache_snapshots: true,
@@ -83,11 +119,13 @@ impl MemoryConfig {
             arena_max_retain_bytes: 64 * 1024,
             text_max_cached_buffers: 64,
             text_stale_frame_age: 16,
+            text_max_mapped_font_files: 16,
             load_system_fonts: true,
             software_scratch_max_bytes: 64 * 1024,
             canvas_cache_max_bytes: 2 * 1024 * 1024,
             gpu_cache_max_bytes: 8 * 1024 * 1024,
             gpu_stale_frame_age: 30,
+            gpu_memory_policy: GpuMemoryPolicy::Minimal,
             sound_cache_max_bytes: 2 * 1024 * 1024,
             icon_lookup_max_entries: 512,
             dbus_cache_snapshots: false,
@@ -106,11 +144,13 @@ impl MemoryConfig {
             arena_max_retain_bytes: 1024 * 1024,
             text_max_cached_buffers: 1024,
             text_stale_frame_age: 240,
+            text_max_mapped_font_files: 64,
             load_system_fonts: true,
             software_scratch_max_bytes: 2 * 1024 * 1024,
             canvas_cache_max_bytes: 32 * 1024 * 1024,
             gpu_cache_max_bytes: 64 * 1024 * 1024,
             gpu_stale_frame_age: 240,
+            gpu_memory_policy: GpuMemoryPolicy::Performance,
             sound_cache_max_bytes: 32 * 1024 * 1024,
             icon_lookup_max_entries: 8192,
             dbus_cache_snapshots: true,
@@ -159,6 +199,12 @@ impl MemoryConfig {
     }
 
     #[must_use]
+    pub const fn text_max_mapped_font_files(mut self, max_files: usize) -> Self {
+        self.text_max_mapped_font_files = max_files;
+        self
+    }
+
+    #[must_use]
     pub const fn load_system_fonts(mut self, enabled: bool) -> Self {
         self.load_system_fonts = enabled;
         self
@@ -184,6 +230,12 @@ impl MemoryConfig {
         } else {
             stale_frame_age
         };
+        self
+    }
+
+    #[must_use]
+    pub const fn gpu_memory_policy(mut self, policy: GpuMemoryPolicy) -> Self {
+        self.gpu_memory_policy = policy;
         self
     }
 

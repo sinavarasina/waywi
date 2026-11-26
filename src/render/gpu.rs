@@ -6,6 +6,7 @@ pub(crate) mod textures;
 
 use wayland_client::Connection;
 
+use crate::app::GpuMemoryPolicy;
 use crate::asset::AssetId;
 use crate::error::{Result, WaywiError};
 use crate::geometry::BufferPx;
@@ -31,8 +32,9 @@ impl GpuRenderer {
         wayland_conn: Option<&Connection>,
         cache_max_bytes: usize,
         stale_age_frames: u64,
+        memory_policy: GpuMemoryPolicy,
     ) -> Option<Self> {
-        let ctx = GpuContext::new(wayland_conn)?;
+        let ctx = GpuContext::new(wayland_conn, memory_policy)?;
         Some(Self {
             ctx,
             textures: GpuTextureCache::with_limits(cache_max_bytes, stale_age_frames),

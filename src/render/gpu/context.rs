@@ -13,6 +13,7 @@ use wgpu::rwh::{
     WaylandWindowHandle,
 };
 
+use crate::app::GpuMemoryPolicy;
 use crate::error::{Result, WaywiError};
 use crate::reconcile::RetainedSurfaceKey;
 
@@ -59,8 +60,22 @@ pub(crate) struct GpuContext {
 }
 
 impl GpuContext {
+    pub(crate) fn memory_hints_for(policy: GpuMemoryPolicy) -> wgpu::MemoryHints {
+        const MIB: u64 = 1024 * 1024;
+        match policy {
+            GpuMemoryPolicy::MemoryUsage => wgpu::MemoryHints::MemoryUsage,
+            GpuMemoryPolicy::Minimal => wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: (4 * MIB)..(16 * MIB),
+            },
+            GpuMemoryPolicy::Performance => wgpu::MemoryHints::Performance,
+        }
+    }
+
     /// Initializes a WGPU instance, adapter, device, and `femtovg::Canvas` cleanly.
-    pub(crate) fn new(wayland_conn: Option<&Connection>) -> Option<Self> {
+    pub(crate) fn new(
+        wayland_conn: Option<&Connection>,
+        memory_policy: GpuMemoryPolicy,
+    ) -> Option<Self> {
         let desc =
             match wayland_conn {
                 Some(conn) => wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
@@ -79,6 +94,7 @@ impl GpuContext {
             label: Some("waywi-gpu-device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            memory_hints: Self::memory_hints_for(memory_policy),
             ..Default::default()
         }))
         .ok()?;
@@ -387,5 +403,30 @@ impl GpuContext {
     pub(crate) fn trim_offscreen(&mut self) {
         self.offscreen_tex = None;
         self.staging_buf = None;
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_memory_policy_maps_to_expected_wgpu_memory_hints() {
+        const MIB: u64 = 1024 * 1024;
+        assert!(matches!(
+            GpuContext::memory_hints_for(GpuMemoryPolicy::MemoryUsage),
+            wgpu::MemoryHints::MemoryUsage
+        ));
+        assert!(matches!(
+            GpuContext::memory_hints_for(GpuMemoryPolicy::Minimal),
+            wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size,
+            } if suballocated_device_memory_block_size == ((4 * MIB)..(16 * MIB))
+        ));
+        assert!(matches!(
+            GpuContext::memory_hints_for(GpuMemoryPolicy::Performance),
+            wgpu::MemoryHints::Performance
+        ));
     }
 }

@@ -272,7 +272,7 @@ mod tests {
     fn software_scratch_buffer_shrinks_after_large_fullscreen_tile() {
         let mut renderer = SoftwareRenderer::new();
         #[cfg(feature = "text")]
-        let mut text_engine = TextEngine::with_config(64, 60, false);
+        let mut text_engine = TextEngine::with_config(64, 60, false, 32);
         let assets = AssetCache::new();
         // 1920x400 RGBA = ~3.07 MiB (> configured retain cap).
         let (w, h) = (1920_i32, 400_i32);

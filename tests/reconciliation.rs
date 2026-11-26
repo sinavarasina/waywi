@@ -1115,9 +1115,27 @@ fn memory_config_presets_trim_memory_and_headless_async_image_delivery() {
         MemoryConfig::low_memory().default_asset_retention,
         AssetRetention::ReclaimAfterPresent
     );
+    assert_eq!(
+        MemoryConfig::balanced().gpu_memory_policy,
+        GpuMemoryPolicy::MemoryUsage
+    );
+    assert_eq!(
+        MemoryConfig::low_memory().gpu_memory_policy,
+        GpuMemoryPolicy::Minimal
+    );
+    assert_eq!(
+        MemoryConfig::high_throughput().gpu_memory_policy,
+        GpuMemoryPolicy::Performance
+    );
     assert!(
         MemoryConfig::high_throughput().text_max_cached_buffers
             > MemoryConfig::balanced().text_max_cached_buffers
+    );
+    assert!(
+        MemoryConfig::low_memory().text_max_mapped_font_files
+            < MemoryConfig::balanced().text_max_mapped_font_files
+            && MemoryConfig::balanced().text_max_mapped_font_files
+                < MemoryConfig::high_throughput().text_max_mapped_font_files
     );
 
     #[derive(Default)]

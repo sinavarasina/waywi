@@ -82,6 +82,7 @@ impl ActiveRenderer {
                     wayland_conn,
                     memory.gpu_cache_max_bytes,
                     memory.gpu_stale_frame_age,
+                    memory.gpu_memory_policy,
                 ) {
                     ActiveBackend::Gpu(Box::new(gpu))
                 } else {
@@ -99,6 +100,7 @@ impl ActiveRenderer {
                     wayland_conn,
                     memory.gpu_cache_max_bytes,
                     memory.gpu_stale_frame_age,
+                    memory.gpu_memory_policy,
                 )
                 .ok_or(WaywiError::UnsupportedCapability(Capability::GpuRenderer))?;
                 ActiveBackend::Gpu(Box::new(gpu))
@@ -117,6 +119,7 @@ impl ActiveRenderer {
                 memory.text_max_cached_buffers,
                 memory.text_stale_frame_age,
                 memory.load_system_fonts,
+                memory.text_max_mapped_font_files,
             ),
         })
     }
@@ -212,7 +215,7 @@ impl RenderBackend for ActiveRenderer {
         dirty_rects: &[BufferRect],
         scene: backend::FrameScene<'_>,
     ) -> Result<()> {
-        match &mut self.backend {
+        let res = match &mut self.backend {
             ActiveBackend::Software(r) => r.render_argb8888(
                 #[cfg(feature = "text")]
                 &mut self.text_engine,
@@ -231,7 +234,10 @@ impl RenderBackend for ActiveRenderer {
                 buf_h,
                 scene,
             ),
-        }
+        };
+        #[cfg(feature = "text")]
+        self.text_engine.finish_frame();
+        res
     }
 
     #[cfg_attr(not(feature = "renderer-gpu"), allow(unused_variables))]
@@ -241,7 +247,7 @@ impl RenderBackend for ActiveRenderer {
         scene: backend::FrameScene<'_>,
         on_before_commit: &mut dyn FnMut(),
     ) -> Result<WaylandPresentOutcome> {
-        match &mut self.backend {
+        let res = match &mut self.backend {
             ActiveBackend::Software(_) => Ok(WaylandPresentOutcome::FallbackToShm),
             #[cfg(feature = "renderer-gpu")]
             ActiveBackend::Gpu(r) => r.present_wayland_surface(
@@ -251,7 +257,12 @@ impl RenderBackend for ActiveRenderer {
                 scene,
                 on_before_commit,
             ),
+        };
+        #[cfg(feature = "text")]
+        if matches!(res, Ok(WaylandPresentOutcome::Committed)) {
+            self.text_engine.finish_frame();
         }
+        res
     }
 
     fn drop_surface_target(&mut self, key: RetainedSurfaceKey) {

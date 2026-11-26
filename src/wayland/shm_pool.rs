@@ -106,12 +106,26 @@ impl SurfaceShmPool {
         self.slots.iter().flatten().all(|s| !s.busy)
     }
 
-    /// Drops an unused secondary double-buffer slot when all slots are idle.
+    /// Minimum oversized `memfd` size before an idle resize downsize closes and reallocates the pool.
+    const IDLE_DOWNSIZE_MIN_BYTES: usize = 64 * 1024;
+
+    /// Drops an unused secondary double-buffer slot and releases oversized `memfd` mappings when
+    /// all slots are idle.
+    ///
+    /// A warm single-slot pool sized to match its active slot is kept mapped so retained surfaces
+    /// preserve zero-allocation incremental damage redraws; double-buffered or previously shrunk
+    /// pools close their oversized `memfd` (without truncating) so the next redraw allocates a
+    /// right-sized single buffer.
     pub(crate) fn trim_idle_slots(&mut self) {
-        if self.all_idle()
-            && let Some(s) = self.slots[1].take()
-        {
-            s.buffer.destroy();
+        if !self.all_idle() {
+            return;
+        }
+        let had_slot1 = self.slots[1].is_some();
+        let single_slot_bytes = self.slots[0].as_ref().map_or(0, |s| {
+            align_64((s.stride as usize).saturating_mul(s.height as usize)).max(4096)
+        });
+        if had_slot1 || self.pool_bytes > single_slot_bytes {
+            self.shrink_and_unmap();
         }
     }
 
@@ -172,11 +186,21 @@ impl SurfaceShmPool {
                 .as_ref()
                 .is_some_and(|s| s.width != width || s.height != height);
             if mismatch {
-                if let Some(s) = self.slots[0].take() {
-                    s.buffer.destroy();
-                }
-                if let Some(s) = self.slots[1].take() {
-                    s.buffer.destroy();
+                if self.pool_bytes
+                    > slot_bytes
+                        .saturating_mul(2)
+                        .max(Self::IDLE_DOWNSIZE_MIN_BYTES)
+                {
+                    // Close the oversized memfd without truncating so the next `ensure_capacity`
+                    // creates a right-sized pool instead of keeping a high-water-mark mapping.
+                    self.shrink_and_unmap();
+                } else {
+                    if let Some(s) = self.slots[0].take() {
+                        s.buffer.destroy();
+                    }
+                    if let Some(s) = self.slots[1].take() {
+                        s.buffer.destroy();
+                    }
                 }
             }
             0
@@ -570,6 +594,67 @@ mod tests {
                 height: 24,
             }]
         );
+        pool.shrink_and_unmap();
+
+        // Warm single-slot retained pool stays mapped across `trim_idle_slots()`, whereas a
+        // double-buffered pool closes its oversized 2x memfd once both slots are idle.
+        let AcquireSlot::Ready {
+            slot: s0,
+            generation: g0,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected single slot");
+        };
+        let single_bytes = pool.current_pool_bytes();
+        pool.mark_committed(s0, g0);
+        pool.mark_released(s0, g0);
+        pool.trim_idle_slots();
+        assert_eq!(pool.current_pool_bytes(), single_bytes);
+        assert_eq!(pool.allocated_slot_count(), 1);
+
+        // Trigger double-buffering, then release both slots and trim -> frees the 2x memfd.
+        pool.mark_committed(s0, g0);
+        let AcquireSlot::Ready {
+            slot: s1,
+            generation: g1,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected second slot");
+        };
+        assert!(pool.current_pool_bytes() >= single_bytes * 2);
+        pool.mark_committed(s1, g1);
+        pool.mark_released(s0, g0);
+        pool.mark_released(s1, g1);
+        pool.trim_idle_slots();
+        assert_eq!(pool.current_pool_bytes(), 0);
+        assert_eq!(pool.allocated_slot_count(), 0);
+
+        // Downsizing an idle pool by >2x (above 64 KiB) automatically replaces the oversized memfd.
+        let AcquireSlot::Ready {
+            slot: big_s,
+            generation: big_g,
+            ..
+        } = pool.acquire_for_draw(512, 256, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected large slot");
+        };
+        assert!(pool.current_pool_bytes() >= 512 * 256 * 4);
+        pool.mark_committed(big_s, big_g);
+        pool.mark_released(big_s, big_g);
+
+        let AcquireSlot::Ready {
+            slot: small_s,
+            generation: small_g,
+            ..
+        } = pool.acquire_for_draw(64, 32, key, &wl_shm, &qh).unwrap()
+        else {
+            panic!("expected downsized slot");
+        };
+        assert_eq!(small_s, 0);
+        assert_ne!(small_g, big_g);
+        assert_eq!(pool.current_pool_bytes(), 64 * 32 * 4);
         pool.shrink_and_unmap();
 
         stop.store(true, Ordering::Relaxed);

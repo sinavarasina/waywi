@@ -1,5 +1,7 @@
 #[cfg(feature = "text")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+#[cfg(feature = "text")]
+use std::path::Path;
 #[cfg(feature = "text")]
 use std::sync::OnceLock;
 
@@ -36,8 +38,13 @@ pub(crate) struct TextEngine {
     font_system: cosmic_text::FontSystem,
     swash_cache: cosmic_text::SwashCache,
     buffer_cache: HashMap<TextShapeKey, CachedTextBuffer>,
+    locale: String,
+    load_system_fonts: bool,
     max_cached_buffers: usize,
     stale_frame_age: u64,
+    max_mapped_font_files: usize,
+    font_system_bloated: bool,
+    bloated_at_frame: u64,
 }
 
 #[cfg(feature = "text")]
@@ -79,34 +86,98 @@ impl TextEngine {
     /// Initializes a `FontSystem` from the process-cached system Fontconfig database with default limits.
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_config(256, 60, true)
+        Self::with_config(256, 60, true, 32)
     }
 
-    /// Initializes a `FontSystem` with explicit shaping-cache limits and Fontconfig loading policy.
+    /// Initializes a `FontSystem` with explicit shaping-cache limits, Fontconfig loading policy,
+    /// and automatic mapped-font reclamation threshold.
     pub(crate) fn with_config(
         max_cached_buffers: usize,
         stale_frame_age: u64,
         load_system_fonts: bool,
+        max_mapped_font_files: usize,
     ) -> Self {
-        let db = if load_system_fonts {
-            shared_system_font_db()
-        } else {
-            fontdb::Database::new()
-        };
         let locale = std::env::var("LANG")
             .unwrap_or_else(|_| "en-US".to_owned())
             .split('.')
             .next()
             .unwrap_or("en-US")
             .replace('_', "-");
-        let font_system = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
+        let font_system = Self::build_font_system(locale.clone(), load_system_fonts);
 
         Self {
             font_system,
             swash_cache: cosmic_text::SwashCache::new(),
             buffer_cache: HashMap::new(),
+            locale,
+            load_system_fonts,
             max_cached_buffers: max_cached_buffers.max(8),
             stale_frame_age: stale_frame_age.max(1),
+            max_mapped_font_files,
+            font_system_bloated: false,
+            bloated_at_frame: 0,
+        }
+    }
+
+    fn build_font_system(locale: String, load_system_fonts: bool) -> cosmic_text::FontSystem {
+        let db = if load_system_fonts {
+            shared_system_font_db()
+        } else {
+            fontdb::Database::new()
+        };
+        cosmic_text::FontSystem::new_with_locale_and_db(locale, db)
+    }
+
+    fn rebuild_font_system(&mut self) {
+        // Cloning `SYSTEM_FONT_DB` preserves deterministic `fontdb::ID` slotmap keys while
+        // resetting every face source back to unmapped `Source::File`, dropping all `Arc<Mmap>`s.
+        self.font_system = Self::build_font_system(self.locale.clone(), self.load_system_fonts);
+        self.font_system_bloated = false;
+        self.bloated_at_frame = 0;
+    }
+
+    fn has_mapped_fonts(&self) -> bool {
+        self.font_system
+            .db()
+            .faces()
+            .any(|face| matches!(face.source, fontdb::Source::SharedFile(..)))
+    }
+
+    fn mapped_font_file_count(&self) -> usize {
+        let mut paths: HashSet<&Path> = HashSet::new();
+        for face in self.font_system.db().faces() {
+            if let fontdb::Source::SharedFile(path, _) = &face.source {
+                paths.insert(path.as_path());
+            }
+        }
+        paths.len()
+    }
+
+    fn exceeds_mapped_font_limit(&self) -> bool {
+        let limit = self.max_mapped_font_files;
+        if limit == 0 {
+            return false;
+        }
+        // Fast zero-allocation pre-check: if total `SharedFile` faces <= limit, unique files are
+        // guaranteed <= limit as well.
+        let shared_faces = self
+            .font_system
+            .db()
+            .faces()
+            .filter(|face| matches!(face.source, fontdb::Source::SharedFile(..)))
+            .count();
+        if shared_faces <= limit {
+            return false;
+        }
+        self.mapped_font_file_count() > limit
+    }
+
+    /// Reclaims mmapped fallback fonts at the end of a rendered frame if shaping triggered a
+    /// fallback storm, while keeping `buffer_cache` and `swash_cache` warm so active strings do
+    /// not reshape or re-scan on subsequent frames.
+    pub(crate) fn finish_frame(&mut self) {
+        if self.font_system_bloated {
+            self.rebuild_font_system();
         }
     }
 
@@ -114,6 +185,9 @@ impl TextEngine {
         self.buffer_cache.clear();
         self.buffer_cache.shrink_to_fit();
         self.swash_cache = cosmic_text::SwashCache::new();
+        if self.font_system_bloated || self.has_mapped_fonts() {
+            self.rebuild_font_system();
+        }
     }
 
     pub(crate) fn measure_text(
@@ -239,11 +313,22 @@ impl TextEngine {
         params: TextDrawParams<'_>,
         frame_seq: u64,
     ) -> &mut CachedTextBuffer {
+        if self.font_system_bloated && frame_seq > self.bloated_at_frame {
+            self.rebuild_font_system();
+        }
+
+        if self.buffer_cache.contains_key(&key) {
+            let entry = self
+                .buffer_cache
+                .get_mut(&key)
+                .expect("checked cached shaped buffer");
+            entry.last_used_frame = frame_seq;
+            return entry;
+        }
+
         let s = params.style;
         let stale_age = self.stale_frame_age;
-        if (frame_seq.is_multiple_of(32) || self.buffer_cache.len() >= self.max_cached_buffers)
-            && !self.buffer_cache.contains_key(&key)
-        {
+        if frame_seq.is_multiple_of(32) || self.buffer_cache.len() >= self.max_cached_buffers {
             self.buffer_cache
                 .retain(|_, v| frame_seq.saturating_sub(v.last_used_frame) < stale_age);
             while self.buffer_cache.len() >= self.max_cached_buffers {
@@ -265,10 +350,10 @@ impl TextEngine {
             }
         }
 
-        let font_system = &mut self.font_system;
-        let swash_cache = &mut self.swash_cache;
         let scale = params.scale.as_f32();
-        let entry = self.buffer_cache.entry(key).or_insert_with(|| {
+        let cached = {
+            let font_system = &mut self.font_system;
+            let swash_cache = &mut self.swash_cache;
             let fs_px = (s.font_size.0.max(1.0) * scale).max(1.0);
             let lh_px = compute_line_height_px(s.font_size, s.line_height_multiplier, scale);
             let metrics = cosmic_text::Metrics::new(fs_px, lh_px);
@@ -369,9 +454,14 @@ impl TextEngine {
                 draw_offset_px,
                 last_used_frame: frame_seq,
             }
-        });
-        entry.last_used_frame = frame_seq;
-        entry
+        };
+
+        if !self.font_system_bloated && self.exceeds_mapped_font_limit() {
+            self.font_system_bloated = true;
+            self.bloated_at_frame = frame_seq;
+        }
+
+        self.buffer_cache.entry(key).or_insert(cached)
     }
 
     /// Rasterizes text directly onto an RGBA8888 premultiplied pixel slice clipped to `target.clip`.
@@ -637,5 +727,119 @@ mod tests {
         assert_eq!(min_y, 4);
         assert_eq!(max_x - min_x + 1, opt_size.width.0.ceil() as u32);
         assert_eq!(max_y - min_y + 1, opt_size.height.0.ceil() as u32);
+    }
+
+    #[test]
+    fn trim_rebuilds_font_system_and_unmaps_loaded_fonts() {
+        let mut engine = TextEngine::new();
+        assert_eq!(engine.mapped_font_file_count(), 0);
+        if engine.font_system.db().is_empty() {
+            return;
+        }
+
+        let font = Font::sans();
+        let style = TextMeasureStyle {
+            font_size: LogicalPx(14.0),
+            line_height_multiplier: 1.2,
+            max_width: None,
+            font: &font,
+            align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
+        };
+        let first =
+            engine.measure_text(&SharedStr::from("Hello WayWi"), style, ScaleFactor::ONE, 1);
+        assert!(first.width.0 > 0.0);
+        assert!(engine.mapped_font_file_count() > 0);
+        assert!(!engine.buffer_cache.is_empty());
+
+        engine.trim();
+        assert_eq!(engine.mapped_font_file_count(), 0);
+        assert!(engine.buffer_cache.is_empty());
+        assert!(!engine.font_system_bloated);
+
+        // Re-shaping after trim works cleanly with identical metrics.
+        let second =
+            engine.measure_text(&SharedStr::from("Hello WayWi"), style, ScaleFactor::ONE, 2);
+        assert_eq!(first, second);
+        assert!(engine.mapped_font_file_count() > 0);
+    }
+
+    #[test]
+    fn fallback_storm_auto_reclaims_at_frame_end_while_preserving_warm_caches() {
+        let mut engine = TextEngine::with_config(64, 16, true, 2);
+        let unique_system_files = {
+            let mut paths = HashSet::new();
+            for face in engine.font_system.db().faces() {
+                if let fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) = &face.source {
+                    paths.insert(p.clone());
+                }
+            }
+            paths.len()
+        };
+        if unique_system_files <= 2 {
+            return;
+        }
+
+        let font = Font::sans();
+        let style = TextMeasureStyle {
+            font_size: LogicalPx(14.0),
+            line_height_multiplier: 1.2,
+            max_width: None,
+            font: &font,
+            align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
+        };
+        // Noncharacter U+10FFFD is guaranteed unassigned in Unicode, triggering exhaustive fallback.
+        let content = SharedStr::from("Alert \u{10FFFD}");
+        let measured = engine.measure_text(&content, style, ScaleFactor::ONE, 1);
+        assert!(measured.width.0 > 0.0);
+        assert!(
+            engine.mapped_font_file_count() > 2,
+            "expected fallback scan to mmap > 2 system font files"
+        );
+        assert!(engine.font_system_bloated);
+
+        // Rasterize on the same frame so `swash_cache` is populated before reclamation.
+        let w = (measured.width.0.ceil() as u32).max(16);
+        let h = (measured.height.0.ceil() as u32).max(16);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut target = TextRasterTarget {
+            dst: &mut pixels,
+            width: w,
+            height: h,
+            clip: crate::geometry::BufferRect {
+                x: 0,
+                y: 0,
+                width: w as i32,
+                height: h as i32,
+            },
+        };
+        let params = TextDrawParams {
+            content: &content,
+            style,
+            wrap_to_width: false,
+            scale: ScaleFactor::ONE,
+        };
+        engine.draw_text_premultiplied_rgba(&mut target, (0.0, 0.0), params, Color::WHITE, 1.0, 1);
+
+        // End of frame unmaps all fallback fonts while preserving shaped buffer and glyph caches.
+        engine.finish_frame();
+        assert_eq!(engine.mapped_font_file_count(), 0);
+        assert!(!engine.font_system_bloated);
+        assert_eq!(engine.buffer_cache.len(), 1);
+
+        // Redrawing the same string on the next frame hits both caches without re-triggering bloat.
+        engine.draw_text_premultiplied_rgba(&mut target, (0.0, 0.0), params, Color::WHITE, 1.0, 2);
+        assert!(!engine.font_system_bloated);
+        assert!(engine.mapped_font_file_count() <= 2);
+
+        // Setting `max_mapped_font_files = 0` disables automatic reclamation (explicit `trim` still works).
+        let mut disabled = TextEngine::with_config(64, 16, true, 0);
+        let _ = disabled.measure_text(&content, style, ScaleFactor::ONE, 1);
+        assert!(!disabled.font_system_bloated);
+        disabled.finish_frame();
+        assert!(disabled.mapped_font_file_count() > 2);
+        disabled.trim();
+        assert_eq!(disabled.mapped_font_file_count(), 0);
     }
 }

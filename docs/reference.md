@@ -6,7 +6,7 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
 
 - `waywi::prelude::*`: re-exports core app, surface, geometry, primitive, text, input, timer, system, desktop, and enabled integration symbols.
 - Top-level public modules: `accessibility`, `animation`, `app`, `audio`, `capabilities`, `clipboard` (`clipboard`), `compositor` (`hyprland-ipc` / `sway-ipc`), `control` (`control-ipc`), `dbus` (`dbus`), `desktop`, `display`, `effect`, `error`, `geometry`, `idle` (`idle-notify`), `image`, `input`, `render`, `sprite`, `subscription`, `surface`, `system`, `text`, `timer`, `wayland_ext`.
-- Top-level re-exports: `App`, `Application`, `HeadlessRuntime`, `MemoryConfig`, `Capabilities`, `Capability`, `Output`, `OutputId`, `OutputInfo`, `OutputTransform`, `EffectCtx`, `ErrorKind`, `Result`, `WaywiError`, `Surface`, `Surfaces`.
+- Top-level re-exports: `App`, `Application`, `GpuMemoryPolicy`, `HeadlessRuntime`, `MemoryConfig`, `Capabilities`, `Capability`, `Output`, `OutputId`, `OutputInfo`, `OutputTransform`, `EffectCtx`, `ErrorKind`, `Result`, `WaywiError`, `Surface`, `Surfaces`.
 
 ## Application Runtime (`app`)
 
@@ -25,9 +25,10 @@ Public API reference for `waywi`. Core types, builders, and helpers are re-expor
   - `.control_socket(impl Into<PathBuf>) -> Self`
   - `.run<A: Application>(self) -> Result<()>`
   - `.run_on_connection<A: Application>(self, conn: wayland_client::Connection) -> Result<()>`
-- `MemoryConfig` (`app::memory`):
+- `MemoryConfig` / `GpuMemoryPolicy` (`app::memory`):
   - Presets: `balanced()` (default), `low_memory()`, `high_throughput()`.
-  - Builders: `default_buffer_retention`, `default_asset_retention`, `arena_limits`, `text_cache`, `load_system_fonts`, `software_scratch_bytes`, `canvas_cache_bytes`, `gpu_cache`, `sound_cache_bytes`, `icon_lookup_max_entries`, `dbus_cache_snapshots`, `dbus_idle_disconnect`.
+  - `GpuMemoryPolicy`: `MemoryUsage` (default), `Minimal`, `Performance`.
+  - Builders: `default_buffer_retention`, `default_asset_retention`, `arena_limits`, `text_cache`, `text_max_mapped_font_files`, `load_system_fonts`, `software_scratch_bytes`, `canvas_cache_bytes`, `gpu_cache`, `gpu_memory_policy`, `sound_cache_bytes`, `icon_lookup_max_entries`, `dbus_cache_snapshots`, `dbus_idle_disconnect`.
 - `RendererPreference` (`render::backend`): `Auto`, `Software`, `Gpu`.
 - `HeadlessRuntime<A: Application>` (`app::headless`):
   - Constructors: `new(capabilities, outputs)`, `new_with_renderer(...)`, `with_memory(capabilities, outputs, renderer_pref, memory)`.

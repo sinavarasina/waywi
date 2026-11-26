@@ -5,7 +5,7 @@ pub use crate::accessibility::AccessibleRole;
 pub use crate::animation::{
     Animated, Animation, Easing, Lerp, Spring, SpringConfig, TransitionSpec, Tween,
 };
-pub use crate::app::{App, Application, HeadlessRuntime, MemoryConfig};
+pub use crate::app::{App, Application, GpuMemoryPolicy, HeadlessRuntime, MemoryConfig};
 pub use crate::capabilities::{Capabilities, Capability};
 #[cfg(feature = "clipboard")]
 pub use crate::clipboard::{Clipboard, ClipboardEvent, ClipboardSelection, ClipboardSnapshot};

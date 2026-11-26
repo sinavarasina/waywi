@@ -6,5 +6,5 @@ pub mod runner;
 pub(crate) mod subscription_mgr;
 
 pub use headless::HeadlessRuntime;
-pub use memory::MemoryConfig;
+pub use memory::{GpuMemoryPolicy, MemoryConfig};
 pub use runner::{App, Application};

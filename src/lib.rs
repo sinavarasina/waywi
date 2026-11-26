@@ -59,7 +59,7 @@ pub mod text;
 pub mod timer;
 pub mod wayland_ext;
 
-pub use app::{App, Application, HeadlessRuntime, MemoryConfig};
+pub use app::{App, Application, GpuMemoryPolicy, HeadlessRuntime, MemoryConfig};
 pub use capabilities::{Capabilities, Capability};
 pub use display::{Output, OutputId, OutputInfo, OutputTransform};
 pub use effect::EffectCtx;
