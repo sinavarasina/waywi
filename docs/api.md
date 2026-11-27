@@ -7,7 +7,7 @@ Core types are re-exported from `waywi::prelude::*`.
 Implement `Application`:
 
 - `init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State>`: runs after Wayland connection and `Capabilities` probing.
-- `update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_, Self::Message>) -> Result<()>`: mutates state and triggers imperative actions (`ctx.quit()`, `ctx.trim_memory()`, `ctx.after(delay, msg)`, `ctx.request_activation_token(...)`, `ctx.activate_surface(...)`, image loading, `ctx.system()`, `ctx.audio()`, `ctx.player()`, `ctx.hyprland()`, `ctx.sway()`, `ctx.compositor()`, `ctx.dbus()`).
+- `update(state: &mut Self::State, msg: Self::Message, ctx: &mut EffectCtx<'_, Self::Message>) -> Result<()>`: mutates state and triggers imperative actions (`ctx.quit()`, `ctx.trim_memory()`, `ctx.after(delay, msg)`, `ctx.request_activation_token(...)`, `ctx.activate_surface(...)`, `ctx.capture_screen(...)`, `ctx.start_drag(...)`, foreign-toplevel/ext-workspace/virtual-keyboard actions, image loading, `ctx.system()`, `ctx.audio()`, `ctx.player()`, `ctx.hyprland()`, `ctx.sway()`, `ctx.compositor()`, `ctx.dbus()`).
 - `view(state: &Self::State) -> Surfaces<Self::Message>`: returns surface definitions for the current state (or `Surfaces::none()`).
 - `subscriptions(state: &Self::State) -> Subscriptions<Self::Message>`: lists active timers, system samplers, and protocol/IPC streams. Unlisted keys stop automatically and release idle workers.
 

@@ -3,6 +3,7 @@
 use std::ffi::CString;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use rustix::fs::{MemfdFlags, memfd_create};
@@ -167,8 +168,8 @@ impl WaylandVirtualKeyboardState {
         if self.keymap_uploaded && self.keyboard.is_some() {
             return Ok(());
         }
-        let default_keymap = build_default_xkb_keymap();
-        self.upload_keymap(seat, qh, &default_keymap)
+        let default_keymap = default_xkb_keymap();
+        self.upload_keymap(seat, qh, default_keymap)
     }
 
     pub(crate) fn send_key(
@@ -207,23 +208,26 @@ impl WaylandVirtualKeyboardState {
     }
 }
 
-fn build_default_xkb_keymap() -> String {
-    let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-    if let Some(km) = xkbcommon::xkb::Keymap::new_from_names(
-        &ctx,
-        "",
-        "",
-        "us",
-        "",
-        None,
-        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-    ) {
-        let s = km.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
-        if !s.is_empty() {
-            return s;
+fn default_xkb_keymap() -> &'static str {
+    static DEFAULT_KEYMAP: OnceLock<String> = OnceLock::new();
+    DEFAULT_KEYMAP.get_or_init(|| {
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        if let Some(km) = xkbcommon::xkb::Keymap::new_from_names(
+            &ctx,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        ) {
+            let s = km.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+            if !s.is_empty() {
+                return s;
+            }
         }
-    }
-    FALLBACK_MINIMAL_XKB_KEYMAP.to_owned()
+        FALLBACK_MINIMAL_XKB_KEYMAP.to_owned()
+    })
 }
 
 impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for WaylandState {

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-27
 
 ### Breaking Changes
 - **Extended `TouchEvent` and `ScrollEvent` fields (`input`)**:
@@ -14,8 +14,12 @@ All notable changes to this project will be documented in this file.
   - `NmActiveConnection` now includes `vpn: bool` and `vpn_state: Option<NmVpnState>`, and `WifiConnectOptions` now includes `enterprise: Option<WifiEnterpriseOptions>` (both implement `Default`).
 - **New `SurfaceKind::SessionLock` variant (`surface`)**:
   - Added `SurfaceKind::SessionLock` for native `ext_session_lock_v1` lockscreen surfaces; exhaustive `match` expressions on `SurfaceKind` must now cover `SessionLock`.
+- **Extended `MemoryConfig` fields (`app::memory`)**:
+  - `MemoryConfig` now includes `text_max_mapped_font_files: usize` and `gpu_memory_policy: GpuMemoryPolicy`. Struct literals constructing `MemoryConfig` directly must populate these fields (or use presets/builders or `..MemoryConfig::default()`).
 
 ### Added
+- **GPU memory allocation policy & bounded mapped font reclamation (`app`, `render`, `text`)**:
+  - Added backend-agnostic `GpuMemoryPolicy` (`MemoryUsage`, `Minimal`, `Performance`, re-exported at the crate root and `waywi::prelude`) and `MemoryConfig::{gpu_memory_policy, text_max_mapped_font_files}` builders.
 - **VSync-paced Animation Mechanism & Retained Transitions (`animation`, `reconcile`, `app`)**:
   - Added zero-dependency, stack-allocated animation primitives in `waywi::animation` (re-exported in `waywi::prelude`): `Easing` (`Linear`, `Quad*`, `Cubic*`, `QuartOut`, `ExpoOut`, `BackOut`, `CubicBezier`), `Lerp` (`f32`, `f64`, `LogicalPx`, `Percent`, `Point`, `LogicalSize`, `Bounds`, `Color`, `Transform`), `SpringConfig`, `Spring` (sub-stepped `<= 4ms` integration with automatic settled detection), `Tween<T>`, `Animated<T>`, and `TransitionSpec`.
   - Added `Animation::frames(key, |now| ...)` synchronized directly to Wayland `wl_surface.frame` VSync callbacks (tracking monitor refresh rates natively and dropping to 0% idle CPU/GPU wakeups when DPMS off, occluded, or unsubscribed), plus deterministic delivery in `HeadlessRuntime::step_at`.
@@ -56,6 +60,14 @@ All notable changes to this project will be documented in this file.
 - **Native Pen Tablet / Stylus & Pad (`zwp_tablet_manager_v2`) support (`input`, `wayland`, `capabilities`, `reconcile`, `app`)**:
   - Added opt-in Cargo feature `tablet`, `Capability::TabletInput`, `TabletId`, `TabletToolId`, `TabletPadId`, `TabletToolType`, `TabletToolAxes` (`pressure`, `distance`, `tilt`, `rotation`, `slider`, `wheel_degrees`, `wheel_clicks`), `TabletToolEventKind`, `TabletToolEvent`, `TabletPadAxisSource`, `TabletPadEventKind` (`Enter`, `Leave`, `Button`, `ModeSwitch`, `Ring`, `Strip`, `Dial`), `TabletPadEvent`, `TabletEvent`, `Element::on_tablet`, `Surface::on_tablet`, and `HeadlessRuntime::tablet_surface`.
   - Implemented full `zwp_tablet_manager_v2` (v1..=2) protocol binding with frame-atomic stylus tool batching, per-tool stroke capture, proper `destroy()` lifecycle on `removed` and drop, and automatic pointer fallback (hover, left-click/drag, barrel buttons -> right/middle/side) for unclaimed stylus actions on standard widgets.
+
+### Changed
+- **Fallback-font reclamation, GPU `MemoryHints`, and SHM pool shrinking (`text`, `render`, `wayland`)**:
+  - `TextEngine::trim()` now rebuilds `cosmic_text::FontSystem` from the unmapped static `fontdb::Database` (releasing all mmapped system font files without re-scanning Fontconfig), and `TextEngine::finish_frame()` automatically reclaims mmapped fallback fonts at end-of-frame when an unknown Unicode codepoint triggers an exhaustive fallback scan past `text_max_mapped_font_files` (`32` balanced, `16` low_memory, `64` high_throughput; `0` disables auto-reclaim) while preserving warm `buffer_cache` and `swash_cache`.
+  - `GpuContext::new()` now forwards `MemoryConfig::gpu_memory_policy` to `wgpu::DeviceDescriptor.memory_hints` (`MemoryUsage` 8–64 MiB blocks for `balanced()`, `Minimal` 4–16 MiB for `low_memory()`, `Performance` 128–256 MiB for `high_throughput()`), and `GpuContext::trim_offscreen()` polls `wgpu::Device` non-blockingly.
+  - `SurfaceShmPool::trim_idle_slots()` now closes oversized or double-buffered `memfd` mappings (without truncating) while keeping right-sized single-slot pools warm, and `acquire_for_draw()` automatically replaces oversized idle `memfd` pools when a surface shrinks by >2× (above 64 KiB).
+- **Zero-thread clipboard pipe I/O (`wayland`)**: Migrated `clipboard` pipe reads and writes onto non-blocking `calloop::generic::Generic` FD sources and bounded timers matching Drag & Drop.
+- **Documentation**: Updated `README.md` and `docs/{architecture,api,integrations,performance,reference,wayland}.md` for `v0.3.0`.
 
 ## [0.2.2] - 2026-11-25
 

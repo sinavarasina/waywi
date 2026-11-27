@@ -269,6 +269,13 @@ pub(crate) fn run_event_loop<A: Application>(app_cfg: App, conn: Connection) -> 
         return Ok(());
     }
 
+    // Establish initial surfaces and subscriptions from `init()`'s returned state before
+    // collecting timers or dispatching `update()` messages so slow `init()` effects cannot cause
+    // short `ctx.after(...)` timers to skip the initial view state.
+    present::sync_view_and_subscriptions::<A>(&mut rt, &mut wl, &state)?;
+    present::present_dirty_surfaces(&mut rt, &mut wl)?;
+    let _ = conn.flush();
+
     loop {
         let now = Instant::now();
         sources::collect_sources(&mut rt, &mut wl, now);

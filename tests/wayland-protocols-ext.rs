@@ -1800,7 +1800,6 @@ fn dnd_finish_after_eof_rejection_and_default_server_decoration() {
     #[derive(Clone)]
     enum Msg {
         Dnd(DndEvent),
-        SwitchDeco,
         Quit,
     }
     struct DndDecoApp;
@@ -1810,8 +1809,7 @@ fn dnd_finish_after_eof_rejection_and_default_server_decoration() {
         fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
             assert!(ctx.capabilities().has(Capability::DragAndDrop));
             assert!(ctx.capabilities().has(Capability::XdgDecoration));
-            ctx.after(Duration::from_millis(40), Msg::SwitchDeco);
-            ctx.after(Duration::from_millis(200), Msg::Quit);
+            ctx.after(Duration::from_millis(1500), Msg::Quit);
             Ok(State {
                 use_client_deco: false,
             })
@@ -1827,9 +1825,10 @@ fn dnd_finish_after_eof_rejection_and_default_server_decoration() {
                 }) => {
                     *DROPPED.lock().unwrap() =
                         Some((mime_type, String::from_utf8_lossy(&data).into_owned()));
+                    state.use_client_deco = true;
+                    ctx.after(Duration::from_millis(60), Msg::Quit);
                 }
                 Msg::Dnd(_) => {}
-                Msg::SwitchDeco => state.use_client_deco = true,
                 Msg::Quit => ctx.quit(),
             }
             Ok(())
@@ -1943,10 +1942,10 @@ fn idle_inhibit_virtual_keyboard_and_pointer_constraints_wire_protocols() {
     struct State {
         inhibit: bool,
         constraint: PointerConstraintMode,
+        toggled: bool,
     }
     #[derive(Clone)]
     enum Msg {
-        Toggle,
         Rel(RelativePointerEvent),
         Quit,
     }
@@ -1962,11 +1961,11 @@ fn idle_inhibit_virtual_keyboard_and_pointer_constraints_wire_protocols() {
             ctx.virtual_key(30, VirtualKeyState::Pressed)?;
             ctx.virtual_key(30, VirtualKeyState::Released)?;
             ctx.virtual_modifiers(1, 0, 0, 0)?;
-            ctx.after(Duration::from_millis(60), Msg::Toggle);
-            ctx.after(Duration::from_millis(160), Msg::Quit);
+            ctx.after(Duration::from_millis(1500), Msg::Quit);
             Ok(State {
                 inhibit: true,
                 constraint: PointerConstraintMode::Locked,
+                toggled: false,
             })
         }
         fn update(
@@ -1975,11 +1974,15 @@ fn idle_inhibit_virtual_keyboard_and_pointer_constraints_wire_protocols() {
             ctx: &mut EffectCtx<'_, Self::Message>,
         ) -> Result<()> {
             match msg {
-                Msg::Toggle => {
-                    state.inhibit = false;
-                    state.constraint = PointerConstraintMode::Confined;
+                Msg::Rel(ev) => {
+                    *REL_EVENT.lock().unwrap() = Some(ev);
+                    if !state.toggled {
+                        state.toggled = true;
+                        state.inhibit = false;
+                        state.constraint = PointerConstraintMode::Confined;
+                        ctx.after(Duration::from_millis(60), Msg::Quit);
+                    }
                 }
-                Msg::Rel(ev) => *REL_EVENT.lock().unwrap() = Some(ev),
                 Msg::Quit => ctx.quit(),
             }
             Ok(())
