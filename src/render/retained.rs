@@ -4,25 +4,29 @@ use crate::geometry::{Affine2D, Bounds, LogicalPx};
 use crate::image::{ImageFilter, ImageFit, SourceRect};
 use crate::input::{CursorShape, ElementKey, EventHandlers, HitTestNode, NodeId};
 use crate::render::canvas::Painter;
-use crate::render::style::{Border, Color, CornerRadius};
+use crate::render::style::{Border, BoxShadow, Color, CornerRadius, Fill};
 use crate::sprite::{SpriteSheet, SpriteSourceState, SpriteTimeline};
-use crate::text::{Font, SharedStr, TextAlign, TextBoundsMode};
+use crate::text::{Font, SharedStr, TextAlign, TextBoundsMode, TextOverflow, TextSpan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PaintPayload {
     Rect {
-        fill: Color,
+        fill: Fill,
         corner_radius: CornerRadius,
         border: Option<Border>,
+        shadow: Option<BoxShadow>,
     },
     Text {
         content: SharedStr,
+        spans: Option<Box<[TextSpan]>>,
         font_size: LogicalPx,
         line_height_multiplier: f32,
         color: Color,
         font: Font,
         align: TextAlign,
         bounds_mode: TextBoundsMode,
+        overflow: TextOverflow,
+        max_lines: Option<usize>,
         wrap_to_width: bool,
     },
     Image {
@@ -101,18 +105,22 @@ pub(crate) struct RetainedNode<M> {
 pub(crate) enum RetainedVisual {
     Container,
     Rect {
-        fill: Color,
+        fill: Fill,
         corner_radius: CornerRadius,
         border: Option<Border>,
+        shadow: Option<BoxShadow>,
     },
     Text {
         content: SharedStr,
+        spans: Option<Box<[TextSpan]>>,
         font_size: LogicalPx,
         line_height_multiplier: f32,
         color: Color,
         font: Font,
         align: TextAlign,
         bounds_mode: TextBoundsMode,
+        overflow: TextOverflow,
+        max_lines: Option<usize>,
         wrap_to_width: bool,
     },
     Image {
@@ -147,42 +155,53 @@ impl RetainedVisual {
                     fill: f1,
                     corner_radius: c1,
                     border: b1,
+                    shadow: s1,
                 },
                 Self::Rect {
                     fill: f2,
                     corner_radius: c2,
                     border: b2,
+                    shadow: s2,
                 },
-            ) => f1 != f2 || c1 != c2 || b1 != b2,
+            ) => f1 != f2 || c1 != c2 || b1 != b2 || s1 != s2,
             (
                 Self::Text {
                     content: t1,
+                    spans: sp1,
                     font_size: fs1,
                     line_height_multiplier: lh1,
                     color: c1,
                     font: fn1,
                     align: a1,
                     bounds_mode: bm1,
+                    overflow: ov1,
+                    max_lines: ml1,
                     wrap_to_width: w1,
                 },
                 Self::Text {
                     content: t2,
+                    spans: sp2,
                     font_size: fs2,
                     line_height_multiplier: lh2,
                     color: c2,
                     font: fn2,
                     align: a2,
                     bounds_mode: bm2,
+                    overflow: ov2,
+                    max_lines: ml2,
                     wrap_to_width: w2,
                 },
             ) => {
                 t1 != t2
+                    || sp1 != sp2
                     || fs1 != fs2
                     || (lh1 - lh2).abs() > f32::EPSILON
                     || c1 != c2
                     || fn1 != fn2
                     || a1 != a2
                     || bm1 != bm2
+                    || ov1 != ov2
+                    || ml1 != ml2
                     || w1 != w2
             }
             (
@@ -289,28 +308,36 @@ fn collect_node_recursive<M: Clone + 'static>(
             fill,
             corner_radius,
             border,
+            shadow,
         } => Some(PaintPayload::Rect {
-            fill: *fill,
+            fill: fill.clone(),
             corner_radius: *corner_radius,
             border: *border,
+            shadow: *shadow,
         }),
         RetainedVisual::Text {
             content,
+            spans,
             font_size,
             line_height_multiplier,
             color,
             font,
             align,
             bounds_mode,
+            overflow,
+            max_lines,
             wrap_to_width,
         } => Some(PaintPayload::Text {
             content: content.clone(),
+            spans: spans.clone(),
             font_size: *font_size,
             line_height_multiplier: *line_height_multiplier,
             color: *color,
             font: font.clone(),
             align: *align,
             bounds_mode: *bounds_mode,
+            overflow: *overflow,
+            max_lines: *max_lines,
             wrap_to_width: *wrap_to_width,
         }),
         RetainedVisual::Image {
@@ -350,11 +377,18 @@ fn collect_node_recursive<M: Clone + 'static>(
 
     if let Some(payload) = payload {
         let is_clip = matches!(payload, PaintPayload::ClipPush { .. });
+        let cmd_world_bounds = match &payload {
+            PaintPayload::Rect {
+                shadow: Some(shadow),
+                ..
+            } if shadow.is_visible() => shadow.expand_bounds(node.world_bounds),
+            _ => node.world_bounds,
+        };
         commands.push(DrawCommand {
             node_id: node.node_id,
             local_rect: node.bounds,
             affine: node.affine,
-            world_bounds: node.world_bounds,
+            world_bounds: cmd_world_bounds,
             clip_rect: node.clip_rect,
             z_index: node.z_index,
             paint_order,

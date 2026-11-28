@@ -3,14 +3,18 @@
 //! - `ext_image_copy_capture_v1` / `zwlr_screencopy_manager_v1` ([`ScreencopyTarget`], [`ScreencopyFrame`])
 //! - `zwlr_foreign_toplevel_management_v1` / `ext_foreign_toplevel_list_v1` ([`ForeignToplevel`], [`ForeignToplevelSnapshot`])
 //! - `ext_workspace_v1` ([`ExtWorkspace`], [`ExtWorkspaceSnapshot`])
+//! - `zwlr_gamma_control_manager_v1` ([`GammaRamp`])
+//! - `wp_color_management_v1` ([`OutputColorInfo`])
 
 use bitflags::bitflags;
 
 use crate::arena::FrameSharedFn;
 use crate::display::{Output, OutputId};
+use crate::error::{Result, WaywiError};
 use crate::geometry::Bounds;
 use crate::render::Color;
 use crate::subscription::{Subscription, SubscriptionSpec};
+use crate::surface::ColorSpace;
 
 /// Lifecycle events emitted by the Wayland `ext_session_lock_v1` session lock protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -218,5 +222,170 @@ impl ExtWorkspace {
                 map: FrameSharedFn::new(map),
             },
         }
+    }
+}
+
+/// Hardware RGB gamma lookup table uploaded via `zwlr_gamma_control_manager_v1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GammaRamp {
+    pub red: Vec<u16>,
+    pub green: Vec<u16>,
+    pub blue: Vec<u16>,
+}
+
+impl GammaRamp {
+    /// Builds a neutral linear identity gamma ramp of `size` entries (`0..=65535`).
+    #[must_use]
+    pub fn identity(size: usize) -> Self {
+        Self::from_rgb_scales(size, 1.0, 1.0, 1.0)
+    }
+
+    /// Builds a color-temperature + brightness gamma ramp using a smooth Planckian/Tanner
+    /// whitepoint approximation (`kelvin` clamped to `1000..=25000`, `brightness` clamped to
+    /// `0.05..=1.0`).
+    ///
+    /// Typical values: `6500 K` (neutral daylight), `4000 K` (warm evening), `3000 K` (night light).
+    #[must_use]
+    pub fn from_temperature(size: usize, kelvin: u32, brightness: f32) -> Self {
+        let (r, g, b) = kelvin_to_rgb_multipliers(kelvin);
+        let br = if brightness.is_finite() {
+            brightness.clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
+        Self::from_rgb_scales(size, r * br, g * br, b * br)
+    }
+
+    /// Builds a linear gamma ramp scaled by per-channel multipliers (`0.0..=1.0`).
+    #[must_use]
+    pub fn from_rgb_scales(size: usize, r_scale: f32, g_scale: f32, b_scale: f32) -> Self {
+        let len = size.max(2);
+        let denom = (len - 1) as f32;
+        let rs = r_scale.clamp(0.0, 1.0);
+        let gs = g_scale.clamp(0.0, 1.0);
+        let bs = b_scale.clamp(0.0, 1.0);
+
+        let mut red = Vec::with_capacity(len);
+        let mut green = Vec::with_capacity(len);
+        let mut blue = Vec::with_capacity(len);
+        for i in 0..len {
+            let t = i as f32 / denom;
+            red.push((t * rs * 65535.0).round().clamp(0.0, 65535.0) as u16);
+            green.push((t * gs * 65535.0).round().clamp(0.0, 65535.0) as u16);
+            blue.push((t * bs * 65535.0).round().clamp(0.0, 65535.0) as u16);
+        }
+        Self { red, green, blue }
+    }
+
+    /// Validates that all three channels are non-empty and have equal length.
+    pub fn validate(&self) -> Result<()> {
+        if self.red.is_empty()
+            || self.red.len() != self.green.len()
+            || self.red.len() != self.blue.len()
+        {
+            return Err(WaywiError::InvalidState(
+                "gamma ramp red/green/blue tables must be non-empty and equal length".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resamples this ramp to `target_size` entries using linear interpolation when the
+    /// compositor's hardware LUT size differs from the caller's table length.
+    #[must_use]
+    pub fn resample(&self, target_size: usize) -> Self {
+        let target = target_size.max(2);
+        if self.red.len() == target && self.green.len() == target && self.blue.len() == target {
+            return self.clone();
+        }
+        Self {
+            red: resample_channel(&self.red, target),
+            green: resample_channel(&self.green, target),
+            blue: resample_channel(&self.blue, target),
+        }
+    }
+}
+
+fn resample_channel(src: &[u16], target: usize) -> Vec<u16> {
+    if src.is_empty() {
+        return vec![0; target];
+    }
+    if src.len() == 1 {
+        return vec![src[0]; target];
+    }
+    let max_src = (src.len() - 1) as f32;
+    let denom = (target - 1) as f32;
+    (0..target)
+        .map(|i| {
+            let pos = (i as f32 / denom) * max_src;
+            let lo = pos.floor() as usize;
+            let hi = (lo + 1).min(src.len() - 1);
+            let frac = pos - lo as f32;
+            let v = f32::from(src[lo]) * (1.0 - frac) + f32::from(src[hi]) * frac;
+            v.round().clamp(0.0, 65535.0) as u16
+        })
+        .collect()
+}
+
+/// Converts a correlated color temperature in Kelvin (`1000..=25000`) into normalized RGB channel
+/// multipliers (`0.0..=1.0`), calibrated so `6500 K` is neutral `(1.0, 1.0, 1.0)`.
+#[must_use]
+pub fn kelvin_to_rgb_multipliers(kelvin: u32) -> (f32, f32, f32) {
+    let k = kelvin.clamp(1000, 25000);
+    if (6450..=6550).contains(&k) {
+        return (1.0, 1.0, 1.0);
+    }
+    let temp = (k as f64) / 100.0;
+    let r = if temp <= 66.0 {
+        255.0
+    } else {
+        (329.698727446 * (temp - 60.0).powf(-0.1332047592)).clamp(0.0, 255.0)
+    };
+    let g = if temp <= 66.0 {
+        (99.4708025861 * temp.ln() - 161.1195681661).clamp(0.0, 255.0)
+    } else {
+        (288.1221695283 * (temp - 60.0).powf(-0.0755148492)).clamp(0.0, 255.0)
+    };
+    let b = if temp >= 66.0 {
+        255.0
+    } else if temp <= 19.0 {
+        0.0
+    } else {
+        (138.5177312231 * (temp - 10.0).ln() - 305.0447927307).clamp(0.0, 255.0)
+    };
+    let max_c = r.max(g).max(b).max(1.0);
+    ((r / max_c) as f32, (g / max_c) as f32, (b / max_c) as f32)
+}
+
+/// Color-management metadata reported for a Wayland output (`wp_color_management_v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputColorInfo {
+    pub output_id: OutputId,
+    pub hdr_supported: bool,
+    pub preferred_color_space: ColorSpace,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gamma_ramp_temperature_and_resampling_behave_monotonically() {
+        let neutral = GammaRamp::from_temperature(256, 6500, 1.0);
+        assert_eq!(neutral.red.len(), 256);
+        assert_eq!(neutral.red[0], 0);
+        assert_eq!(neutral.red[255], 65535);
+        assert_eq!(neutral.red, neutral.green);
+        assert_eq!(neutral.red, neutral.blue);
+
+        let warm = GammaRamp::from_temperature(256, 3200, 0.8);
+        assert!(warm.red[255] > warm.green[255]);
+        assert!(warm.green[255] > warm.blue[255]);
+        assert!(warm.red[255] <= (0.81 * 65535.0) as u16);
+
+        let resampled = warm.resample(1024);
+        assert_eq!(resampled.red.len(), 1024);
+        assert_eq!(resampled.red[0], warm.red[0]);
+        assert_eq!(resampled.red[1023], warm.red[255]);
     }
 }

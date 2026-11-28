@@ -1,5 +1,4 @@
 use std::ops::Deref;
-#[cfg(feature = "control-ipc")]
 use std::path::PathBuf;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use std::sync::Arc;
@@ -83,6 +82,11 @@ pub(crate) enum SubscriptionSpec<M> {
         interval: Duration,
         map: FrameSharedFn<crate::system::PrivacySnapshot, M>,
     },
+    FileWatch {
+        key: SubscriptionKey,
+        paths: Vec<PathBuf>,
+        map: FrameSharedFn<crate::system::FileWatchEvent, M>,
+    },
     KeyboardLayout {
         map: FrameSharedFn<crate::input::KeyboardLayoutInfo, M>,
     },
@@ -115,6 +119,13 @@ pub(crate) enum SubscriptionSpec<M> {
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     AudioEvent {
         map: FrameSharedFn<crate::audio::AudioEvent, M>,
+    },
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    AudioCapture {
+        key: SubscriptionKey,
+        target: crate::audio::AudioCaptureTarget,
+        config: crate::audio::AudioCaptureConfig,
+        map: FrameSharedFn<crate::audio::AudioCaptureFrame, M>,
     },
     #[cfg(feature = "hyprland-ipc")]
     HyprlandEvent {
@@ -373,6 +384,7 @@ impl<M: 'static> Subscription<M> {
             SystemUptime { key, interval },
             SystemBrightness { key, interval },
             SystemPrivacy { key, interval },
+            FileWatch { key, paths },
             KeyboardLayout {},
             SessionLock {},
             ForeignToplevel {},
@@ -381,6 +393,8 @@ impl<M: 'static> Subscription<M> {
             AudioSnapshot {},
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
             AudioEvent {},
+            #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+            AudioCapture { key, target, config },
             #[cfg(feature = "hyprland-ipc")]
             HyprlandEvent {},
             #[cfg(feature = "sway-ipc")]

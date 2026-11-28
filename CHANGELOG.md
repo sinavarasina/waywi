@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking Changes
+- **Unified `Fill` type on `Rect` and `Painter` (`render`)**:
+  - `Rect::fill` and `Painter::{fill_rect, fill_rounded_rect, fill_circle, fill_path}` now accept `impl Into<Fill>` (`Fill::Solid(Color)`, `Fill::Linear(LinearGradient)`, `Fill::Radial(RadialGradient)`). Existing call sites passing `Color` continue to compile transparently via `From<Color> for Fill`, while code matching or reading internal `Fill` values must handle gradient variants.
+- **New `Capability` variants (`capabilities`)**:
+  - Added `Capability::ImageJpeg`, `Capability::AudioCapture`, `Capability::BackgroundEffect`, `Capability::ToplevelIcon`, `Capability::GammaControl`, and `Capability::ColorManagement`; exhaustive matches on `Capability` must cover these variants.
+- **Structured `PipeWireNodeProps` parameter for `classify_pipewire_node` (`system::privacy`)**:
+  - `classify_pipewire_node` now takes `PipeWireNodeProps<'_>` instead of 7 positional arguments so PipeWire link-graph topology (`linked_from_output_monitor`, `linked_from_screencast`) and authoritative protocol properties (`stream.capture.sink`, `stream.monitor`, `device.api`, `target.object`) govern Microphone vs. AudioCapture and Camera vs. ScreenShare classification.
+
+### Added
+- **Audio capture/monitor streaming & per-stream routing (`audio`)**:
+  - Added `Audio::capture(key, target, config, map)` (`AudioCaptureTarget::{DefaultOutputMonitor, DefaultInput, SinkMonitor, Source, DeviceName}`, `AudioCaptureConfig`, `AudioCaptureFrame`) with real-time VU peak/RMS metering, dBFS peak level, and optional interleaved `f32` PCM output across PipeWire (`STREAM_CAPTURE_SINK`), PulseAudio (`@DEFAULT_MONITOR@`/`@DEFAULT_SOURCE@`), and ALSA (`Direction::Capture`). Capture workers spawn lazily on demand, suppress event-loop wakeups completely during sustained silence, coalesce buffered frames, and tear down immediately on unsubscribe.
+  - Added `AudioClient::move_stream(direction, stream_id, device_id)` across PipeWire (`target.node`/`target.object` metadata) and PulseAudio (`move_sink_input_by_index` / `move_source_output_by_index`).
+- **JPEG decoding (`image-jpeg`, `Capability::ImageJpeg`)**:
+  - Added opt-in `image-jpeg` Cargo feature backed by `zune-jpeg` (`ImageFormat::Jpeg`) supporting baseline/progressive JPEG decoding (RGB, RGBA, and grayscale) into premultiplied RGBA8 across `AssetCache` and `EffectCtx::load_image*`.
+- **Text overflow, custom/embedded fonts, rich spans & selection metrics (`text`, `effect`, `input`)**:
+  - Added `TextOverflow::{Clip, EllipsisStart, EllipsisMiddle, EllipsisEnd}` and `Text::{overflow, ellipsis, max_lines}` (backed natively by `cosmic-text` `Ellipsize`), plus matching `TextLayoutOptions::{overflow, ellipsis, max_lines}`.
+  - Added `EffectCtx::{load_font_bytes, load_font_static, load_font_file}` so applications can bundle custom UI/icon fonts via `include_bytes!` or load local font files; loaded custom fonts persist cleanly across `TextEngine::trim()` and fallback-storm rebuilds and sync automatically to the GPU renderer.
+  - Added multi-style rich text spans (`TextSpan`, `Text::rich`, `Text::span`) supporting per-span color, font family/weight/style, and font size on both CPU and GPU renderers.
+  - Added `TextSelectionMetrics`, `EffectCtx::{measure_text_selection, hit_test_text_byte}`, and `TextInputState::{clear_selection, delete_selection}` for full text selection, mouse drag highlighting, and copy/cut workflows.
+- **Main-axis layout justification, flex weights & min/max size constraints (`render`, `input`, `reconcile`)**:
+  - Added `Justify::{Start, Center, End, SpaceBetween, SpaceAround, SpaceEvenly}` with `Row::justify` and `Column::justify`.
+  - Added `.flex(f32)` and `.min_width`, `.max_width`, `.min_height`, `.max_height`, `.min_size`, `.max_size` on `CommonProps` (all elements and containers), with an O(N) fast-path when `Justify::Start` and no flex children are present.
+- **Linear/radial gradients & box shadows across CPU and GPU (`render`)**:
+  - Added `GradientStop`, `LinearGradient`, `RadialGradient`, `Fill`, and `BoxShadow` (`Rect::shadow`), implemented with CPU (`tiny-skia`) and GPU (`femtovg`) parity across both `Rect` and `Canvas` (`Painter`), including automatic dirty/world bounds expansion for shadows without inflating hit-test bounds.
+- **Zero-thread `inotify` filesystem watcher & generic background tasks (`system`, `effect`, `app`)**:
+  - Added `FileWatch::{path, paths}` (`FileWatchEvent`, `FileWatchKind`) registered directly into `calloop::generic::Generic` via `rustix::fs::inotify` with zero background threads and parent-directory watching for files so atomic-rename editor saves never lose watches.
+  - Added `EffectCtx::spawn_blocking(task, map)` backed by a lazy single worker thread waking `calloop` automatically via `ping` (and executing deterministically inline in `HeadlessRuntime`).
+- **4 Additional Wayland Protocols (`wayland`, `wayland_ext`, `surface`, `effect`, `app`)**:
+  - **Background blur (`background-effect`, `Capability::BackgroundEffect`)**: `ext_background_effect_v1` with declarative `BackgroundBlur::{None, Full, Region(Bounds)}` via `Surface::background_blur(bool)` / `Surface::background_blur_region(Option<Bounds>)`.
+  - **Toplevel window icons (`toplevel-icon`, `Capability::ToplevelIcon`)**: `xdg_toplevel_icon_v1` with declarative `WindowIcon::{Name, Asset}` via `Surface::window_icon`, `Surface::window_icon_name`, and `Surface::clear_window_icon` (automatically center-padding non-square assets into square SHM icon buffers per spec).
+  - **Display gamma & color temperature (`gamma-control`, `Capability::GammaControl`)**: `zwlr_gamma_control_manager_v1` with `GammaRamp` (`identity`, `from_temperature`, `from_rgb_scales`, `resample`), `kelvin_to_rgb_multipliers`, and `EffectCtx::{set_output_gamma, set_output_color_temperature, reset_output_gamma}` with automatic gamma restoration on reset/drop.
+  - **Color management & HDR (`color-management`, `Capability::ColorManagement`)**: `wp_color_management_v1` with `ColorSpace::{Default, Srgb, DisplayP3, Rec2020Pq, LinearSrgb}`, `OutputColorInfo`, and declarative `Surface::color_space(ColorSpace)`.
+  - Added `HeadlessRuntime` inspection hooks `surface_background_blur`, `surface_window_icon`, `surface_color_space`, `recorded_gamma_actions`, and `HeadlessGammaAction`.
+
+### Fixed
+- **Authoritative Linux telemetry & privacy classification (`system`, `audio`)**:
+  - Upgraded `PrivacyMonitor` (`system::privacy`) to track PipeWire `ObjectType::Link` topology and upstream node classes (`Audio/Sink`, `Stream/Output/Audio`, `Audio/Source`, `Video/Source` hardware vs. screencast) plus `stream.capture.sink`, `stream.monitor`, `media.role`, `device.api`, and `target.object` updates in `Node::info`, preventing output-monitor streams (such as `waywi-capture`, OBS desktop audio, or CAVA) from being misclassified as `Microphone` and preventing hardware webcams whose names contain `"screen"` from being misclassified as `ScreenShare`.
+  - Tightened `/proc/<pid>/fd` device matching in `system::privacy` to strict `/dev/snd/pcmC<card>D<dev>c` and `/dev/video<digits>` formats (ignoring `" (deleted)"` suffixes).
+  - Filtered WayWi's internal `waywi-capture` stream from mixer `AudioSnapshot::streams` in both PipeWire and PulseAudio backends, and added `target.object` parsing alongside `node.target`/`target.node` in PipeWire stream metadata.
+  - Upgraded `classify_interface` (`system::network`) to consult authoritative kernel `sysfs` facts (`type`, `wireless/`, `uevent` `DEVTYPE`, `bridge/`, `tun_flags`, and backing hardware `device/`) before falling back to interface name prefixes.
+  - Tightened `is_whole_block_device` (`system::disk`) to exclude stacked device-mapper (`dm-*`), `zram*`, `mmcblk*boot*`/`rpmb`, and `md*p*`/`nbd*p*`/`xvd*<digit>` partitions from whole-disk I/O totals.
+
 ## [0.3.0] - 2026-11-27
 
 ### Breaking Changes

@@ -38,40 +38,42 @@ pub use crate::input::{
     VirtualKeyState,
 };
 pub use crate::render::{
-    Align, Border, Canvas, Clip, Color, Column, CornerRadius, Element, Group, Painter, PathBuilder,
-    Rect, RendererPreference, Row,
+    Align, Border, BoxShadow, Canvas, Clip, Color, Column, CornerRadius, Element, Fill,
+    GradientStop, Group, Justify, LinearGradient, Painter, PathBuilder, RadialGradient, Rect,
+    RendererPreference, Row,
 };
 pub use crate::sprite::{Fps, FpsExt, Frames, PlaybackMode, Sprite, SpriteFrame, SpriteSheet};
 pub use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionKey, Subscriptions};
 pub use crate::surface::{
-    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer, PopupAnchor,
-    PopupConstraintAdjustment, PopupGravity, PopupPositioner, Surface, SurfaceKey, SurfaceKind,
-    Surfaces, WindowDecoration,
+    Anchor, BackgroundBlur, BufferRetention, ColorSpace, InputMode, IntoSurfaceKey,
+    KeyboardInteractivity, Layer, PopupAnchor, PopupConstraintAdjustment, PopupGravity,
+    PopupPositioner, Surface, SurfaceKey, SurfaceKind, Surfaces, WindowDecoration, WindowIcon,
 };
 pub use crate::system::{
     BacklightDevice, BatteryInfo, BatterySnapshot, BrightnessSnapshot, ByteSize, CalendarDayCell,
-    CalendarMonth, CalendarRow, DataRate, DdcMonitorInfo, FreqUnit, LocalDateTime,
-    NetInterfaceKind, NetInterfaceSnapshot, NetLinkState, NetworkSnapshot, PrivacyAccessEntry,
-    PrivacyAccessKind, PrivacyAccessSource, PrivacySnapshot, RateUnit, SnapshotState, System,
-    ThermalSnapshot, TimeFormat, TimeSnapshot, UsbDevice,
+    CalendarMonth, CalendarRow, DataRate, DdcMonitorInfo, FileWatch, FileWatchEvent, FileWatchKind,
+    FreqUnit, LocalDateTime, NetInterfaceKind, NetInterfaceSnapshot, NetLinkState, NetworkSnapshot,
+    PipeWireNodeProps, PrivacyAccessEntry, PrivacyAccessKind, PrivacyAccessSource, PrivacySnapshot,
+    RateUnit, SnapshotState, System, ThermalSnapshot, TimeFormat, TimeSnapshot, UsbDevice,
 };
 pub use crate::text::{
     Font, FontStyle, FontWeight, SharedStr, Text, TextAlign, TextBoundsMode, TextCursorMetrics,
-    TextLayoutOptions,
+    TextLayoutOptions, TextOverflow, TextSelectionMetrics, TextSpan,
 };
 pub use crate::timer::Timer;
 pub use crate::wayland_ext::{
     ExtWorkspace, ExtWorkspaceCapabilities, ExtWorkspaceGroupId, ExtWorkspaceGroupInfo,
     ExtWorkspaceId, ExtWorkspaceInfo, ExtWorkspaceSnapshot, ExtWorkspaceState, ForeignToplevel,
     ForeignToplevelId, ForeignToplevelInfo, ForeignToplevelSnapshot, ForeignToplevelState,
-    ScreencopyFrame, ScreencopyTarget, SessionLock, SessionLockEvent,
+    GammaRamp, OutputColorInfo, ScreencopyFrame, ScreencopyTarget, SessionLock, SessionLockEvent,
 };
 
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use crate::audio::{
-    Audio, AudioCard, AudioChannelPosition, AudioClient, AudioDevice, AudioDirection, AudioEvent,
-    AudioPort, AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream,
-    AudioTarget, AudioVolume,
+    Audio, AudioCaptureConfig, AudioCaptureFrame, AudioCaptureTarget, AudioCard,
+    AudioChannelPosition, AudioClient, AudioDevice, AudioDirection, AudioEvent, AudioPort,
+    AudioPortAvailability, AudioPortTarget, AudioProfile, AudioSnapshot, AudioStream, AudioTarget,
+    AudioVolume,
 };
 #[cfg(any(
     feature = "pipewire",

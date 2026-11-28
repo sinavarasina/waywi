@@ -10,8 +10,9 @@ use crate::display::OutputInfo;
 #[cfg(feature = "clipboard")]
 use crate::effect::context::ClipboardSetter;
 use crate::effect::{
-    ActivationCallback, AssetCallback, AsyncAssetWorker, DragStartRequest, EffectCtx,
-    ExtWorkspaceAction, ForeignToplevelAction, ScreencopyCallback, VirtualKeyboardAction,
+    ActivationCallback, AssetCallback, AsyncAssetWorker, AsyncTaskWorker, BlockingTaskCallback,
+    DragStartRequest, EffectCtx, ExtWorkspaceAction, ForeignToplevelAction, GammaAction,
+    ScreencopyCallback, VirtualKeyboardAction,
 };
 use crate::error::Result;
 use crate::geometry::{LogicalSize, Point, ScaleFactor};
@@ -45,6 +46,8 @@ pub(crate) struct EffectPostWork<M> {
     pub(crate) ext_workspace_actions: Vec<ExtWorkspaceAction>,
     pub(crate) virtual_keyboard_actions: Vec<VirtualKeyboardAction>,
     pub(crate) drag_starts: Vec<DragStartRequest>,
+    pub(crate) gamma_actions: Vec<GammaAction>,
+    pub(crate) inline_messages: Vec<M>,
     pub(crate) trim_requested: bool,
 }
 
@@ -58,6 +61,10 @@ pub(crate) struct CoreEngine<M: Clone + 'static> {
     pub(crate) asset_worker: AsyncAssetWorker,
     pub(crate) next_asset_job_id: u64,
     pub(crate) pending_asset_callbacks: HashMap<u64, AssetCallback<M>>,
+    pub(crate) task_worker: AsyncTaskWorker,
+    pub(crate) next_task_job_id: u64,
+    pub(crate) pending_task_callbacks: HashMap<u64, BlockingTaskCallback<M>>,
+    pub(crate) run_blocking_inline: bool,
     pub(crate) system: SystemProviders,
     pub(crate) system_samplers: SystemSamplers<M>,
     pub(crate) renderer: ActiveRenderer,
@@ -142,6 +149,10 @@ impl<M: Clone + 'static> CoreEngine<M> {
             asset_worker: AsyncAssetWorker::new(),
             next_asset_job_id: 1,
             pending_asset_callbacks: HashMap::new(),
+            task_worker: AsyncTaskWorker::new(),
+            next_task_job_id: 1,
+            pending_task_callbacks: HashMap::new(),
+            run_blocking_inline: !probe_session_ipc,
             system: SystemProviders::new(),
             system_samplers: SystemSamplers::new(),
             renderer,
@@ -189,6 +200,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
         let mut trim_requested = false;
         let mut pending_after: Vec<(Duration, M)> = Vec::new();
         let mut pending_asset_jobs = Vec::new();
+        let mut pending_blocking_tasks = Vec::new();
         let mut reloaded_assets: Vec<(AssetId, u64)> = Vec::new();
         let mut evicted_assets: Vec<AssetId> = Vec::new();
         let mut activation_requests = Vec::new();
@@ -198,6 +210,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
         let mut ext_workspace_actions = Vec::new();
         let mut virtual_keyboard_actions = Vec::new();
         let mut drag_starts = Vec::new();
+        let mut gamma_actions = Vec::new();
 
         #[cfg(feature = "clipboard")]
         let has_clipboard = clipboard_writer.is_some();
@@ -213,12 +226,6 @@ impl<M: Clone + 'static> CoreEngine<M> {
 
         #[cfg(feature = "text")]
         let frame_seq = self.reconciler.frame_seq;
-        #[cfg(feature = "text")]
-        let mut measure_cursor =
-            |content: &SharedStr, style: crate::text::TextMeasureStyle<'_>, cursor_byte: usize| {
-                self.renderer
-                    .measure_text_cursor(content, style, cursor_byte, frame_seq)
-            };
 
         let result = {
             let mut ctx = EffectCtx {
@@ -229,6 +236,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
                 memory_config: &self.memory,
                 assets: &mut self.assets,
                 pending_asset_jobs: &mut pending_asset_jobs,
+                pending_blocking_tasks: &mut pending_blocking_tasks,
                 system: &mut self.system,
                 pending_after: &mut pending_after,
                 reloaded_assets: &mut reloaded_assets,
@@ -240,6 +248,7 @@ impl<M: Clone + 'static> CoreEngine<M> {
                 pending_ext_workspace_actions: &mut ext_workspace_actions,
                 pending_virtual_keyboard_actions: &mut virtual_keyboard_actions,
                 pending_drag_starts: &mut drag_starts,
+                pending_gamma_actions: &mut gamma_actions,
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 audio: &self.audio_client,
                 #[cfg(any(
@@ -262,7 +271,9 @@ impl<M: Clone + 'static> CoreEngine<M> {
                     None
                 },
                 #[cfg(feature = "text")]
-                text_cursor_measurer: &mut measure_cursor,
+                text_engine: &mut self.renderer.text_engine,
+                #[cfg(feature = "text")]
+                frame_seq,
             };
             f(&mut ctx)
         };
@@ -275,6 +286,18 @@ impl<M: Clone + 'static> CoreEngine<M> {
             self.next_asset_job_id = self.next_asset_job_id.wrapping_add(1);
             self.pending_asset_callbacks.insert(job_id, cb);
             self.asset_worker.submit(job_id, path);
+        }
+        let mut inline_messages = Vec::new();
+        for (job, cb) in pending_blocking_tasks {
+            if self.run_blocking_inline {
+                let payload = job();
+                inline_messages.push(cb(payload));
+            } else {
+                let job_id = self.next_task_job_id;
+                self.next_task_job_id = self.next_task_job_id.wrapping_add(1);
+                self.pending_task_callbacks.insert(job_id, cb);
+                self.task_worker.submit(job_id, job);
+            }
         }
         for (aid, rev) in reloaded_assets {
             self.reconciler.invalidate_asset(aid, rev);
@@ -296,6 +319,8 @@ impl<M: Clone + 'static> CoreEngine<M> {
                 ext_workspace_actions,
                 virtual_keyboard_actions,
                 drag_starts,
+                gamma_actions,
+                inline_messages,
                 trim_requested,
             },
         )
@@ -340,6 +365,12 @@ impl<M: Clone + 'static> CoreEngine<M> {
             });
             if let Some(cb) = self.pending_asset_callbacks.remove(&done.job_id) {
                 out_msgs.push_back(cb(asset_res));
+            }
+        }
+
+        for done in self.task_worker.drain_completed() {
+            if let Some(cb) = self.pending_task_callbacks.remove(&done.job_id) {
+                out_msgs.push_back(cb(done.payload));
             }
         }
 

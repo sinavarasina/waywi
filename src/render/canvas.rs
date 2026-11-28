@@ -5,8 +5,10 @@ use crate::arena::FrameSharedFn;
 use crate::geometry::{Bounds, LogicalPx, LogicalSize, Size};
 use crate::input::CommonProps;
 #[cfg(feature = "renderer-software")]
-use crate::render::software::path::{build_rounded_rect_path, to_tiny_skia_path};
-use crate::render::style::{Color, CornerRadius};
+use crate::render::software::path::{
+    build_rounded_rect_path, build_skia_fill_paint, to_tiny_skia_path,
+};
+use crate::render::style::{Color, CornerRadius, Fill};
 
 /// Vector path command recorded by [`PathBuilder`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,12 +78,12 @@ impl PathBuilder {
 #[derive(Debug, Clone)]
 pub(crate) enum CanvasOp {
     Clear(Color),
-    FillRect(Bounds, Color),
-    FillRoundedRect(Bounds, CornerRadius, Color),
+    FillRect(Bounds, Fill),
+    FillRoundedRect(Bounds, CornerRadius, Fill),
     StrokeRect(Bounds, LogicalPx, Color),
-    FillCircle(LogicalPx, LogicalPx, LogicalPx, Color),
+    FillCircle(LogicalPx, LogicalPx, LogicalPx, Fill),
     StrokeLine(LogicalPx, LogicalPx, LogicalPx, LogicalPx, LogicalPx, Color),
-    FillPath(Vec<PathOp>, Color),
+    FillPath(Vec<PathOp>, Fill),
     StrokePath(Vec<PathOp>, LogicalPx, Color),
 }
 
@@ -155,10 +157,11 @@ impl<'a> Painter<'a> {
         }
     }
 
-    pub fn fill_rect(&mut self, rect: Bounds, color: Color) {
+    pub fn fill_rect(&mut self, rect: Bounds, fill: impl Into<Fill>) {
+        let fill = fill.into();
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
-            ops.push(CanvasOp::FillRect(rect, color));
+            ops.push(CanvasOp::FillRect(rect, fill));
             return;
         }
         #[cfg(feature = "renderer-software")]
@@ -172,23 +175,22 @@ impl<'a> Painter<'a> {
                     rect.width.0 * self.scale,
                     rect.height.0 * self.scale,
                 )
+                && let Some(paint) = build_skia_fill_paint(&fill, rect, self.scale, 1.0)
             {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(color.r, color.g, color.b, color.a);
-                paint.anti_alias = true;
                 pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
             }
         }
         #[cfg(not(feature = "renderer-software"))]
         {
-            let _ = (rect, color);
+            let _ = (rect, fill);
         }
     }
 
-    pub fn fill_rounded_rect(&mut self, rect: Bounds, radius: CornerRadius, color: Color) {
+    pub fn fill_rounded_rect(&mut self, rect: Bounds, radius: CornerRadius, fill: impl Into<Fill>) {
+        let fill = fill.into();
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
-            ops.push(CanvasOp::FillRoundedRect(rect, radius, color));
+            ops.push(CanvasOp::FillRoundedRect(rect, radius, fill));
             return;
         }
         #[cfg(feature = "renderer-software")]
@@ -197,10 +199,8 @@ impl<'a> Painter<'a> {
                 && let Some(mut pixmap) =
                     tiny_skia::PixmapMut::from_bytes(pixels, self.width_px, self.height_px)
                 && let Some(path) = build_rounded_rect_path(rect, radius, self.scale)
+                && let Some(paint) = build_skia_fill_paint(&fill, rect, self.scale, 1.0)
             {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(color.r, color.g, color.b, color.a);
-                paint.anti_alias = true;
                 pixmap.fill_path(
                     &path,
                     &paint,
@@ -212,7 +212,7 @@ impl<'a> Painter<'a> {
         }
         #[cfg(not(feature = "renderer-software"))]
         {
-            let _ = (rect, radius, color);
+            let _ = (rect, radius, fill);
         }
     }
 
@@ -257,14 +257,28 @@ impl<'a> Painter<'a> {
         }
     }
 
-    pub fn fill_circle(&mut self, cx: LogicalPx, cy: LogicalPx, radius: LogicalPx, color: Color) {
+    pub fn fill_circle(
+        &mut self,
+        cx: LogicalPx,
+        cy: LogicalPx,
+        radius: LogicalPx,
+        fill: impl Into<Fill>,
+    ) {
+        let fill = fill.into();
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
-            ops.push(CanvasOp::FillCircle(cx, cy, radius, color));
+            ops.push(CanvasOp::FillCircle(cx, cy, radius, fill));
             return;
         }
         #[cfg(feature = "renderer-software")]
         {
+            let r = radius.0.max(0.1);
+            let circle_bounds = Bounds::new(
+                LogicalPx(cx.0 - r),
+                LogicalPx(cy.0 - r),
+                LogicalPx(r * 2.0),
+                LogicalPx(r * 2.0),
+            );
             if let Some(pixels) = &mut self.rgba_pixels
                 && let Some(mut pixmap) =
                     tiny_skia::PixmapMut::from_bytes(pixels, self.width_px, self.height_px)
@@ -273,10 +287,8 @@ impl<'a> Painter<'a> {
                     cy.0 * self.scale,
                     (radius.0 * self.scale).max(0.1),
                 )
+                && let Some(paint) = build_skia_fill_paint(&fill, circle_bounds, self.scale, 1.0)
             {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(color.r, color.g, color.b, color.a);
-                paint.anti_alias = true;
                 pixmap.fill_path(
                     &path,
                     &paint,
@@ -288,7 +300,7 @@ impl<'a> Painter<'a> {
         }
         #[cfg(not(feature = "renderer-software"))]
         {
-            let _ = (cx, cy, radius, color);
+            let _ = (cx, cy, radius, fill);
         }
     }
 
@@ -311,22 +323,27 @@ impl<'a> Painter<'a> {
         self.stroke_path(&pb, width, color);
     }
 
-    pub fn fill_path(&mut self, builder: &PathBuilder, color: Color) {
+    pub fn fill_path(&mut self, builder: &PathBuilder, fill: impl Into<Fill>) {
+        let fill = fill.into();
         #[cfg(feature = "renderer-gpu")]
         if let Some(ops) = &mut self.recorded_ops {
-            ops.push(CanvasOp::FillPath(builder.ops.clone(), color));
+            ops.push(CanvasOp::FillPath(builder.ops.clone(), fill));
             return;
         }
         #[cfg(feature = "renderer-software")]
         {
+            let canvas_bounds = Bounds::new(
+                LogicalPx::ZERO,
+                LogicalPx::ZERO,
+                self.logical_size.width,
+                self.logical_size.height,
+            );
             if let Some(pixels) = &mut self.rgba_pixels
                 && let Some(mut pixmap) =
                     tiny_skia::PixmapMut::from_bytes(pixels, self.width_px, self.height_px)
                 && let Some(path) = to_tiny_skia_path(builder, self.scale)
+                && let Some(paint) = build_skia_fill_paint(&fill, canvas_bounds, self.scale, 1.0)
             {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(color.r, color.g, color.b, color.a);
-                paint.anti_alias = true;
                 pixmap.fill_path(
                     &path,
                     &paint,
@@ -338,7 +355,7 @@ impl<'a> Painter<'a> {
         }
         #[cfg(not(feature = "renderer-software"))]
         {
-            let _ = (builder, color);
+            let _ = (builder, fill);
         }
     }
 

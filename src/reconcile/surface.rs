@@ -14,8 +14,8 @@ use crate::input::{
 use crate::render::{Color, DrawCommand, RetainedNode};
 use crate::surface::types::PopupSpec;
 use crate::surface::{
-    Anchor, BufferRetention, InputMode, KeyboardInteractivity, Layer, SurfaceKey, SurfaceKind,
-    WindowDecoration,
+    Anchor, BackgroundBlur, BufferRetention, ColorSpace, InputMode, KeyboardInteractivity, Layer,
+    SurfaceKey, SurfaceKind, WindowDecoration, WindowIcon,
 };
 use crate::text::SharedStr;
 
@@ -45,6 +45,9 @@ pub(crate) struct SurfaceSpec {
     pub(crate) namespace: SharedStr,
     pub(crate) cursor: CursorShape,
     pub(crate) decoration: WindowDecoration,
+    pub(crate) background_blur: BackgroundBlur,
+    pub(crate) window_icon: Option<WindowIcon>,
+    pub(crate) color_space: ColorSpace,
     pub(crate) inhibit_idle: bool,
     pub(crate) pointer_constraint: PointerConstraintMode,
     pub(crate) accepts_dnd: bool,

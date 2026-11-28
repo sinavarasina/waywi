@@ -50,6 +50,7 @@ pub struct DecodedImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
     Png,
+    Jpeg,
     Svg,
     Gif,
     Webp,

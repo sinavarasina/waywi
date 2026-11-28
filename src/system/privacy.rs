@@ -92,49 +92,127 @@ pub fn sample_privacy_oneshot_from(proc_root: &Path, self_pid: u32) -> PrivacySn
     build_snapshot(entries)
 }
 
+/// PipeWire node properties and optional link-graph context passed to [`classify_pipewire_node`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipeWireNodeProps<'a> {
+    pub media_class: &'a str,
+    pub media_role: Option<&'a str>,
+    pub node_name: Option<&'a str>,
+    pub media_name: Option<&'a str>,
+    pub app_name: Option<&'a str>,
+    pub device_api: Option<&'a str>,
+    pub target_object: Option<&'a str>,
+    pub pid: Option<u32>,
+    pub is_running: bool,
+    /// `true` when PipeWire reports `stream.capture.sink = "true" | "1"`.
+    pub stream_capture_sink: bool,
+    /// `true` when PipeWire reports `stream.monitor = "true" | "1"`.
+    pub stream_monitor: bool,
+    /// Authoritative PipeWire link-graph classification for `Stream/Input/Audio`:
+    /// - `Some(true)`: linked from an `Audio/Sink` or `Stream/Output/Audio` (output monitor/loopback)
+    /// - `Some(false)`: linked from an `Audio/Source` (microphone/input)
+    /// - `None`: no active graph link observed; fall back to node properties
+    pub linked_from_output_monitor: Option<bool>,
+    /// Authoritative PipeWire link-graph classification for `Stream/Input/Video`:
+    /// - `Some(true)`: linked from a screen-capture `Video/Source`
+    /// - `Some(false)`: linked from a physical camera `Video/Source` (`v4l2`/`libcamera`)
+    /// - `None`: no active graph link observed; fall back to node properties
+    pub linked_from_screencast: Option<bool>,
+}
+
+#[cfg(feature = "pipewire")]
+fn parse_pw_bool(val: Option<&str>) -> bool {
+    matches!(
+        val.map(str::trim),
+        Some("true" | "TRUE" | "True" | "1" | "yes" | "YES")
+    )
+}
+
+fn is_physical_camera_api(device_api: Option<&str>, node_name: Option<&str>) -> bool {
+    device_api.is_some_and(|api| {
+        api.eq_ignore_ascii_case("v4l2") || api.eq_ignore_ascii_case("libcamera")
+    }) || node_name
+        .is_some_and(|n| n.starts_with("v4l2_input.") || n.starts_with("libcamera_input."))
+}
+
+fn is_screencast_role(role: Option<&str>) -> bool {
+    role.is_some_and(|r| r.eq_ignore_ascii_case("Screen") || r.eq_ignore_ascii_case("ScreenCast"))
+}
+
+fn is_audio_monitor_role(role: Option<&str>) -> bool {
+    role.is_some_and(|r| {
+        r.eq_ignore_ascii_case("Monitor")
+            || r.eq_ignore_ascii_case("Screen")
+            || r.eq_ignore_ascii_case("DSP")
+    })
+}
+
 /// Classifies a live PipeWire node record into an active [`PrivacyAccessEntry`].
+///
+/// Prefers authoritative PipeWire link-graph topology and explicit protocol properties
+/// (`stream.capture.sink`, `stream.monitor`, `media.role`, `device.api`, `target.object`) before
+/// falling back to conservative naming conventions.
 #[must_use]
-pub fn classify_pipewire_node(
-    media_class: &str,
-    media_role: Option<&str>,
-    node_name: Option<&str>,
-    media_name: Option<&str>,
-    app_name: Option<&str>,
-    pid: Option<u32>,
-    is_running: bool,
-) -> Option<PrivacyAccessEntry> {
-    if !is_running {
+pub fn classify_pipewire_node(props: PipeWireNodeProps<'_>) -> Option<PrivacyAccessEntry> {
+    if !props.is_running {
         return None;
     }
-    let resolved_app = app_name
+    let resolved_app = props
+        .app_name
         .filter(|s| !s.trim().is_empty())
-        .or(node_name.filter(|s| !s.trim().is_empty()))
+        .or(props.node_name.filter(|s| !s.trim().is_empty()))
         .unwrap_or("unknown")
         .to_owned();
 
-    let kind = match media_class {
+    let kind = match props.media_class {
         "Stream/Input/Audio" => {
-            let is_screen_or_loopback = node_name.is_some_and(|n| {
-                let low = n.to_ascii_lowercase();
-                low.contains("loopback") || low.contains("monitor")
-            });
-            if is_screen_or_loopback {
+            let is_output_monitor = match props.linked_from_output_monitor {
+                Some(from_monitor) => from_monitor,
+                None => {
+                    props.stream_capture_sink
+                        || props.stream_monitor
+                        || is_audio_monitor_role(props.media_role)
+                        || props.target_object.is_some_and(|t| t.ends_with(".monitor"))
+                        || props.node_name.is_some_and(|n| {
+                            let low = n.to_ascii_lowercase();
+                            low.contains("loopback")
+                                || low.ends_with(".monitor")
+                                || low.ends_with("-monitor")
+                                || low.ends_with("_monitor")
+                        })
+                }
+            };
+            if is_output_monitor {
                 PrivacyAccessKind::AudioCapture
             } else {
                 PrivacyAccessKind::Microphone
             }
         }
         "Stream/Input/Video" => {
-            let is_screencast = media_role.is_some_and(|r| r.eq_ignore_ascii_case("Screen"))
-                || media_name.is_some_and(|m| m.to_ascii_lowercase().contains("screencast"))
-                || node_name.is_some_and(|n| {
-                    let low = n.to_ascii_lowercase();
-                    low.contains("screencast")
-                        || low.contains("portal")
-                        || low.contains("desktop-portal")
-                        || low.contains("xdpw")
-                })
-                || resolved_app.to_ascii_lowercase().contains("screencast");
+            let is_screencast = match props.linked_from_screencast {
+                Some(from_screen) => from_screen,
+                None => {
+                    if is_physical_camera_api(props.device_api, props.node_name)
+                        || props
+                            .media_role
+                            .is_some_and(|r| r.eq_ignore_ascii_case("Camera"))
+                    {
+                        false
+                    } else {
+                        is_screencast_role(props.media_role)
+                            || props
+                                .media_name
+                                .is_some_and(|m| m.to_ascii_lowercase().contains("screencast"))
+                            || props.node_name.is_some_and(|n| {
+                                let low = n.to_ascii_lowercase();
+                                low.contains("screencast")
+                                    || low.contains("xdg-desktop-portal")
+                                    || low.starts_with("xdpw")
+                            })
+                            || resolved_app.to_ascii_lowercase().contains("screencast")
+                    }
+                }
+            };
             if is_screencast {
                 PrivacyAccessKind::ScreenShare
             } else {
@@ -142,11 +220,17 @@ pub fn classify_pipewire_node(
             }
         }
         "Video/Source" => {
-            let is_screencast = media_role.is_some_and(|r| r.eq_ignore_ascii_case("Screen"))
-                || node_name.is_some_and(|n| {
-                    let low = n.to_ascii_lowercase();
-                    low.contains("screencast") || low.contains("xdpw") || low.contains("screen")
-                });
+            let is_screencast = if is_physical_camera_api(props.device_api, props.node_name) {
+                false
+            } else {
+                is_screencast_role(props.media_role)
+                    || props.node_name.is_some_and(|n| {
+                        let low = n.to_ascii_lowercase();
+                        low.contains("screencast")
+                            || low.contains("xdg-desktop-portal")
+                            || low.starts_with("xdpw")
+                    })
+            };
             if is_screencast {
                 PrivacyAccessKind::ScreenShare
             } else {
@@ -160,8 +244,8 @@ pub fn classify_pipewire_node(
         kind,
         source: PrivacyAccessSource::PipeWire,
         app_name: resolved_app,
-        node_name: node_name.map(str::to_owned),
-        pid,
+        node_name: props.node_name.map(str::to_owned),
+        pid: props.pid,
         device_path: None,
     })
 }
@@ -203,7 +287,7 @@ pub fn scan_proc_fd_from(proc_root: &Path, self_pid: u32) -> Vec<PrivacyAccessEn
                 continue;
             };
             let target_str = target.to_string_lossy();
-            if target_str.starts_with("/dev/video") {
+            if is_v4l2_video_dev(&target_str) {
                 matched.push((PrivacyAccessKind::Camera, target_str.into_owned()));
             } else if is_alsa_capture_dev(&target_str) {
                 matched.push((PrivacyAccessKind::Microphone, target_str.into_owned()));
@@ -228,11 +312,34 @@ pub fn scan_proc_fd_from(proc_root: &Path, self_pid: u32) -> Vec<PrivacyAccessEn
     found.into_iter().collect()
 }
 
+fn strip_deleted_suffix(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
+/// Matches Linux V4L2 device nodes strictly (`/dev/video<digits>`).
+fn is_v4l2_video_dev(path: &str) -> bool {
+    let clean = strip_deleted_suffix(path);
+    clean
+        .strip_prefix("/dev/video")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Matches Linux ALSA PCM capture device nodes strictly (`/dev/snd/pcmC<card>D<dev>c`).
 fn is_alsa_capture_dev(path: &str) -> bool {
-    let Some(base) = path.strip_prefix("/dev/snd/pcm") else {
+    let clean = strip_deleted_suffix(path);
+    let Some(rest) = clean.strip_prefix("/dev/snd/pcmC") else {
         return false;
     };
-    base.contains('c')
+    let Some(after_c) = rest.strip_suffix('c') else {
+        return false;
+    };
+    let Some((card, dev)) = after_c.split_once('D') else {
+        return false;
+    };
+    !card.is_empty()
+        && !dev.is_empty()
+        && card.bytes().all(|b| b.is_ascii_digit())
+        && dev.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn read_proc_name(proc_dir: &Path) -> Option<String> {
@@ -269,13 +376,25 @@ mod pw_monitor {
 
     use super::*;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GraphSourceKind {
+        AudioSinkOrOutput,
+        AudioSource,
+        VideoCamera,
+        VideoScreenCast,
+    }
+
     struct TrackedNode {
         media_class: String,
         media_role: Option<String>,
         node_name: Option<String>,
         media_name: Option<String>,
         app_name: Option<String>,
+        device_api: Option<String>,
+        target_object: Option<String>,
         pid: Option<u32>,
+        stream_capture_sink: bool,
+        stream_monitor: bool,
         running: bool,
         _node: Node,
         _listener: NodeListener,
@@ -284,23 +403,88 @@ mod pw_monitor {
     #[derive(Default)]
     struct PwPrivacyState {
         nodes: HashMap<u32, TrackedNode>,
+        /// Lightweight graph index of upstream producer nodes (no `registry.bind()` needed).
+        source_kinds: HashMap<u32, GraphSourceKind>,
+        /// Active PipeWire links (`link_id -> (output_node_id, input_node_id)`).
+        links: HashMap<u32, (u32, u32)>,
     }
 
     impl PwPrivacyState {
+        fn resolve_audio_link_monitor(&self, input_node_id: u32) -> Option<bool> {
+            let mut saw_monitor = false;
+            let mut saw_mic = false;
+            for &(out_id, in_id) in self.links.values() {
+                if in_id != input_node_id {
+                    continue;
+                }
+                match self.source_kinds.get(&out_id) {
+                    Some(GraphSourceKind::AudioSinkOrOutput) => saw_monitor = true,
+                    Some(GraphSourceKind::AudioSource) => saw_mic = true,
+                    _ => {}
+                }
+            }
+            if saw_mic {
+                // If linked to an actual microphone source, report Microphone honestly.
+                Some(false)
+            } else if saw_monitor {
+                Some(true)
+            } else {
+                None
+            }
+        }
+
+        fn resolve_video_link_screencast(&self, input_node_id: u32) -> Option<bool> {
+            let mut saw_screen = false;
+            let mut saw_camera = false;
+            for &(out_id, in_id) in self.links.values() {
+                if in_id != input_node_id {
+                    continue;
+                }
+                match self.source_kinds.get(&out_id) {
+                    Some(GraphSourceKind::VideoScreenCast) => saw_screen = true,
+                    Some(GraphSourceKind::VideoCamera) => saw_camera = true,
+                    _ => {}
+                }
+            }
+            if saw_camera {
+                Some(false)
+            } else if saw_screen {
+                Some(true)
+            } else {
+                None
+            }
+        }
+
         fn publish(&self, shared: &Arc<Mutex<Vec<PrivacyAccessEntry>>>) {
             let entries: Vec<PrivacyAccessEntry> = self
                 .nodes
-                .values()
-                .filter_map(|n| {
-                    classify_pipewire_node(
-                        &n.media_class,
-                        n.media_role.as_deref(),
-                        n.node_name.as_deref(),
-                        n.media_name.as_deref(),
-                        n.app_name.as_deref(),
-                        n.pid,
-                        n.running,
-                    )
+                .iter()
+                .filter_map(|(&id, n)| {
+                    let linked_from_output_monitor = if n.media_class == "Stream/Input/Audio" {
+                        self.resolve_audio_link_monitor(id)
+                    } else {
+                        None
+                    };
+                    let linked_from_screencast = if n.media_class == "Stream/Input/Video" {
+                        self.resolve_video_link_screencast(id)
+                    } else {
+                        None
+                    };
+                    classify_pipewire_node(PipeWireNodeProps {
+                        media_class: &n.media_class,
+                        media_role: n.media_role.as_deref(),
+                        node_name: n.node_name.as_deref(),
+                        media_name: n.media_name.as_deref(),
+                        app_name: n.app_name.as_deref(),
+                        device_api: n.device_api.as_deref(),
+                        target_object: n.target_object.as_deref(),
+                        pid: n.pid,
+                        is_running: n.running,
+                        stream_capture_sink: n.stream_capture_sink,
+                        stream_monitor: n.stream_monitor,
+                        linked_from_output_monitor,
+                        linked_from_screencast,
+                    })
                 })
                 .collect();
             if let Ok(mut g) = shared.lock()
@@ -308,6 +492,35 @@ mod pw_monitor {
             {
                 *g = entries;
             }
+        }
+    }
+
+    fn classify_graph_source(props: &pw::spa::utils::dict::DictRef) -> Option<GraphSourceKind> {
+        let media_class = props.get("media.class")?;
+        if media_class == "Audio/Sink"
+            || media_class == "Audio/Duplex"
+            || media_class.starts_with("Stream/Output/Audio")
+        {
+            Some(GraphSourceKind::AudioSinkOrOutput)
+        } else if media_class == "Audio/Source" || media_class == "Audio/Source/Virtual" {
+            Some(GraphSourceKind::AudioSource)
+        } else if media_class == "Video/Source" {
+            if is_physical_camera_api(props.get("device.api"), props.get("node.name")) {
+                Some(GraphSourceKind::VideoCamera)
+            } else if is_screencast_role(props.get("media.role"))
+                || props.get("node.name").is_some_and(|n| {
+                    let low = n.to_ascii_lowercase();
+                    low.contains("screencast")
+                        || low.contains("xdg-desktop-portal")
+                        || low.starts_with("xdpw")
+                })
+            {
+                Some(GraphSourceKind::VideoScreenCast)
+            } else {
+                Some(GraphSourceKind::VideoCamera)
+            }
+        } else {
+            None
         }
     }
 
@@ -356,12 +569,36 @@ mod pw_monitor {
         let _reg_listener = registry
             .add_listener_local()
             .global(move |obj| {
-                if obj.type_ != ObjectType::Node {
-                    return;
-                }
                 let Some(props) = obj.props else {
                     return;
                 };
+                if obj.type_ == ObjectType::Link {
+                    let Some(out_id) = props
+                        .get("link.output.node")
+                        .and_then(|s| s.parse::<u32>().ok())
+                    else {
+                        return;
+                    };
+                    let Some(in_id) = props
+                        .get("link.input.node")
+                        .and_then(|s| s.parse::<u32>().ok())
+                    else {
+                        return;
+                    };
+                    let mut st = state_add.borrow_mut();
+                    st.links.insert(obj.id, (out_id, in_id));
+                    if st.nodes.contains_key(&in_id) {
+                        st.publish(&shared_add);
+                    }
+                    return;
+                }
+                if obj.type_ != ObjectType::Node {
+                    return;
+                }
+                if let Some(src_kind) = classify_graph_source(props) {
+                    let mut st = state_add.borrow_mut();
+                    st.source_kinds.insert(obj.id, src_kind);
+                }
                 let Some(media_class) = props.get("media.class") else {
                     return;
                 };
@@ -383,9 +620,16 @@ mod pw_monitor {
                 let node_name = props.get("node.name").map(str::to_owned);
                 let media_name = props.get("media.name").map(str::to_owned);
                 let app_name = props.get("application.name").map(str::to_owned);
+                let device_api = props.get("device.api").map(str::to_owned);
+                let target_object = props
+                    .get("target.object")
+                    .or_else(|| props.get("node.target"))
+                    .map(str::to_owned);
                 let pid = props
                     .get("application.process.id")
                     .and_then(|s| s.parse::<u32>().ok());
+                let stream_capture_sink = parse_pw_bool(props.get("stream.capture.sink"));
+                let stream_monitor = parse_pw_bool(props.get("stream.monitor"));
 
                 let state_node = Rc::clone(&state_add);
                 let shared_node = Arc::clone(&shared_add);
@@ -413,6 +657,41 @@ mod pw_monitor {
                                     rec.media_name = Some(m.to_owned());
                                     changed = true;
                                 }
+                                if let Some(r) = p.get("media.role")
+                                    && rec.media_role.as_deref() != Some(r)
+                                {
+                                    rec.media_role = Some(r.to_owned());
+                                    changed = true;
+                                }
+                                if let Some(n) = p.get("node.name")
+                                    && rec.node_name.as_deref() != Some(n)
+                                {
+                                    rec.node_name = Some(n.to_owned());
+                                    changed = true;
+                                }
+                                if let Some(api) = p.get("device.api")
+                                    && rec.device_api.as_deref() != Some(api)
+                                {
+                                    rec.device_api = Some(api.to_owned());
+                                    changed = true;
+                                }
+                                if let Some(t) =
+                                    p.get("target.object").or_else(|| p.get("node.target"))
+                                    && rec.target_object.as_deref() != Some(t)
+                                {
+                                    rec.target_object = Some(t.to_owned());
+                                    changed = true;
+                                }
+                                let cap_sink = parse_pw_bool(p.get("stream.capture.sink"));
+                                if cap_sink && !rec.stream_capture_sink {
+                                    rec.stream_capture_sink = true;
+                                    changed = true;
+                                }
+                                let mon = parse_pw_bool(p.get("stream.monitor"));
+                                if mon && !rec.stream_monitor {
+                                    rec.stream_monitor = true;
+                                    changed = true;
+                                }
                             }
                         }
                         if changed {
@@ -430,7 +709,11 @@ mod pw_monitor {
                         node_name,
                         media_name,
                         app_name,
+                        device_api,
+                        target_object,
                         pid,
+                        stream_capture_sink,
+                        stream_monitor,
                         running: false,
                         _node: node,
                         _listener: listener,
@@ -439,7 +722,13 @@ mod pw_monitor {
             })
             .global_remove(move |id| {
                 let mut st = state_rem.borrow_mut();
-                if st.nodes.remove(&id).is_some() {
+                let removed_node = st.nodes.remove(&id).is_some();
+                let removed_src = st.source_kinds.remove(&id).is_some();
+                let removed_link = st.links.remove(&id);
+                if removed_node
+                    || removed_src
+                    || removed_link.is_some_and(|(_, in_id)| st.nodes.contains_key(&in_id))
+                {
                     st.publish(&shared_rem);
                 }
             })
@@ -753,56 +1042,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_pipewire_mic_camera_and_screencast_accurately() {
-        let mic = classify_pipewire_node(
-            "Stream/Input/Audio",
-            Some("Communication"),
-            Some("obs-mic"),
-            None,
-            Some("OBS Studio"),
-            Some(1234),
-            true,
-        )
+    fn classifies_pipewire_mic_monitor_camera_and_screencast_accurately() {
+        // 1. Real microphone capture.
+        let mic = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Stream/Input/Audio",
+            media_role: Some("Communication"),
+            node_name: Some("obs-mic"),
+            app_name: Some("OBS Studio"),
+            pid: Some(1234),
+            is_running: true,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(mic.kind, PrivacyAccessKind::Microphone);
         assert_eq!(mic.app_name, "OBS Studio");
 
-        let screen = classify_pipewire_node(
-            "Stream/Input/Video",
-            Some("Screen"),
-            Some("xdg-desktop-portal-wlr"),
-            Some("screencast"),
-            Some("Chromium"),
-            Some(4567),
-            true,
-        )
+        // 2. Output monitor capture (like waywi-capture) with stream.capture.sink / media.role=Monitor
+        //    must classify as AudioCapture even when node_name lacks "monitor"/"loopback".
+        let waywi_mon = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Stream/Input/Audio",
+            media_role: Some("Monitor"),
+            node_name: Some("waywi-capture"),
+            app_name: Some("waywi"),
+            pid: Some(2000),
+            is_running: true,
+            stream_capture_sink: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(waywi_mon.kind, PrivacyAccessKind::AudioCapture);
+
+        // 3. Authoritative PipeWire link graph overrides misleading node names in both directions.
+        let linked_monitor = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Stream/Input/Audio",
+            node_name: Some("obs-audio"),
+            app_name: Some("OBS"),
+            is_running: true,
+            linked_from_output_monitor: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(linked_monitor.kind, PrivacyAccessKind::AudioCapture);
+
+        let linked_mic = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Stream/Input/Audio",
+            node_name: Some("studio-monitor-mic"),
+            app_name: Some("DAW"),
+            is_running: true,
+            linked_from_output_monitor: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(linked_mic.kind, PrivacyAccessKind::Microphone);
+
+        // 4. Screencast stream vs physical camera whose name happens to contain "screen".
+        let screen = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Stream/Input/Video",
+            media_role: Some("Screen"),
+            node_name: Some("xdg-desktop-portal-wlr"),
+            media_name: Some("screencast"),
+            app_name: Some("Chromium"),
+            pid: Some(4567),
+            is_running: true,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(screen.kind, PrivacyAccessKind::ScreenShare);
 
-        let cam = classify_pipewire_node(
-            "Video/Source",
-            Some("Camera"),
-            Some("v4l2_input.pci"),
-            None,
-            Some("Firefox"),
-            Some(999),
-            true,
-        )
+        let cam = classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Video/Source",
+            media_role: Some("Camera"),
+            node_name: Some("v4l2_input.pci-screencam"),
+            device_api: Some("v4l2"),
+            app_name: Some("Firefox"),
+            pid: Some(999),
+            is_running: true,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(cam.kind, PrivacyAccessKind::Camera);
 
         assert!(
-            classify_pipewire_node(
-                "Stream/Input/Audio",
-                None,
-                None,
-                None,
-                Some("IdleApp"),
-                Some(1),
-                false
-            )
+            classify_pipewire_node(PipeWireNodeProps {
+                media_class: "Stream/Input/Audio",
+                app_name: Some("IdleApp"),
+                pid: Some(1),
+                is_running: false,
+                ..Default::default()
+            })
             .is_none()
         );
+    }
+
+    #[test]
+    fn validates_alsa_and_v4l2_device_paths_strictly() {
+        assert!(is_alsa_capture_dev("/dev/snd/pcmC0D0c"));
+        assert!(is_alsa_capture_dev("/dev/snd/pcmC12D3c (deleted)"));
+        assert!(!is_alsa_capture_dev("/dev/snd/pcmC0D0p"));
+        assert!(!is_alsa_capture_dev("/dev/snd/pcmC0D0p (deleted)"));
+        assert!(!is_alsa_capture_dev("/dev/snd/pcm_custom"));
+        assert!(is_v4l2_video_dev("/dev/video0"));
+        assert!(is_v4l2_video_dev("/dev/video12 (deleted)"));
+        assert!(!is_v4l2_video_dev("/dev/video_loopback"));
     }
 
     #[cfg(unix)]

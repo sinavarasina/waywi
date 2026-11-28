@@ -8,7 +8,7 @@ use crate::image::ImageFit;
 use crate::render::backend::FrameScene;
 use crate::render::canvas::{CanvasOp, PathOp};
 use crate::render::retained::{DrawCommand, PaintPayload};
-use crate::render::style::{Color, CornerRadius};
+use crate::render::style::{BoxShadow, Color, CornerRadius, Fill};
 #[cfg(feature = "text")]
 use crate::text::TextMeasureStyle;
 #[cfg(feature = "text")]
@@ -20,6 +20,94 @@ use super::textures::GpuTextureCache;
 pub(crate) fn to_femto_color(c: Color, opacity: f32) -> FemtoColor {
     let alpha = ((f32::from(c.a) * opacity.clamp(0.0, 1.0)).round() as u32).min(255) as u8;
     FemtoColor::rgba(c.r, c.g, c.b, alpha)
+}
+
+fn build_femto_fill_paint(fill: &Fill, rect: Bounds, opacity: f32) -> Option<Paint> {
+    let mut paint = match fill {
+        Fill::Solid(c) => {
+            if c.a == 0 {
+                return None;
+            }
+            Paint::color(to_femto_color(*c, opacity))
+        }
+        Fill::Linear(g) => {
+            if !g.is_visible() {
+                return None;
+            }
+            let x0 = rect.x.0 + g.start.x.0 * rect.width.0;
+            let y0 = rect.y.0 + g.start.y.0 * rect.height.0;
+            let mut x1 = rect.x.0 + g.end.x.0 * rect.width.0;
+            let y1 = rect.y.0 + g.end.y.0 * rect.height.0;
+            if (x1 - x0).abs() < 1e-4 && (y1 - y0).abs() < 1e-4 {
+                x1 += 1.0;
+            }
+            let mut stops: Vec<(f32, FemtoColor)> = g
+                .stops
+                .iter()
+                .map(|s| (s.offset.clamp(0.0, 1.0), to_femto_color(s.color, opacity)))
+                .collect();
+            stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+            Paint::linear_gradient_stops(x0, y0, x1, y1, stops)
+        }
+        Fill::Radial(g) => {
+            if !g.is_visible() {
+                return None;
+            }
+            let cx = rect.x.0 + g.center.x.0 * rect.width.0;
+            let cy = rect.y.0 + g.center.y.0 * rect.height.0;
+            let radius = (g.radius * rect.width.0.max(rect.height.0)).max(0.5);
+            let mut stops: Vec<(f32, FemtoColor)> = g
+                .stops
+                .iter()
+                .map(|s| (s.offset.clamp(0.0, 1.0), to_femto_color(s.color, opacity)))
+                .collect();
+            stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+            Paint::radial_gradient_stops(cx, cy, 0.0, radius, stops)
+        }
+    };
+    paint.set_anti_alias(true);
+    Some(paint)
+}
+
+fn draw_femto_box_shadow(
+    canvas: &mut Canvas<WGPURenderer>,
+    rect: Bounds,
+    corner_radius: CornerRadius,
+    shadow: BoxShadow,
+    opacity: f32,
+) {
+    let inner = to_femto_color(shadow.color, opacity);
+    if inner.a <= 0.0 {
+        return;
+    }
+    let spread = shadow.spread.0;
+    let blur = shadow.blur_radius.0.max(0.0);
+    let sx = rect.x.0 + shadow.offset_x.0 - spread;
+    let sy = rect.y.0 + shadow.offset_y.0 - spread;
+    let sw = (rect.width.0 + spread * 2.0).max(0.0);
+    let sh = (rect.height.0 + spread * 2.0).max(0.0);
+    if sw <= 0.0 || sh <= 0.0 {
+        return;
+    }
+    let [tl, tr, br, bl] = corner_radius.clamped(rect.width.0, rect.height.0, 1.0);
+    let uniform_r = (tl.max(tr).max(br).max(bl) + spread).max(0.0);
+    if blur <= 0.5 {
+        let p = build_rounded_rect(
+            Bounds::new(LogicalPx(sx), LogicalPx(sy), LogicalPx(sw), LogicalPx(sh)),
+            CornerRadius::all(LogicalPx(uniform_r)),
+        );
+        let mut paint = Paint::color(inner);
+        paint.set_anti_alias(true);
+        canvas.fill_path(&p, &paint);
+        return;
+    }
+    let feather = (blur * 2.0).max(1.0);
+    let outer = FemtoColor::rgba(shadow.color.r, shadow.color.g, shadow.color.b, 0);
+    let mut path = Path::new();
+    path.rect(sx - blur, sy - blur, sw + blur * 2.0, sh + blur * 2.0);
+    let mut paint = Paint::box_gradient(sx, sy, sw, sh, uniform_r, feather, inner, outer);
+    paint.set_anti_alias(true);
+    canvas.fill_path(&path, &paint);
 }
 
 #[inline]
@@ -62,6 +150,7 @@ pub(crate) fn encode_commands(
                 fill,
                 corner_radius,
                 border,
+                shadow,
             } => {
                 let r = cmd.local_rect;
                 if r.width.0 <= 0.0 || r.height.0 <= 0.0 {
@@ -71,10 +160,14 @@ pub(crate) fn encode_commands(
                 canvas.reset_transform();
                 canvas.set_transform(&to_femto_transform(cmd.affine, scale_f));
 
-                if fill.a > 0 {
+                if let Some(sh) = shadow
+                    && sh.is_visible()
+                {
+                    draw_femto_box_shadow(canvas, r, *corner_radius, *sh, cmd.opacity);
+                }
+
+                if let Some(paint) = build_femto_fill_paint(fill, r, cmd.opacity) {
                     let path = build_rounded_rect(r, *corner_radius);
-                    let mut paint = Paint::color(to_femto_color(*fill, cmd.opacity));
-                    paint.set_anti_alias(true);
                     canvas.fill_path(&path, &paint);
                 }
 
@@ -132,12 +225,15 @@ pub(crate) fn encode_commands(
             }
             PaintPayload::Text {
                 content,
+                spans,
                 font_size,
                 line_height_multiplier,
                 color,
                 font,
                 align,
                 bounds_mode,
+                overflow,
+                max_lines,
                 wrap_to_width,
             } => {
                 #[cfg(feature = "text")]
@@ -154,6 +250,9 @@ pub(crate) fn encode_commands(
                             font,
                             align: *align,
                             bounds_mode: *bounds_mode,
+                            overflow: *overflow,
+                            max_lines: *max_lines,
+                            spans: spans.as_deref(),
                         },
                         wrap_to_width: *wrap_to_width,
                         scale,
@@ -183,12 +282,15 @@ pub(crate) fn encode_commands(
                 {
                     let _ = (
                         content,
+                        spans,
                         font_size,
                         line_height_multiplier,
                         color,
                         font,
                         align,
                         bounds_mode,
+                        overflow,
+                        max_lines,
                         wrap_to_width,
                     );
                 }
@@ -304,18 +406,18 @@ fn replay_canvas_ops(
                 let paint = Paint::color(to_femto_color(*c, opacity));
                 canvas.fill_path(&p, &paint);
             }
-            CanvasOp::FillRect(r, c) => {
-                let mut p = Path::new();
-                p.rect(r.x.0, r.y.0, r.width.0, r.height.0);
-                let mut paint = Paint::color(to_femto_color(*c, opacity));
-                paint.set_anti_alias(true);
-                canvas.fill_path(&p, &paint);
+            CanvasOp::FillRect(r, fill) => {
+                if let Some(paint) = build_femto_fill_paint(fill, *r, opacity) {
+                    let mut p = Path::new();
+                    p.rect(r.x.0, r.y.0, r.width.0, r.height.0);
+                    canvas.fill_path(&p, &paint);
+                }
             }
-            CanvasOp::FillRoundedRect(r, rad, c) => {
-                let p = build_rounded_rect(*r, *rad);
-                let mut paint = Paint::color(to_femto_color(*c, opacity));
-                paint.set_anti_alias(true);
-                canvas.fill_path(&p, &paint);
+            CanvasOp::FillRoundedRect(r, rad, fill) => {
+                if let Some(paint) = build_femto_fill_paint(fill, *r, opacity) {
+                    let p = build_rounded_rect(*r, *rad);
+                    canvas.fill_path(&p, &paint);
+                }
             }
             CanvasOp::StrokeRect(r, width, c) => {
                 let mut p = Path::new();
@@ -325,12 +427,19 @@ fn replay_canvas_ops(
                 paint.set_line_width(width.0.max(0.5 / scale_f));
                 canvas.stroke_path(&p, &paint);
             }
-            CanvasOp::FillCircle(cx, cy, rad, c) => {
-                let mut p = Path::new();
-                p.circle(cx.0, cy.0, rad.0.max(0.1));
-                let mut paint = Paint::color(to_femto_color(*c, opacity));
-                paint.set_anti_alias(true);
-                canvas.fill_path(&p, &paint);
+            CanvasOp::FillCircle(cx, cy, rad, fill) => {
+                let r = rad.0.max(0.1);
+                let circle_bounds = Bounds::new(
+                    LogicalPx(cx.0 - r),
+                    LogicalPx(cy.0 - r),
+                    LogicalPx(r * 2.0),
+                    LogicalPx(r * 2.0),
+                );
+                if let Some(paint) = build_femto_fill_paint(fill, circle_bounds, opacity) {
+                    let mut p = Path::new();
+                    p.circle(cx.0, cy.0, r);
+                    canvas.fill_path(&p, &paint);
+                }
             }
             CanvasOp::StrokeLine(x1, y1, x2, y2, width, c) => {
                 let mut p = Path::new();
@@ -341,11 +450,17 @@ fn replay_canvas_ops(
                 paint.set_line_width(width.0.max(0.5 / scale_f));
                 canvas.stroke_path(&p, &paint);
             }
-            CanvasOp::FillPath(path_ops, c) => {
-                let p = build_path_ops(path_ops);
-                let mut paint = Paint::color(to_femto_color(*c, opacity));
-                paint.set_anti_alias(true);
-                canvas.fill_path(&p, &paint);
+            CanvasOp::FillPath(path_ops, fill) => {
+                let canvas_bounds = Bounds::new(
+                    LogicalPx::ZERO,
+                    LogicalPx::ZERO,
+                    bounds.width,
+                    bounds.height,
+                );
+                if let Some(paint) = build_femto_fill_paint(fill, canvas_bounds, opacity) {
+                    let p = build_path_ops(path_ops);
+                    canvas.fill_path(&p, &paint);
+                }
             }
             CanvasOp::StrokePath(path_ops, width, c) => {
                 let p = build_path_ops(path_ops);

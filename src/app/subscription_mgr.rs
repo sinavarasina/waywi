@@ -2,32 +2,45 @@ use std::cell::RefCell;
 #[cfg(any(
     feature = "dbus",
     feature = "control-ipc",
-    feature = "global-shortcuts"
+    feature = "global-shortcuts",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
 ))]
 use std::collections::HashMap;
 #[cfg(any(
     feature = "dbus",
     feature = "global-shortcuts",
-    feature = "control-ipc"
+    feature = "control-ipc",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
 ))]
 use std::collections::HashSet;
 use std::collections::VecDeque;
-#[cfg(any(
-    feature = "hyprland-ipc",
-    feature = "sway-ipc",
-    feature = "control-ipc"
-))]
 use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 use std::sync::Arc;
 
 use calloop::LoopHandle;
-#[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc", feature = "dbus"))]
+#[cfg(any(
+    feature = "hyprland-ipc",
+    feature = "sway-ipc",
+    feature = "dbus",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
 use calloop::channel as calloop_channel;
 
 use crate::arena::FrameSharedFn;
-#[cfg(feature = "global-shortcuts")]
+#[cfg(any(
+    feature = "global-shortcuts",
+    feature = "pipewire",
+    feature = "pulseaudio",
+    feature = "alsa"
+))]
 use crate::subscription::SubscriptionKey;
 use crate::subscription::{SubscriptionSpec, Subscriptions};
 use crate::wayland::WaylandState;
@@ -172,6 +185,14 @@ impl<Ev, W, M> BroadcastSlot<Ev, W, M> {
     }
 }
 
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+struct AudioCaptureWorkerEntry {
+    target: crate::audio::AudioCaptureTarget,
+    cfg_key: (u32, u16, usize, std::time::Duration, bool, u32),
+    worker: crate::audio::capture::AudioCaptureWorker,
+    token: calloop::RegistrationToken,
+}
+
 #[cfg(feature = "dbus")]
 pub(crate) type DbusSignalKey = (crate::dbus::DbusBus, String, String, Option<String>);
 #[cfg(feature = "dbus")]
@@ -202,6 +223,9 @@ pub(crate) struct SubscriptionClients<'a> {
 
 pub(crate) struct LoopInbox<M> {
     pub(crate) messages: VecDeque<M>,
+    pub(crate) file_watch_events: VecDeque<crate::system::FileWatchEvent>,
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    pub(crate) audio_capture_frames: VecDeque<(SubscriptionKey, crate::audio::AudioCaptureFrame)>,
     #[cfg(feature = "hyprland-ipc")]
     pub(crate) hyprland_events: VecDeque<crate::compositor::hyprland::HyprlandEvent>,
     #[cfg(feature = "sway-ipc")]
@@ -221,6 +245,9 @@ impl<M> Default for LoopInbox<M> {
     fn default() -> Self {
         Self {
             messages: VecDeque::new(),
+            file_watch_events: VecDeque::new(),
+            #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+            audio_capture_frames: VecDeque::new(),
             #[cfg(feature = "hyprland-ipc")]
             hyprland_events: VecDeque::new(),
             #[cfg(feature = "sway-ipc")]
@@ -240,6 +267,11 @@ impl<M> Default for LoopInbox<M> {
 pub(crate) struct SubscriptionManager<M> {
     pub(crate) animation_frame_subs: Vec<FrameSharedFn<std::time::Instant, M>>,
     pub(crate) keyboard_layout_subs: Vec<FrameSharedFn<crate::input::KeyboardLayoutInfo, M>>,
+    pub(crate) file_watch_subs: Vec<(
+        Vec<PathBuf>,
+        FrameSharedFn<crate::system::FileWatchEvent, M>,
+    )>,
+    file_watcher: Option<crate::system::watch::InotifyRegistration>,
     #[cfg(feature = "session-lock")]
     pub(crate) session_lock_subs: Vec<FrameSharedFn<crate::wayland_ext::SessionLockEvent, M>>,
     #[cfg(feature = "foreign-toplevel")]
@@ -264,6 +296,15 @@ pub(crate) struct SubscriptionManager<M> {
     pub(crate) audio_snapshot_subs: Vec<FrameSharedFn<Arc<crate::audio::AudioSnapshot>, M>>,
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     pub(crate) audio_event_subs: Vec<FrameSharedFn<crate::audio::AudioEvent, M>>,
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    pub(crate) audio_capture_subs: Vec<(
+        SubscriptionKey,
+        crate::audio::AudioCaptureTarget,
+        crate::audio::AudioCaptureConfig,
+        FrameSharedFn<crate::audio::AudioCaptureFrame, M>,
+    )>,
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    audio_capture_workers: HashMap<SubscriptionKey, AudioCaptureWorkerEntry>,
 
     #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
     pub(crate) compositor_subs: Vec<FrameSharedFn<crate::compositor::CompositorEvent, M>>,
@@ -403,6 +444,8 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
         Self {
             animation_frame_subs: Vec::new(),
             keyboard_layout_subs: Vec::new(),
+            file_watch_subs: Vec::new(),
+            file_watcher: None,
             #[cfg(feature = "session-lock")]
             session_lock_subs: Vec::new(),
             #[cfg(feature = "foreign-toplevel")]
@@ -419,6 +462,10 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             audio_snapshot_subs: Vec::new(),
             #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
             audio_event_subs: Vec::new(),
+            #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+            audio_capture_subs: Vec::new(),
+            #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+            audio_capture_workers: HashMap::new(),
             #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
             compositor_subs: Vec::new(),
             #[cfg(feature = "hyprland-ipc")]
@@ -527,6 +574,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
 
         self.animation_frame_subs.clear();
         self.keyboard_layout_subs.clear();
+        self.file_watch_subs.clear();
         #[cfg(feature = "session-lock")]
         self.session_lock_subs.clear();
         #[cfg(feature = "foreign-toplevel")]
@@ -544,6 +592,7 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
         {
             self.audio_snapshot_subs.clear();
             self.audio_event_subs.clear();
+            self.audio_capture_subs.clear();
         }
         #[cfg(any(feature = "hyprland-ipc", feature = "sway-ipc"))]
         self.compositor_subs.clear();
@@ -600,6 +649,9 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 SubscriptionSpec::KeyboardLayout { map } => {
                     self.keyboard_layout_subs.push(map.clone());
                 }
+                SubscriptionSpec::FileWatch { paths, map, .. } => {
+                    self.file_watch_subs.push((paths.clone(), map.clone()));
+                }
                 #[cfg(feature = "session-lock")]
                 SubscriptionSpec::SessionLock { map } => {
                     self.session_lock_subs.push(map.clone());
@@ -635,6 +687,16 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
                 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
                 SubscriptionSpec::AudioEvent { map } => {
                     self.audio_event_subs.push(map.clone());
+                }
+                #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+                SubscriptionSpec::AudioCapture {
+                    key,
+                    target,
+                    config,
+                    map,
+                } => {
+                    self.audio_capture_subs
+                        .push((*key, target.clone(), *config, map.clone()));
                 }
                 #[cfg(feature = "hyprland-ipc")]
                 SubscriptionSpec::HyprlandEvent { map } => {
@@ -817,6 +879,69 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             } else {
                 audio_client.stop_if_idle();
             }
+
+            let desired: HashSet<SubscriptionKey> = self
+                .audio_capture_subs
+                .iter()
+                .map(|(k, _, _, _)| *k)
+                .collect();
+            let existing: Vec<SubscriptionKey> =
+                self.audio_capture_workers.keys().copied().collect();
+            for key in existing {
+                if !desired.contains(&key)
+                    && let Some(entry) = self.audio_capture_workers.remove(&key)
+                {
+                    drop(entry.worker);
+                    loop_handle.remove(entry.token);
+                }
+            }
+            for (key, target, config, _) in &self.audio_capture_subs {
+                let cfg_key = config.eq_key();
+                let needs_restart = self
+                    .audio_capture_workers
+                    .get(key)
+                    .is_some_and(|entry| entry.target != *target || entry.cfg_key != cfg_key);
+                if needs_restart && let Some(entry) = self.audio_capture_workers.remove(key) {
+                    drop(entry.worker);
+                    loop_handle.remove(entry.token);
+                }
+                if !self.audio_capture_workers.contains_key(key) {
+                    let (tx, rx) = calloop_channel::channel();
+                    let inbox_cl = Rc::clone(inbox);
+                    let k_for_cb = *key;
+                    if let Ok(token) = loop_handle.insert_source(rx, move |evt, _, _| {
+                        if let calloop_channel::Event::Msg(frame) = evt {
+                            let mut guard = inbox_cl.borrow_mut();
+                            // Coalesce stale buffered capture frames for the same key so UI
+                            // always sees the latest audio meter/spectrum without falling behind.
+                            if let Some(pos) = guard
+                                .audio_capture_frames
+                                .iter()
+                                .position(|(k, _)| *k == k_for_cb)
+                            {
+                                guard.audio_capture_frames[pos].1 = frame;
+                            } else {
+                                guard.audio_capture_frames.push_back((k_for_cb, frame));
+                            }
+                        }
+                    }) {
+                        let worker = crate::audio::capture::AudioCaptureWorker::spawn(
+                            target.clone(),
+                            *config,
+                            tx,
+                        );
+                        self.audio_capture_workers.insert(
+                            *key,
+                            AudioCaptureWorkerEntry {
+                                target: target.clone(),
+                                cfg_key,
+                                worker,
+                                token,
+                            },
+                        );
+                    }
+                }
+            }
         }
 
         #[cfg(feature = "hyprland-ipc")]
@@ -927,8 +1052,44 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
             }
         }
 
+        self.sync_file_watch(loop_handle, inbox);
+
         #[cfg(feature = "control-ipc")]
         self.sync_control(loop_handle, inbox);
+    }
+
+    fn sync_file_watch(
+        &mut self,
+        loop_handle: &LoopHandle<'static, WaylandState>,
+        inbox: &Rc<RefCell<LoopInbox<M>>>,
+    ) {
+        if self.file_watch_subs.is_empty() {
+            if let Some(reg) = self.file_watcher.take() {
+                reg.remove(loop_handle);
+            }
+            return;
+        }
+        let mut all_paths: Vec<PathBuf> = Vec::new();
+        for (paths, _) in &self.file_watch_subs {
+            for p in paths {
+                if !all_paths.contains(p) {
+                    all_paths.push(p.clone());
+                }
+            }
+        }
+        if self.file_watcher.is_none() {
+            let inbox_cl = Rc::clone(inbox);
+            if let Ok(reg) =
+                crate::system::watch::InotifyRegistration::register(loop_handle, move |events| {
+                    inbox_cl.borrow_mut().file_watch_events.extend(events);
+                })
+            {
+                self.file_watcher = Some(reg);
+            }
+        }
+        if let Some(reg) = &self.file_watcher {
+            reg.sync_paths(&all_paths);
+        }
     }
 
     #[cfg(feature = "dbus")]
@@ -1462,7 +1623,16 @@ impl<M: Clone + 'static> SubscriptionManager<M> {
     }
 
     pub(crate) fn cleanup(&mut self, loop_handle: &LoopHandle<'static, WaylandState>) {
-        let _ = loop_handle;
+        if let Some(reg) = self.file_watcher.take() {
+            reg.remove(loop_handle);
+        }
+        #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+        {
+            for (_, entry) in self.audio_capture_workers.drain() {
+                drop(entry.worker);
+                loop_handle.remove(entry.token);
+            }
+        }
         #[cfg(feature = "hyprland-ipc")]
         if let Some((_, handle, token)) = self.hyprland_listener.take() {
             drop(handle);

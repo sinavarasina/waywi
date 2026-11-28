@@ -1,7 +1,7 @@
 use crate::accessibility::AccessibleProps;
 use crate::animation::TransitionSpec;
 use crate::arena::FrameSharedFn;
-use crate::geometry::{ElementAnchor, Position, Size, Transform};
+use crate::geometry::{ElementAnchor, LogicalPx, Position, Size, Transform};
 
 use super::cursor::CursorShape;
 use super::events::EventHandlers;
@@ -13,6 +13,11 @@ pub(crate) struct CommonProps<M> {
     pub(crate) key: Option<ElementKey>,
     pub(crate) position: Position,
     pub(crate) size: Size,
+    pub(crate) min_width: Option<LogicalPx>,
+    pub(crate) max_width: Option<LogicalPx>,
+    pub(crate) min_height: Option<LogicalPx>,
+    pub(crate) max_height: Option<LogicalPx>,
+    pub(crate) flex: f32,
     pub(crate) anchor: ElementAnchor,
     pub(crate) visible: bool,
     pub(crate) opacity: f32,
@@ -32,6 +37,11 @@ impl<M> Default for CommonProps<M> {
             key: None,
             position: Position::Auto,
             size: Size::auto(),
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
+            flex: 0.0,
             anchor: ElementAnchor::TopLeft,
             visible: true,
             opacity: 1.0,
@@ -61,6 +71,11 @@ impl<M: 'static> CommonProps<M> {
             key: self.key,
             position: self.position,
             size: self.size,
+            min_width: self.min_width,
+            max_width: self.max_width,
+            min_height: self.min_height,
+            max_height: self.max_height,
+            flex: self.flex,
             anchor: self.anchor,
             visible: self.visible,
             opacity: self.opacity,
@@ -150,6 +165,55 @@ macro_rules! impl_common_builders {
 
         pub fn size(mut self, size: impl Into<$crate::geometry::Size>) -> Self {
             self.common.size = size.into();
+            self
+        }
+
+        /// Sets the proportional flex weight along the parent [`Row`](crate::render::Row) or
+        /// [`Column`](crate::render::Column) main axis (`0.0` = non-flexible default).
+        pub fn flex(mut self, weight: f32) -> Self {
+            self.common.flex = if weight.is_finite() {
+                weight.max(0.0)
+            } else {
+                0.0
+            };
+            self
+        }
+
+        /// Sets a minimum width constraint in logical pixels.
+        pub fn min_width(mut self, width: $crate::geometry::LogicalPx) -> Self {
+            self.common.min_width = Some(width.max($crate::geometry::LogicalPx::ZERO));
+            self
+        }
+
+        /// Sets a maximum width constraint in logical pixels.
+        pub fn max_width(mut self, width: $crate::geometry::LogicalPx) -> Self {
+            self.common.max_width = Some(width.max($crate::geometry::LogicalPx::ZERO));
+            self
+        }
+
+        /// Sets a minimum height constraint in logical pixels.
+        pub fn min_height(mut self, height: $crate::geometry::LogicalPx) -> Self {
+            self.common.min_height = Some(height.max($crate::geometry::LogicalPx::ZERO));
+            self
+        }
+
+        /// Sets a maximum height constraint in logical pixels.
+        pub fn max_height(mut self, height: $crate::geometry::LogicalPx) -> Self {
+            self.common.max_height = Some(height.max($crate::geometry::LogicalPx::ZERO));
+            self
+        }
+
+        /// Sets minimum `(width, height)` constraints in logical pixels.
+        pub fn min_size(mut self, size: $crate::geometry::LogicalSize) -> Self {
+            self.common.min_width = Some(size.width.max($crate::geometry::LogicalPx::ZERO));
+            self.common.min_height = Some(size.height.max($crate::geometry::LogicalPx::ZERO));
+            self
+        }
+
+        /// Sets maximum `(width, height)` constraints in logical pixels.
+        pub fn max_size(mut self, size: $crate::geometry::LogicalSize) -> Self {
+            self.common.max_width = Some(size.width.max($crate::geometry::LogicalPx::ZERO));
+            self.common.max_height = Some(size.height.max($crate::geometry::LogicalPx::ZERO));
             self
         }
 

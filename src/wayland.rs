@@ -1,5 +1,9 @@
+#[cfg(feature = "background-effect")]
+pub(crate) mod background_effect;
 #[cfg(feature = "clipboard")]
 pub(crate) mod clipboard;
+#[cfg(feature = "color-management")]
+pub(crate) mod color_management;
 pub(crate) mod connection;
 #[cfg(feature = "cursor-shape")]
 pub(crate) mod cursor_shape;
@@ -9,6 +13,8 @@ pub(crate) mod dnd;
 pub(crate) mod ext_workspace;
 #[cfg(feature = "foreign-toplevel")]
 pub(crate) mod foreign_toplevel;
+#[cfg(feature = "gamma-control")]
+pub(crate) mod gamma_control;
 #[cfg(feature = "idle-notify")]
 pub(crate) mod idle;
 #[cfg(feature = "idle-inhibit")]
@@ -30,6 +36,8 @@ pub(crate) mod shm_pool;
 pub(crate) mod surface_state;
 #[cfg(feature = "tablet")]
 pub(crate) mod tablet;
+#[cfg(feature = "toplevel-icon")]
+pub(crate) mod toplevel_icon;
 #[cfg(feature = "virtual-keyboard")]
 pub(crate) mod virtual_keyboard;
 pub(crate) mod xdg_shell;

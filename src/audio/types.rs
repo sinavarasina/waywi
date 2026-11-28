@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::arena::FrameSharedFn;
-use crate::subscription::{Subscription, SubscriptionSpec};
+use crate::subscription::{IntoSubscriptionKey, Subscription, SubscriptionSpec};
+
+use super::capture::{AudioCaptureConfig, AudioCaptureFrame, AudioCaptureTarget};
 
 /// Signal flow direction for an audio device, stream, or default-device query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -755,6 +757,28 @@ impl Audio {
     pub fn events<M: 'static>(map: impl Fn(AudioEvent) -> M + 'static) -> Subscription<M> {
         Subscription {
             spec: SubscriptionSpec::AudioEvent {
+                map: FrameSharedFn::new(map),
+            },
+        }
+    }
+
+    /// Subscribes to a live audio capture or output-monitor stream producing VU peak/RMS levels
+    /// and optional raw interleaved `f32` PCM samples.
+    ///
+    /// The capture stream is opened on demand while subscribed, suppresses wakeups completely
+    /// during sustained silence, and tears down cleanly when unsubscribed. Higher-level DSP (such
+    /// as FFT spectrum analysis) is left to the application.
+    pub fn capture<M: 'static>(
+        key: impl IntoSubscriptionKey,
+        target: AudioCaptureTarget,
+        config: AudioCaptureConfig,
+        map: impl Fn(AudioCaptureFrame) -> M + 'static,
+    ) -> Subscription<M> {
+        Subscription {
+            spec: SubscriptionSpec::AudioCapture {
+                key: key.into_subscription_key(),
+                target,
+                config: config.normalized(),
                 map: FrameSharedFn::new(map),
             },
         }

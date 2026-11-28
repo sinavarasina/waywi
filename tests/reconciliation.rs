@@ -2294,3 +2294,258 @@ fn headless_records_protocol_actions_and_defaults_window_decoration_to_server() 
         }]
     );
 }
+
+#[test]
+fn flex_justify_and_min_max_layout_positions_children_accurately() {
+    #[derive(Default)]
+    struct LayoutState {
+        clicked: Vec<&'static str>,
+    }
+    #[derive(Clone)]
+    enum LayoutMsg {
+        Hit(&'static str),
+    }
+    struct LayoutApp;
+    impl Application for LayoutApp {
+        type State = LayoutState;
+        type Message = LayoutMsg;
+
+        fn init(_ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            Ok(LayoutState::default())
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                LayoutMsg::Hit(tag) => state.clicked.push(tag),
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            // Surface 1: Row with Justify::SpaceBetween (300px wide, 3x 30px items -> x=0, x=135, x=270).
+            s.push(
+                Surface::floating("bar", Output::Primary)
+                    .size((300.logical_px(), 40.logical_px()))
+                    .child(
+                        Row::new()
+                            .size((300.logical_px(), 40.logical_px()))
+                            .justify(Justify::SpaceBetween)
+                            .child(
+                                Rect::new()
+                                    .size((30.logical_px(), 40.logical_px()))
+                                    .fill(Color::RED)
+                                    .on_click(LayoutMsg::Hit("left")),
+                            )
+                            .child(
+                                Rect::new()
+                                    .size((30.logical_px(), 40.logical_px()))
+                                    .fill(Color::GREEN)
+                                    .on_click(LayoutMsg::Hit("center")),
+                            )
+                            .child(
+                                Rect::new()
+                                    .size((30.logical_px(), 40.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_click(LayoutMsg::Hit("right")),
+                            ),
+                    ),
+            );
+            // Surface 2: Row with flex weights + min/max clamps (300px wide):
+            // Fixed 40px + flex(1.0) max_width(60px) + flex(2.0) -> shares remaining 260px:
+            // flex(1) gets 86.67 clamped to 60px -> [40..100], flex(2) gets 173.33 -> [100..273.33].
+            s.push(
+                Surface::floating("flex", Output::Primary)
+                    .size((300.logical_px(), 40.logical_px()))
+                    .child(
+                        Row::new()
+                            .size((300.logical_px(), 40.logical_px()))
+                            .child(
+                                Rect::new()
+                                    .size((40.logical_px(), 40.logical_px()))
+                                    .fill(Color::RED)
+                                    .on_click(LayoutMsg::Hit("fixed")),
+                            )
+                            .child(
+                                Rect::new()
+                                    .flex(1.0)
+                                    .max_width(60.logical_px())
+                                    .size((Length::Auto, 40.logical_px()))
+                                    .fill(Color::GREEN)
+                                    .on_click(LayoutMsg::Hit("f1")),
+                            )
+                            .child(
+                                Rect::new()
+                                    .flex(2.0)
+                                    .min_width(120.logical_px())
+                                    .size((Length::Auto, 40.logical_px()))
+                                    .fill(Color::BLUE)
+                                    .on_click(LayoutMsg::Hit("f2")),
+                            ),
+                    ),
+            );
+            s
+        }
+    }
+
+    let mut rt = HeadlessRuntime::<LayoutApp>::new(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+    )
+    .unwrap();
+    rt.step().unwrap();
+
+    // SpaceBetween positions: left=[0..30], center=[135..165], right=[270..300].
+    assert!(rt.click_surface_point("bar", 10.0, 20.0));
+    assert!(!rt.click_surface_point("bar", 80.0, 20.0));
+    assert!(rt.click_surface_point("bar", 150.0, 20.0));
+    assert!(!rt.click_surface_point("bar", 220.0, 20.0));
+    assert!(rt.click_surface_point("bar", 285.0, 20.0));
+
+    // Flex positions: fixed=[0..40], f1=[40..100] (clamped by max_width=60), f2=[100..273].
+    assert!(rt.click_surface_point("flex", 20.0, 20.0));
+    assert!(rt.click_surface_point("flex", 70.0, 20.0));
+    assert!(rt.click_surface_point("flex", 150.0, 20.0));
+    rt.step().unwrap();
+
+    assert_eq!(
+        rt.state().clicked,
+        vec!["left", "center", "right", "fixed", "f1", "f2"]
+    );
+}
+
+#[test]
+fn spawn_blocking_new_surface_protocols_and_gamma_actions_headless() {
+    use waywi::app::headless::HeadlessGammaAction;
+
+    struct ProtoState {
+        computed: Option<u64>,
+        #[cfg(feature = "text")]
+        sel_rects: usize,
+        #[cfg(feature = "text")]
+        hit_byte: usize,
+    }
+    #[derive(Clone)]
+    enum ProtoMsg {
+        RunTask,
+        TaskDone(u64),
+        SetGamma,
+    }
+    struct ProtoApp;
+    impl Application for ProtoApp {
+        type State = ProtoState;
+        type Message = ProtoMsg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            #[cfg(feature = "text")]
+            let (sel_rects, hit_byte) = {
+                let mut input = TextInputState::with_text("Hello WayWi");
+                input.select_all();
+                input.delete_selection();
+                assert_eq!(input.text(), "");
+                input.set_text("Hello WayWi");
+                let opts = TextLayoutOptions::default();
+                let sel = ctx.measure_text_selection("Hello WayWi", &opts, 0, 5);
+                let byte = ctx.hit_test_text_byte(
+                    "Hello WayWi",
+                    &opts,
+                    Point::new(LogicalPx(1000.0), LogicalPx(4.0)),
+                );
+                (sel.rects.len(), byte)
+            };
+            #[cfg(not(feature = "text"))]
+            let _ = ctx;
+            Ok(ProtoState {
+                computed: None,
+                #[cfg(feature = "text")]
+                sel_rects,
+                #[cfg(feature = "text")]
+                hit_byte,
+            })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                ProtoMsg::RunTask => {
+                    ctx.spawn_blocking(|| 21u64 * 2, ProtoMsg::TaskDone);
+                }
+                ProtoMsg::TaskDone(v) => {
+                    state.computed = Some(v);
+                }
+                ProtoMsg::SetGamma => {
+                    ctx.set_output_color_temperature(Output::Primary, 3500, 0.9)?;
+                    ctx.set_output_gamma(Output::Primary, GammaRamp::identity(128))?;
+                    ctx.reset_output_gamma(Output::Primary)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn view(_state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("modern")
+                    .size((240.logical_px(), 120.logical_px()))
+                    .background_blur(true)
+                    .window_icon_name("org.waywi.modern")
+                    .color_space(ColorSpace::DisplayP3),
+            );
+            s
+        }
+    }
+
+    let mut caps = Capabilities::from_compile_features();
+    caps.set(Capability::GammaControl, true);
+    let mut rt = HeadlessRuntime::<ProtoApp>::new(caps, vec![OutputInfo::default()]).unwrap();
+
+    assert_eq!(
+        rt.surface_background_blur("modern"),
+        Some(BackgroundBlur::Full)
+    );
+    assert_eq!(
+        rt.surface_window_icon("modern"),
+        Some(&WindowIcon::Name(SharedStr::from("org.waywi.modern")))
+    );
+    assert_eq!(
+        rt.surface_color_space("modern"),
+        Some(ColorSpace::DisplayP3)
+    );
+
+    #[cfg(feature = "text")]
+    {
+        assert!(rt.state().sel_rects >= 1);
+        assert_eq!(rt.state().hit_byte, "Hello WayWi".len());
+    }
+
+    rt.enqueue(ProtoMsg::RunTask);
+    rt.enqueue(ProtoMsg::SetGamma);
+    rt.step().unwrap();
+    // Inline blocking task delivers deterministically without sleeping.
+    rt.step().unwrap();
+    assert_eq!(rt.state().computed, Some(42));
+    assert_eq!(
+        rt.recorded_gamma_actions(),
+        &[
+            HeadlessGammaAction::SetTemperature {
+                output: Output::Primary,
+                kelvin: 3500,
+                brightness: 0.9,
+            },
+            HeadlessGammaAction::SetRamp {
+                output: Output::Primary,
+                ramp: GammaRamp::identity(128),
+            },
+            HeadlessGammaAction::Reset {
+                output: Output::Primary,
+            },
+        ]
+    );
+}

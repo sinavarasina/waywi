@@ -1,6 +1,7 @@
 //! Bounded image loading, format sniffing, and per-format decoder dispatch.
 
 mod gif;
+mod jpeg;
 mod png;
 mod svg;
 mod webp;
@@ -41,6 +42,9 @@ pub(crate) fn detect_format(bytes: &[u8], path: Option<&Path>) -> Result<ImageFo
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Ok(ImageFormat::Png);
     }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Ok(ImageFormat::Jpeg);
+    }
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return Ok(ImageFormat::Gif);
     }
@@ -62,6 +66,7 @@ pub(crate) fn detect_format(bytes: &[u8], path: Option<&Path>) -> Result<ImageFo
     if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
         match ext.to_ascii_lowercase().as_str() {
             "png" => return Ok(ImageFormat::Png),
+            "jpg" | "jpeg" => return Ok(ImageFormat::Jpeg),
             "svg" | "svgz" => return Ok(ImageFormat::Svg),
             "gif" => return Ok(ImageFormat::Gif),
             "webp" => return Ok(ImageFormat::Webp),
@@ -107,6 +112,7 @@ pub(crate) fn decode_image_bytes_sized(
 ) -> Result<DecodedImage> {
     match format {
         ImageFormat::Png => png::decode(bytes, revision),
+        ImageFormat::Jpeg => jpeg::decode(bytes, revision),
         ImageFormat::Svg => svg::decode_min_size(bytes, min_svg_px, revision),
         ImageFormat::Gif => gif::decode(bytes, revision),
         ImageFormat::Webp => webp::decode(bytes, revision),
@@ -114,7 +120,7 @@ pub(crate) fn decode_image_bytes_sized(
 }
 
 /// Converts packed straight RGBA8 or RGB8 rows into premultiplied RGBA8 pixels.
-#[cfg(feature = "image-webp")]
+#[cfg(any(feature = "image-webp", feature = "image-jpeg"))]
 pub(crate) fn premultiply_rgb_or_rgba(
     src: &[u8],
     width: u32,

@@ -10,7 +10,8 @@ use crate::sprite::{SpriteSheet, SpriteSourceState, SpriteTimeline};
 
 use super::super::diff::Reconciler;
 use super::super::layout::{
-    LayoutFlow, element_kind_tag, measure_element_intrinsic, resolve_length,
+    LayoutFlow, clamp_dimension, element_kind_tag, measure_element_intrinsic,
+    resolve_clamped_length,
 };
 use super::{FlowLayout, ParentScope, TreePass};
 
@@ -63,15 +64,25 @@ fn compute_node_bounds_and_transform<M: 'static, R: RenderBackend>(
     surface_size: LogicalSize,
     flow: FlowLayout,
     cursor_main: &mut LogicalPx,
+    main_override: Option<LogicalPx>,
     pass: &mut TreePass<'_, R>,
 ) -> (Bounds, Transform) {
     let common = el.common().expect("non-memo element has common props");
+    let measure_parent = match (flow.flow, main_override) {
+        (LayoutFlow::Row, Some(w)) => {
+            Bounds::new(parent_rect.x, parent_rect.y, w, parent_rect.height)
+        }
+        (LayoutFlow::Column, Some(h)) => {
+            Bounds::new(parent_rect.x, parent_rect.y, parent_rect.width, h)
+        }
+        _ => parent_rect,
+    };
     let intrinsic = if matches!(common.size.width, Length::Auto)
         || matches!(common.size.height, Length::Auto)
     {
         measure_element_intrinsic(
             el,
-            parent_rect,
+            measure_parent,
             pass.scale,
             pass.renderer,
             pass.assets,
@@ -80,8 +91,32 @@ fn compute_node_bounds_and_transform<M: 'static, R: RenderBackend>(
     } else {
         LogicalSize::ZERO
     };
-    let resolved_w = resolve_length(common.size.width, parent_rect.width, intrinsic.width);
-    let resolved_h = resolve_length(common.size.height, parent_rect.height, intrinsic.height);
+    let resolved_w = if flow.flow == LayoutFlow::Row
+        && let Some(w) = main_override
+    {
+        clamp_dimension(w, common.min_width, common.max_width)
+    } else {
+        resolve_clamped_length(
+            common.size.width,
+            parent_rect.width,
+            intrinsic.width,
+            common.min_width,
+            common.max_width,
+        )
+    };
+    let resolved_h = if flow.flow == LayoutFlow::Column
+        && let Some(h) = main_override
+    {
+        clamp_dimension(h, common.min_height, common.max_height)
+    } else {
+        resolve_clamped_length(
+            common.size.height,
+            parent_rect.height,
+            intrinsic.height,
+            common.min_height,
+            common.max_height,
+        )
+    };
 
     let (raw_x, raw_y) = match common.position {
         Position::Auto => resolve_auto_position(
@@ -214,18 +249,30 @@ struct NodeSnapshotRef<'a> {
     visual: &'a RetainedVisual,
 }
 
+fn visual_dirty_bounds(world_bounds: Bounds, visual: &RetainedVisual) -> Bounds {
+    match visual {
+        RetainedVisual::Rect {
+            shadow: Some(shadow),
+            ..
+        } if shadow.is_visible() => shadow.expand_bounds(world_bounds),
+        _ => world_bounds,
+    }
+}
+
 fn record_dirty_bounds(
     prev_snapshot: Option<PrevSnapshot>,
     next: &NodeSnapshotRef<'_>,
     dirty_rects: &mut Vec<Bounds>,
 ) {
+    let next_dirty = visual_dirty_bounds(next.world_bounds, next.visual);
     match prev_snapshot {
         None => {
             if next.visible && !matches!(next.visual, RetainedVisual::Container) {
-                dirty_rects.push(next.world_bounds);
+                dirty_rects.push(next_dirty);
             }
         }
         Some(prev) => {
+            let prev_dirty = visual_dirty_bounds(prev.world_bounds, &prev.visual);
             let changed = prev.visible != next.visible
                 || prev.world_bounds != next.world_bounds
                 || prev.affine != next.affine
@@ -234,10 +281,10 @@ fn record_dirty_bounds(
                 || prev.visual.visual_changed(next.visual);
             if changed && !matches!(next.visual, RetainedVisual::Container) {
                 if prev.visible {
-                    dirty_rects.push(prev.world_bounds);
+                    dirty_rects.push(prev_dirty);
                 }
-                if next.visible && next.world_bounds != prev.world_bounds {
-                    dirty_rects.push(next.world_bounds);
+                if next.visible && next_dirty != prev_dirty {
+                    dirty_rects.push(next_dirty);
                 }
             }
         }
@@ -245,6 +292,7 @@ fn record_dirty_bounds(
 }
 
 impl<M: Clone + 'static> Reconciler<M> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn build_or_update_node<R: RenderBackend>(
         &mut self,
         el: Element<M>,
@@ -252,6 +300,7 @@ impl<M: Clone + 'static> Reconciler<M> {
         parent: ParentScope,
         flow: FlowLayout,
         cursor_main: &mut LogicalPx,
+        main_override: Option<LogicalPx>,
         pass: &mut TreePass<'_, R>,
     ) -> RetainedNode<M> {
         let kind_tag = element_kind_tag(&el);
@@ -261,6 +310,7 @@ impl<M: Clone + 'static> Reconciler<M> {
             pass.surface_size,
             flow,
             cursor_main,
+            main_override,
             pass,
         );
 
@@ -373,19 +423,26 @@ impl<M: Clone + 'static> Reconciler<M> {
                     fill: r.fill,
                     corner_radius: r.corner_radius,
                     border: r.border,
+                    shadow: r.shadow,
                 }
             }
             ElementKind::Text(t) => {
                 handlers = t.common.handlers;
+                let wrap_to_width = !matches!(t.common.size.width, crate::geometry::Length::Auto)
+                    || main_override.is_some()
+                    || t.common.max_width.is_some();
                 RetainedVisual::Text {
                     content: t.content,
+                    spans: t.spans,
                     font_size: t.font_size,
                     line_height_multiplier: t.line_height_multiplier,
                     color: t.color,
                     font: t.font,
                     align: t.align,
                     bounds_mode: t.bounds_mode,
-                    wrap_to_width: !matches!(t.common.size.width, crate::geometry::Length::Auto),
+                    overflow: t.overflow,
+                    max_lines: t.max_lines,
+                    wrap_to_width,
                 }
             }
             ElementKind::Image(img) => {
@@ -448,6 +505,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                         flow: LayoutFlow::Row,
                         gap: r.gap,
                         cross_align: r.align,
+                        justify: r.justify,
                         padding: r.padding,
                     },
                     pass,
@@ -464,6 +522,7 @@ impl<M: Clone + 'static> Reconciler<M> {
                         flow: LayoutFlow::Column,
                         gap: c.gap,
                         cross_align: c.align,
+                        justify: c.justify,
                         padding: c.padding,
                     },
                     pass,

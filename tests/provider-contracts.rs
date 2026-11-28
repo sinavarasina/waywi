@@ -24,7 +24,8 @@ use waywi::system::memory::{ByteSize, parse_meminfo};
 use waywi::system::network::{NetInterfaceKind, NetLinkState, NetworkSampler, parse_proc_net_dev};
 use waywi::system::os::{parse_loadavg, parse_os_release, parse_uptime};
 use waywi::system::privacy::{
-    PrivacyAccessKind, PrivacyAccessSource, classify_pipewire_node, scan_proc_fd_from,
+    PipeWireNodeProps, PrivacyAccessKind, PrivacyAccessSource, classify_pipewire_node,
+    scan_proc_fd_from,
 };
 use waywi::system::{DataRate, SystemProviders};
 
@@ -469,42 +470,43 @@ fn backlight_sysfs_and_ddc_packet_codec_contracts() {
 
 #[test]
 fn privacy_classifiers_and_proc_fd_scanner_contracts() {
-    let cam = classify_pipewire_node(
-        "Video/Source",
-        Some("Camera"),
-        Some("v4l2_input.pci-0000"),
-        Some("Integrated Camera"),
-        Some("obs"),
-        Some(4242),
-        true,
-    )
+    let cam = classify_pipewire_node(PipeWireNodeProps {
+        media_class: "Video/Source",
+        media_role: Some("Camera"),
+        node_name: Some("v4l2_input.pci-0000"),
+        media_name: Some("Integrated Camera"),
+        app_name: Some("obs"),
+        device_api: Some("v4l2"),
+        pid: Some(4242),
+        is_running: true,
+        ..Default::default()
+    })
     .expect("running video source classified");
     assert_eq!(cam.kind, PrivacyAccessKind::Camera);
     assert_eq!(cam.source, PrivacyAccessSource::PipeWire);
     assert_eq!(cam.app_name, "obs");
 
-    let share = classify_pipewire_node(
-        "Stream/Input/Video",
-        Some("Screen"),
-        Some("xdg-desktop-portal-wlr"),
-        Some("Screen Cast"),
-        Some("chromium"),
-        Some(1337),
-        true,
-    )
+    let share = classify_pipewire_node(PipeWireNodeProps {
+        media_class: "Stream/Input/Video",
+        media_role: Some("Screen"),
+        node_name: Some("xdg-desktop-portal-wlr"),
+        media_name: Some("Screen Cast"),
+        app_name: Some("chromium"),
+        pid: Some(1337),
+        is_running: true,
+        ..Default::default()
+    })
     .expect("screencast stream classified");
     assert_eq!(share.kind, PrivacyAccessKind::ScreenShare);
 
     assert!(
-        classify_pipewire_node(
-            "Video/Source",
-            None,
-            Some("cam"),
-            None,
-            Some("app"),
-            None,
-            false
-        )
+        classify_pipewire_node(PipeWireNodeProps {
+            media_class: "Video/Source",
+            node_name: Some("cam"),
+            app_name: Some("app"),
+            is_running: false,
+            ..Default::default()
+        })
         .is_none()
     );
 

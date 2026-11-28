@@ -80,6 +80,14 @@ pub(crate) struct WaylandState {
     #[cfg(feature = "pointer-constraints")]
     pub(crate) pointer_constraints:
         crate::wayland::pointer_constraints::WaylandPointerConstraintsState,
+    #[cfg(feature = "background-effect")]
+    pub(crate) background_effect: crate::wayland::background_effect::WaylandBackgroundEffectState,
+    #[cfg(feature = "toplevel-icon")]
+    pub(crate) toplevel_icon: crate::wayland::toplevel_icon::WaylandToplevelIconState,
+    #[cfg(feature = "gamma-control")]
+    pub(crate) gamma_control: crate::wayland::gamma_control::WaylandGammaControlState,
+    #[cfg(feature = "color-management")]
+    pub(crate) color_management: crate::wayland::color_management::WaylandColorManagementState,
 
     pub(crate) outputs: Vec<OutputInfo>,
     pub(crate) output_handles: HashMap<crate::display::OutputId, wl_output::WlOutput>,
@@ -116,6 +124,14 @@ impl Drop for WaylandState {
         self.idle_inhibit.clear_all();
         #[cfg(feature = "pointer-constraints")]
         self.pointer_constraints.clear_all_surfaces();
+        #[cfg(feature = "background-effect")]
+        self.background_effect.clear_all();
+        #[cfg(feature = "toplevel-icon")]
+        self.toplevel_icon.clear_all();
+        #[cfg(feature = "gamma-control")]
+        self.gamma_control.clear_all();
+        #[cfg(feature = "color-management")]
+        self.color_management.clear_all();
         // 2. Drop all live surfaces (including ext_session_lock_surface_v1 + wl_surface)
         //    BEFORE unlocking/destroying ext_session_lock_v1.
         self.surfaces.clear();
@@ -194,6 +210,18 @@ impl WaylandState {
             crate::wayland::pointer_constraints::WaylandPointerConstraintsState::bind(
                 &globals, &qh,
             );
+        #[cfg(feature = "background-effect")]
+        let background_effect =
+            crate::wayland::background_effect::WaylandBackgroundEffectState::bind(&globals, &qh);
+        #[cfg(feature = "toplevel-icon")]
+        let toplevel_icon =
+            crate::wayland::toplevel_icon::WaylandToplevelIconState::bind(&globals, &qh);
+        #[cfg(feature = "gamma-control")]
+        let gamma_control =
+            crate::wayland::gamma_control::WaylandGammaControlState::bind(&globals, &qh);
+        #[cfg(feature = "color-management")]
+        let color_management =
+            crate::wayland::color_management::WaylandColorManagementState::bind(&globals, &qh);
 
         let output_state = OutputState::new(&globals, &qh);
         let seat_state = SeatState::new(&globals, &qh);
@@ -240,6 +268,14 @@ impl WaylandState {
             virtual_keyboard,
             #[cfg(feature = "pointer-constraints")]
             pointer_constraints,
+            #[cfg(feature = "background-effect")]
+            background_effect,
+            #[cfg(feature = "toplevel-icon")]
+            toplevel_icon,
+            #[cfg(feature = "gamma-control")]
+            gamma_control,
+            #[cfg(feature = "color-management")]
+            color_management,
             outputs: Vec::new(),
             output_handles: HashMap::new(),
             surfaces: HashMap::new(),
@@ -430,6 +466,28 @@ impl WaylandState {
             caps.set(Capability::PointerConstraints, false);
             caps.set(Capability::RelativePointer, false);
         }
+        #[cfg(feature = "background-effect")]
+        caps.set(
+            Capability::BackgroundEffect,
+            self.background_effect.is_supported(),
+        );
+        #[cfg(not(feature = "background-effect"))]
+        caps.set(Capability::BackgroundEffect, false);
+        #[cfg(feature = "toplevel-icon")]
+        caps.set(Capability::ToplevelIcon, self.toplevel_icon.is_supported());
+        #[cfg(not(feature = "toplevel-icon"))]
+        caps.set(Capability::ToplevelIcon, false);
+        #[cfg(feature = "gamma-control")]
+        caps.set(Capability::GammaControl, self.gamma_control.is_supported());
+        #[cfg(not(feature = "gamma-control"))]
+        caps.set(Capability::GammaControl, false);
+        #[cfg(feature = "color-management")]
+        caps.set(
+            Capability::ColorManagement,
+            self.color_management.is_supported(),
+        );
+        #[cfg(not(feature = "color-management"))]
+        caps.set(Capability::ColorManagement, false);
         #[cfg(feature = "pipewire")]
         caps.set(
             Capability::PipeWire,
@@ -455,6 +513,12 @@ impl WaylandState {
             Capability::AudioPlayback,
             cfg!(feature = "audio-playback")
                 || caps.has(Capability::PipeWire)
+                || caps.has(Capability::PulseAudio)
+                || caps.has(Capability::Alsa),
+        );
+        caps.set(
+            Capability::AudioCapture,
+            caps.has(Capability::PipeWire)
                 || caps.has(Capability::PulseAudio)
                 || caps.has(Capability::Alsa),
         );
@@ -666,6 +730,21 @@ impl WaylandState {
                 qh,
             );
         }
+        #[cfg(feature = "background-effect")]
+        if spec.background_blur != crate::surface::BackgroundBlur::None {
+            self.background_effect.sync_surface(
+                &self.compositor,
+                role.wl_surface(),
+                spec.background_blur,
+                spec.logical_size,
+                qh,
+            );
+        }
+        #[cfg(feature = "color-management")]
+        if spec.color_space != crate::surface::ColorSpace::Default {
+            self.color_management
+                .sync_surface(role.wl_surface(), spec.color_space, qh);
+        }
 
         self.surface_by_obj.insert(wl_surface_id.clone(), key);
         self.surfaces.insert(
@@ -758,6 +837,17 @@ impl WaylandState {
                     qh,
                 );
             }
+            #[cfg(feature = "background-effect")]
+            self.background_effect.sync_surface(
+                &self.compositor,
+                &wl_surface,
+                spec.background_blur,
+                spec.logical_size,
+                qh,
+            );
+            #[cfg(feature = "color-management")]
+            self.color_management
+                .sync_surface(&wl_surface, spec.color_space, qh);
             if !is_unconfigured_lock {
                 wl_surface.commit();
             }
@@ -767,7 +857,12 @@ impl WaylandState {
             }
             #[cfg(not(feature = "ime"))]
             let _ = wl_id;
-            #[cfg(not(any(feature = "idle-inhibit", feature = "pointer-constraints")))]
+            #[cfg(not(any(
+                feature = "idle-inhibit",
+                feature = "pointer-constraints",
+                feature = "background-effect",
+                feature = "color-management"
+            )))]
             let _ = qh;
         }
         Ok(())
@@ -787,6 +882,15 @@ impl WaylandState {
             self.idle_inhibit.clear_surface(&surf.wl_surface_id);
             #[cfg(feature = "pointer-constraints")]
             self.pointer_constraints.clear_surface(&surf.wl_surface_id);
+            #[cfg(feature = "background-effect")]
+            self.background_effect.clear_surface(&surf.wl_surface_id);
+            #[cfg(feature = "toplevel-icon")]
+            if let SurfaceRole::Xdg(ref window) = surf.role {
+                self.toplevel_icon
+                    .clear_toplevel(&window.xdg_toplevel().id());
+            }
+            #[cfg(feature = "color-management")]
+            self.color_management.clear_surface(&surf.wl_surface_id);
             if self.focused_keyboard_surface == Some(key) {
                 self.focused_keyboard_surface = None;
             }
@@ -971,6 +1075,37 @@ impl WaylandState {
         };
         self.dnd
             .start_drag(&wl_surf, &seat, serial, req.entries, req.actions, qh)
+    }
+
+    #[cfg(feature = "toplevel-icon")]
+    pub(crate) fn sync_toplevel_icon(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        key: RetainedSurfaceKey,
+        assets: &crate::asset::AssetCache,
+    ) {
+        let Some(surf) = self.surfaces.get(&key) else {
+            return;
+        };
+        if let SurfaceRole::Xdg(ref window) = surf.role {
+            self.toplevel_icon.sync_toplevel(
+                window.xdg_toplevel(),
+                surf.spec.window_icon.as_ref(),
+                &self.shm,
+                assets,
+                qh,
+            );
+        }
+    }
+
+    #[cfg(feature = "gamma-control")]
+    pub(crate) fn apply_gamma_action(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        action: &crate::effect::GammaAction,
+    ) -> bool {
+        self.gamma_control
+            .apply_action(action, &self.outputs, &self.output_handles, qh)
     }
 
     pub(crate) fn apply_input_region(

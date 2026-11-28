@@ -281,7 +281,9 @@ fn run_alsa_worker(
                         },
                     );
                 }
-                AudioCommand::SetPort(..) | AudioCommand::SetCardProfile(..) => {}
+                AudioCommand::MoveStream(..)
+                | AudioCommand::SetPort(..)
+                | AudioCommand::SetCardProfile(..) => {}
             }
         }
         if shutdown {

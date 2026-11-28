@@ -269,6 +269,18 @@ impl AudioClient {
         self.send_command(AudioCommand::SetDefaultDevice(direction, device_id))
     }
 
+    /// Moves a per-application playback (`AudioDirection::Output`) or capture
+    /// (`AudioDirection::Input`) stream identified by `stream_id` to the sink/source identified by
+    /// `device_id`.
+    pub fn move_stream(
+        &self,
+        direction: AudioDirection,
+        stream_id: u32,
+        device_id: u32,
+    ) -> Result<()> {
+        self.send_command(AudioCommand::MoveStream(direction, stream_id, device_id))
+    }
+
     /// Switches the active physical or logical port/route on `target` by `port_name`.
     pub fn set_port(&self, target: AudioPortTarget, port_name: &str) -> Result<()> {
         self.send_command(AudioCommand::SetPort(target, port_name.to_owned()))
@@ -453,6 +465,7 @@ mod tests {
         client
             .set_default_device(AudioDirection::Output, 1)
             .unwrap();
+        client.move_stream(AudioDirection::Output, 9, 1).unwrap();
         client
             .set_port(AudioPortTarget::DefaultSink, "headphones")
             .unwrap();
@@ -464,7 +477,11 @@ mod tests {
         assert!(!client.has_pending());
 
         let cmds = recorded.lock().unwrap();
-        assert!(cmds.len() >= 11);
+        assert!(cmds.len() >= 12);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, AudioCommand::MoveStream(AudioDirection::Output, 9, 1)))
+        );
         assert!(matches!(cmds.last(), Some(AudioCommand::Shutdown)));
         drop(cmds);
 

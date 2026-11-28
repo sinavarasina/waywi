@@ -444,6 +444,7 @@ mod tests {
             handlers: btn_handlers,
             visual: RetainedVisual::Text {
                 content: SharedStr::from_static("Launch"),
+                spans: None,
                 font_size: LogicalPx(14.0),
                 line_height_multiplier: 1.25,
                 wrap_to_width: false,
@@ -451,6 +452,8 @@ mod tests {
                 font: Font::default(),
                 align: TextAlign::Left,
                 bounds_mode: crate::text::TextBoundsMode::Typographic,
+                overflow: crate::text::TextOverflow::Clip,
+                max_lines: None,
             },
             a11y: AccessibleProps {
                 role: Some(AccessibleRole::Button),
@@ -483,6 +486,9 @@ mod tests {
                 namespace: SharedStr::from_static("waywi"),
                 cursor: crate::input::CursorShape::Default,
                 decoration: crate::surface::WindowDecoration::Server,
+                background_blur: crate::surface::BackgroundBlur::None,
+                window_icon: None,
+                color_space: crate::surface::ColorSpace::Default,
                 inhibit_idle: false,
                 pointer_constraint: crate::input::PointerConstraintMode::None,
                 accepts_dnd: false,

@@ -14,7 +14,10 @@ pub mod style;
 pub use backend::RendererPreference;
 pub use canvas::{Canvas, Painter, PathBuilder, PathOp};
 pub use elements::{Clip, Column, Element, Group, Rect, Row};
-pub use style::{Align, Border, Color, CornerRadius};
+pub use style::{
+    Align, Border, BoxShadow, Color, CornerRadius, Fill, GradientStop, Justify, LinearGradient,
+    RadialGradient,
+};
 
 use wayland_client::Connection;
 
@@ -51,7 +54,7 @@ enum ActiveBackend {
 pub(crate) struct ActiveRenderer {
     backend: ActiveBackend,
     #[cfg(feature = "text")]
-    text_engine: TextEngine,
+    pub(crate) text_engine: TextEngine,
 }
 
 impl ActiveRenderer {
@@ -184,6 +187,9 @@ impl RenderBackend for ActiveRenderer {
                 style.font,
                 style.align,
                 style.bounds_mode,
+                style.overflow,
+                style.max_lines,
+                style.spans,
                 scale,
                 frame_seq,
             );
@@ -193,18 +199,6 @@ impl RenderBackend for ActiveRenderer {
                 LogicalPx((style.font_size.0 * 1.25).ceil()),
             )
         }
-    }
-
-    #[cfg(feature = "text")]
-    fn measure_text_cursor(
-        &mut self,
-        content: &SharedStr,
-        style: TextMeasureStyle<'_>,
-        cursor_byte: usize,
-        frame_seq: u64,
-    ) -> crate::text::TextCursorMetrics {
-        self.text_engine
-            .measure_text_cursor(content, style, cursor_byte, frame_seq)
     }
 
     fn render_argb8888(

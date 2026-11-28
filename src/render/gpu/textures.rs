@@ -528,6 +528,10 @@ impl GpuTextureCache {
         s.font.hash(&mut h);
         s.align.hash(&mut h);
         s.bounds_mode.hash(&mut h);
+        s.overflow.hash(&mut h);
+        s.max_lines.hash(&mut h);
+        s.spans.hash(&mut h);
+        text_engine.custom_font_revision().hash(&mut h);
         params.scale.as_120ths().hash(&mut h);
         tex_w.hash(&mut h);
         tex_h.hash(&mut h);

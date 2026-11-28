@@ -586,6 +586,9 @@ fn request_refresh(ml: &mut Mainloop, ctx: &Context, tx: &mpsc::Sender<PulseWork
     let tx_outputs = tx.clone();
     let _output_op = introspect.get_source_output_info_list(move |res| match res {
         ListResult::Item(info) => {
+            if info.name.as_deref() == Some("waywi-capture") {
+                return;
+            }
             if let Ok(mut list) = collected_outputs_cb.lock() {
                 list.push(pulse_stream_record(
                     info.index,
@@ -808,6 +811,33 @@ fn apply_pulse_command(
             if is_valid_pa_str(&profile_name) && records.cards.contains_key(&card_id) {
                 let mut introspect = ctx.introspect();
                 let _op = introspect.set_card_profile_by_index(card_id, &profile_name, None);
+            }
+        }
+        AudioCommand::MoveStream(dir, stream_id, device_id) => {
+            let valid = match dir {
+                AudioDirection::Output => {
+                    records.sink_inputs.contains_key(&stream_id)
+                        && records.sinks.contains_key(&device_id)
+                }
+                AudioDirection::Input => {
+                    records.source_outputs.contains_key(&stream_id)
+                        && records.sources.contains_key(&device_id)
+                }
+            };
+            if valid {
+                let mut introspect = ctx.introspect();
+                match dir {
+                    AudioDirection::Output => {
+                        let _op = introspect.move_sink_input_by_index(stream_id, device_id, None);
+                    }
+                    AudioDirection::Input => {
+                        let _op =
+                            introspect.move_source_output_by_index(stream_id, device_id, None);
+                    }
+                }
+                if let Some(stream) = records.stream_map_mut(dir).get_mut(&stream_id) {
+                    stream.target_id = device_id;
+                }
             }
         }
         AudioCommand::Shutdown => {}

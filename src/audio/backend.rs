@@ -30,6 +30,11 @@ pub(crate) enum AudioCommand {
         not(any(feature = "pulseaudio", feature = "pipewire")),
         allow(dead_code)
     )]
+    MoveStream(AudioDirection, u32, u32),
+    #[cfg_attr(
+        not(any(feature = "pulseaudio", feature = "pipewire")),
+        allow(dead_code)
+    )]
     SetPort(AudioPortTarget, String),
     #[cfg_attr(
         not(any(feature = "pulseaudio", feature = "pipewire")),

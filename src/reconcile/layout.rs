@@ -25,6 +25,21 @@ pub(crate) fn element_kind_tag<M>(el: &Element<M>) -> u8 {
     }
 }
 
+pub(crate) fn clamp_dimension(
+    val: LogicalPx,
+    min: Option<LogicalPx>,
+    max: Option<LogicalPx>,
+) -> LogicalPx {
+    let mut out = val.max(LogicalPx::ZERO);
+    if let Some(lo) = min {
+        out = out.max(lo.max(LogicalPx::ZERO));
+    }
+    if let Some(hi) = max {
+        out = out.min(hi.max(LogicalPx::ZERO));
+    }
+    out
+}
+
 pub(crate) fn resolve_length(len: Length, available: LogicalPx, intrinsic: LogicalPx) -> LogicalPx {
     match len {
         Length::Px(px) => px.max(LogicalPx::ZERO),
@@ -32,6 +47,16 @@ pub(crate) fn resolve_length(len: Length, available: LogicalPx, intrinsic: Logic
         Length::Fill => available.max(LogicalPx::ZERO),
         Length::Auto => intrinsic.max(LogicalPx::ZERO),
     }
+}
+
+pub(crate) fn resolve_clamped_length(
+    len: Length,
+    available: LogicalPx,
+    intrinsic: LogicalPx,
+    min: Option<LogicalPx>,
+    max: Option<LogicalPx>,
+) -> LogicalPx {
+    clamp_dimension(resolve_length(len, available, intrinsic), min, max)
 }
 
 fn resolve_intrinsic_child(len: Length, intrinsic: LogicalPx) -> LogicalPx {
@@ -149,6 +174,9 @@ pub(crate) fn measure_element_intrinsic<M: 'static>(
                     font: &t.font,
                     align: t.align,
                     bounds_mode: t.bounds_mode,
+                    overflow: t.overflow,
+                    max_lines: t.max_lines,
+                    spans: t.spans.as_deref(),
                 },
                 scale,
                 frame_seq,

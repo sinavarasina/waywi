@@ -88,6 +88,10 @@ impl<M: Clone + 'static> LoopRuntime<M> {
             let p = ping_tx.clone();
             core.asset_worker.set_wakeup(move || p.ping());
         }
+        {
+            let p = ping_tx.clone();
+            core.task_worker.set_wakeup(move || p.ping());
+        }
         #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
         {
             let p = ping_tx.clone();
@@ -152,6 +156,12 @@ impl<M: Clone + 'static> LoopRuntime<M> {
 
         if post.trim_requested {
             wl.trim_idle_shm_pools();
+        }
+        if !post.inline_messages.is_empty() {
+            self.inbox
+                .borrow_mut()
+                .messages
+                .extend(post.inline_messages);
         }
 
         let mut flush_wayland = false;
@@ -222,6 +232,12 @@ impl<M: Clone + 'static> LoopRuntime<M> {
         }
         for drag in post.drag_starts {
             if wl.start_drag(&self.qh, drag) {
+                flush_wayland = true;
+            }
+        }
+        #[cfg(feature = "gamma-control")]
+        for action in post.gamma_actions {
+            if wl.apply_gamma_action(&self.qh, &action) {
                 flush_wayland = true;
             }
         }

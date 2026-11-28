@@ -8,8 +8,11 @@ use crate::render::retained::{DrawCommand, PaintPayload};
 use crate::render::software::bitmap::draw_bitmap_region;
 use crate::render::software::fast_path::{BlitSource, PixelTarget, fast_fill_rect_rgba};
 #[cfg(feature = "renderer-software")]
-use crate::render::software::path::{build_clip_mask, build_rounded_rect_path};
+use crate::render::software::path::{
+    build_clip_mask, build_rounded_rect_path, build_skia_fill_paint, draw_skia_box_shadow,
+};
 use crate::render::software::{CachedCanvasPixmap, SoftwareRenderer};
+use crate::render::style::Fill;
 
 #[cfg(feature = "text")]
 use crate::text::TextEngine;
@@ -38,9 +41,15 @@ impl SoftwareRenderer {
                 fill,
                 corner_radius,
                 border,
+                shadow,
             } => {
-                let eff_fill = fill.with_opacity(cmd.opacity);
-                if axis_aligned && corner_radius.is_zero() && border.is_none() {
+                if let Fill::Solid(solid) = fill
+                    && axis_aligned
+                    && corner_radius.is_zero()
+                    && border.is_none()
+                    && shadow.is_none()
+                {
+                    let eff_fill = solid.with_opacity(cmd.opacity);
                     let x = (cmd.local_rect.x.0 + cmd.affine.tx) * scale_f - tile.origin_x as f32;
                     let y = (cmd.local_rect.y.0 + cmd.affine.ty) * scale_f - tile.origin_y as f32;
                     let w = cmd.local_rect.width.0 * scale_f;
@@ -68,20 +77,35 @@ impl SoftwareRenderer {
                         );
                         let mask_ref = mask.as_ref();
 
+                        if let Some(sh) = shadow
+                            && sh.is_visible()
+                        {
+                            draw_skia_box_shadow(
+                                &mut pixmap,
+                                cmd.local_rect,
+                                *corner_radius,
+                                *sh,
+                                scale_f,
+                                cmd.opacity,
+                                skia_transform,
+                                mask_ref,
+                            );
+                        }
+
                         let stroke_border = border
                             .filter(|b| b.width.0 > 0.0)
                             .map(|b| (b.width.0, b.color.with_opacity(cmd.opacity)))
                             .filter(|(_, c)| c.a > 0);
-                        if (eff_fill.a > 0 || stroke_border.is_some())
+                        let fill_paint = if fill.is_visible() {
+                            build_skia_fill_paint(fill, cmd.local_rect, scale_f, cmd.opacity)
+                        } else {
+                            None
+                        };
+                        if (fill_paint.is_some() || stroke_border.is_some())
                             && let Some(path) =
                                 build_rounded_rect_path(cmd.local_rect, *corner_radius, scale_f)
                         {
-                            if eff_fill.a > 0 {
-                                let mut paint = tiny_skia::Paint::default();
-                                paint.set_color_rgba8(
-                                    eff_fill.r, eff_fill.g, eff_fill.b, eff_fill.a,
-                                );
-                                paint.anti_alias = true;
+                            if let Some(paint) = fill_paint {
                                 pixmap.fill_path(
                                     &path,
                                     &paint,
@@ -112,12 +136,15 @@ impl SoftwareRenderer {
             }
             PaintPayload::Text {
                 content,
+                spans,
                 font_size,
                 line_height_multiplier,
                 color,
                 font,
                 align,
                 bounds_mode,
+                overflow,
+                max_lines,
                 wrap_to_width,
             } => {
                 #[cfg(feature = "text")]
@@ -140,6 +167,9 @@ impl SoftwareRenderer {
                             font,
                             align: *align,
                             bounds_mode: *bounds_mode,
+                            overflow: *overflow,
+                            max_lines: *max_lines,
+                            spans: spans.as_deref(),
                         },
                         wrap_to_width: *wrap_to_width,
                         scale,
@@ -157,12 +187,15 @@ impl SoftwareRenderer {
                 {
                     let _ = (
                         content,
+                        spans,
                         font_size,
                         line_height_multiplier,
                         color,
                         font,
                         align,
                         bounds_mode,
+                        overflow,
+                        max_lines,
                         wrap_to_width,
                         frame_seq,
                     );

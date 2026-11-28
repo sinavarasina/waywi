@@ -6,7 +6,7 @@ pub mod shared_str;
 pub use element::Text;
 #[cfg(feature = "text")]
 pub(crate) use engine::TextEngine;
-pub use font::{Font, FontStyle, FontWeight, TextAlign, TextBoundsMode};
+pub use font::{Font, FontStyle, FontWeight, TextAlign, TextBoundsMode, TextOverflow, TextSpan};
 pub use shared_str::SharedStr;
 
 /// Measured layout bounds and visual cursor coordinates for shaped text.
@@ -22,7 +22,18 @@ pub struct TextCursorMetrics {
     pub line_height: crate::geometry::LogicalPx,
 }
 
-/// Optional typography parameters passed to [`EffectCtx::measure_text_cursor_with`](crate::effect::EffectCtx::measure_text_cursor_with).
+/// Measured selection highlight rectangles for a UTF-8 byte range in shaped text.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TextSelectionMetrics {
+    /// Total bounding size of the shaped text in logical pixels.
+    pub size: crate::geometry::LogicalSize,
+    /// One logical rectangle per visual line intersecting the selection range.
+    pub rects: Vec<crate::geometry::Bounds>,
+}
+
+/// Optional typography parameters passed to [`EffectCtx::measure_text_cursor_with`](crate::effect::EffectCtx::measure_text_cursor_with),
+/// [`EffectCtx::measure_text_selection`](crate::effect::EffectCtx::measure_text_selection), and
+/// [`EffectCtx::hit_test_text_byte`](crate::effect::EffectCtx::hit_test_text_byte).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextLayoutOptions {
     /// Font specification (default: sans-serif normal).
@@ -37,6 +48,10 @@ pub struct TextLayoutOptions {
     pub align: TextAlign,
     /// Bounding-box metric (`Typographic` default or tight `Optical` ink bounds).
     pub bounds_mode: TextBoundsMode,
+    /// Overflow truncation behavior (default: [`TextOverflow::Clip`]).
+    pub overflow: TextOverflow,
+    /// Optional maximum number of visual lines (`None` = unlimited).
+    pub max_lines: Option<usize>,
 }
 
 impl Default for TextLayoutOptions {
@@ -48,6 +63,8 @@ impl Default for TextLayoutOptions {
             max_width: None,
             align: TextAlign::Left,
             bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
         }
     }
 }
@@ -90,6 +107,27 @@ impl TextLayoutOptions {
         self.bounds_mode = mode;
         self
     }
+
+    /// Sets overflow truncation behavior (`Clip` or `Ellipsis*`).
+    #[must_use]
+    pub fn overflow(mut self, overflow: TextOverflow) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    /// Convenience shorthand for `.overflow(TextOverflow::EllipsisEnd)`.
+    #[must_use]
+    pub fn ellipsis(mut self) -> Self {
+        self.overflow = TextOverflow::EllipsisEnd;
+        self
+    }
+
+    /// Limits visible visual lines (`>= 1`).
+    #[must_use]
+    pub fn max_lines(mut self, lines: Option<usize>) -> Self {
+        self.max_lines = lines.map(|n| n.max(1));
+        self
+    }
 }
 
 /// Grouped typography parameters passed when shaping/measuring text.
@@ -101,6 +139,9 @@ pub(crate) struct TextMeasureStyle<'a> {
     pub(crate) font: &'a Font,
     pub(crate) align: TextAlign,
     pub(crate) bounds_mode: TextBoundsMode,
+    pub(crate) overflow: TextOverflow,
+    pub(crate) max_lines: Option<usize>,
+    pub(crate) spans: Option<&'a [TextSpan]>,
 }
 
 impl<'a> TextMeasureStyle<'a> {
@@ -114,6 +155,9 @@ impl<'a> TextMeasureStyle<'a> {
             font: &opts.font,
             align: opts.align,
             bounds_mode: opts.bounds_mode,
+            overflow: opts.overflow,
+            max_lines: opts.max_lines,
+            spans: None,
         }
     }
 }

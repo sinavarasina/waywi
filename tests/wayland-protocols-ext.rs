@@ -16,7 +16,7 @@
 mod common;
 
 use std::collections::HashMap;
-#[cfg(feature = "virtual-keyboard")]
+#[cfg(any(feature = "virtual-keyboard", feature = "gamma-control"))]
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -27,6 +27,10 @@ use std::time::Duration;
 use common::write_shm_buffer;
 use common::{BufferInfo, DummyClientData, PoolInfo, bind_mock_output};
 use wayland_client::Connection;
+#[cfg(feature = "background-effect")]
+use wayland_protocols::ext::background_effect::v1::server::{
+    ext_background_effect_manager_v1, ext_background_effect_surface_v1,
+};
 #[cfg(feature = "foreign-toplevel")]
 use wayland_protocols::ext::foreign_toplevel_list::v1::server::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
@@ -48,6 +52,11 @@ use wayland_protocols::ext::session_lock::v1::server::{
 use wayland_protocols::ext::workspace::v1::server::{
     ext_workspace_group_handle_v1, ext_workspace_handle_v1, ext_workspace_manager_v1,
 };
+#[cfg(feature = "color-management")]
+use wayland_protocols::wp::color_management::v1::server::{
+    wp_color_management_surface_v1, wp_color_manager_v1, wp_image_description_creator_params_v1,
+    wp_image_description_v1,
+};
 #[cfg(feature = "cursor-shape")]
 use wayland_protocols::wp::cursor_shape::v1::server::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
@@ -68,6 +77,10 @@ use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
+#[cfg(feature = "toplevel-icon")]
+use wayland_protocols::xdg::toplevel_icon::v1::server::{
+    xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
+};
 #[cfg(feature = "virtual-keyboard")]
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::server::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
@@ -75,6 +88,10 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::server::{
 #[cfg(feature = "foreign-toplevel")]
 use wayland_protocols_wlr::foreign_toplevel::v1::server::{
     zwlr_foreign_toplevel_handle_v1, zwlr_foreign_toplevel_manager_v1,
+};
+#[cfg(feature = "gamma-control")]
+use wayland_protocols_wlr::gamma_control::v1::server::{
+    zwlr_gamma_control_manager_v1, zwlr_gamma_control_v1,
 };
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 #[cfg(feature = "screencopy")]
@@ -122,6 +139,14 @@ struct ExtServerCfg {
     enable_pointer_constraints: bool,
     #[cfg(feature = "pointer-constraints")]
     send_relative_motion: bool,
+    #[cfg(feature = "background-effect")]
+    enable_background_effect: bool,
+    #[cfg(feature = "toplevel-icon")]
+    enable_toplevel_icon: bool,
+    #[cfg(feature = "gamma-control")]
+    enable_gamma_control: bool,
+    #[cfg(feature = "color-management")]
+    enable_color_management: bool,
 }
 
 #[allow(dead_code)]
@@ -153,6 +178,17 @@ struct ExtTrace {
     ws_activated: usize,
     ws_created: Vec<String>,
     ws_commits: usize,
+    bg_blur_surfaces_created: usize,
+    bg_blur_regions_set: usize,
+    bg_blur_surfaces_destroyed: usize,
+    toplevel_icon_names: Vec<String>,
+    toplevel_icon_set_calls: usize,
+    gamma_controls_created: usize,
+    gamma_table_bytes: Vec<usize>,
+    gamma_controls_destroyed: usize,
+    color_surfaces_created: usize,
+    color_descs_applied: usize,
+    color_surfaces_destroyed: usize,
 }
 
 struct ExtMockCompositor {
@@ -1225,6 +1261,260 @@ impl Dispatch<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()>
     }
 }
 
+#[cfg(feature = "background-effect")]
+impl GlobalDispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()>
+    for ExtMockCompositor
+{
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        res: New<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
+        _: &(),
+        di: &mut DataInit<'_, Self>,
+    ) {
+        let mgr = di.init(res, ());
+        mgr.capabilities(ext_background_effect_manager_v1::Capability::Blur);
+    }
+}
+#[cfg(feature = "background-effect")]
+impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()>
+    for ExtMockCompositor
+{
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
+        req: ext_background_effect_manager_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
+    ) {
+        if let ext_background_effect_manager_v1::Request::GetBackgroundEffect { id, .. } = req {
+            let _ = di.init(id, ());
+            state.trace.lock().unwrap().bg_blur_surfaces_created += 1;
+        }
+    }
+}
+#[cfg(feature = "background-effect")]
+impl Dispatch<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1, ()>
+    for ExtMockCompositor
+{
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+        req: ext_background_effect_surface_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            ext_background_effect_surface_v1::Request::SetBlurRegion { region: Some(_) } => {
+                state.trace.lock().unwrap().bg_blur_regions_set += 1;
+            }
+            ext_background_effect_surface_v1::Request::Destroy => {
+                state.trace.lock().unwrap().bg_blur_surfaces_destroyed += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "toplevel-icon")]
+impl_simple_global!(
+    ExtMockCompositor,
+    xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1
+);
+#[cfg(feature = "toplevel-icon")]
+impl Dispatch<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, ()> for ExtMockCompositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
+        req: xdg_toplevel_icon_manager_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            xdg_toplevel_icon_manager_v1::Request::CreateIcon { id } => {
+                let _ = di.init(id, ());
+            }
+            xdg_toplevel_icon_manager_v1::Request::SetIcon { .. } => {
+                state.trace.lock().unwrap().toplevel_icon_set_calls += 1;
+            }
+            _ => {}
+        }
+    }
+}
+#[cfg(feature = "toplevel-icon")]
+impl Dispatch<xdg_toplevel_icon_v1::XdgToplevelIconV1, ()> for ExtMockCompositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &xdg_toplevel_icon_v1::XdgToplevelIconV1,
+        req: xdg_toplevel_icon_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        if let xdg_toplevel_icon_v1::Request::SetName { icon_name } = req {
+            state
+                .trace
+                .lock()
+                .unwrap()
+                .toplevel_icon_names
+                .push(icon_name);
+        }
+    }
+}
+
+#[cfg(feature = "gamma-control")]
+impl_simple_global!(
+    ExtMockCompositor,
+    zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1
+);
+#[cfg(feature = "gamma-control")]
+impl Dispatch<zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1, ()> for ExtMockCompositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1,
+        req: zwlr_gamma_control_manager_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
+    ) {
+        if let zwlr_gamma_control_manager_v1::Request::GetGammaControl { id, .. } = req {
+            let ctl = di.init(id, ());
+            state.trace.lock().unwrap().gamma_controls_created += 1;
+            ctl.gamma_size(256);
+        }
+    }
+}
+#[cfg(feature = "gamma-control")]
+impl Dispatch<zwlr_gamma_control_v1::ZwlrGammaControlV1, ()> for ExtMockCompositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &zwlr_gamma_control_v1::ZwlrGammaControlV1,
+        req: zwlr_gamma_control_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            zwlr_gamma_control_v1::Request::SetGamma { fd } => {
+                let mut f = std::fs::File::from(fd);
+                let mut bytes = Vec::new();
+                let _ = f.read_to_end(&mut bytes);
+                state
+                    .trace
+                    .lock()
+                    .unwrap()
+                    .gamma_table_bytes
+                    .push(bytes.len());
+            }
+            zwlr_gamma_control_v1::Request::Destroy => {
+                state.trace.lock().unwrap().gamma_controls_destroyed += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "color-management")]
+impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for ExtMockCompositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        res: New<wp_color_manager_v1::WpColorManagerV1>,
+        _: &(),
+        di: &mut DataInit<'_, Self>,
+    ) {
+        let mgr = di.init(res, ());
+        mgr.supported_feature(wp_color_manager_v1::Feature::Parametric);
+        mgr.supported_primaries_named(wp_color_manager_v1::Primaries::DisplayP3);
+        mgr.supported_primaries_named(wp_color_manager_v1::Primaries::Srgb);
+        mgr.supported_tf_named(wp_color_manager_v1::TransferFunction::Srgb);
+        mgr.supported_intent(wp_color_manager_v1::RenderIntent::Perceptual);
+        mgr.done();
+    }
+}
+#[cfg(feature = "color-management")]
+impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for ExtMockCompositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &wp_color_manager_v1::WpColorManagerV1,
+        req: wp_color_manager_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            wp_color_manager_v1::Request::GetSurface { id, .. } => {
+                let _ = di.init(id, ());
+                state.trace.lock().unwrap().color_surfaces_created += 1;
+            }
+            wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
+                let _ = di.init(obj, ());
+            }
+            _ => {}
+        }
+    }
+}
+#[cfg(feature = "color-management")]
+impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, ()>
+    for ExtMockCompositor
+{
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+        req: wp_color_management_surface_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match req {
+            wp_color_management_surface_v1::Request::SetImageDescription { .. } => {
+                state.trace.lock().unwrap().color_descs_applied += 1;
+            }
+            wp_color_management_surface_v1::Request::Destroy => {
+                state.trace.lock().unwrap().color_surfaces_destroyed += 1;
+            }
+            _ => {}
+        }
+    }
+}
+#[cfg(feature = "color-management")]
+impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1, ()>
+    for ExtMockCompositor
+{
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+        req: wp_image_description_creator_params_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        di: &mut DataInit<'_, Self>,
+    ) {
+        if let wp_image_description_creator_params_v1::Request::Create { image_description } = req {
+            let desc = di.init(image_description, ());
+            desc.ready(1);
+        }
+    }
+}
+#[cfg(feature = "color-management")]
+impl_noop_dispatch!(
+    ExtMockCompositor,
+    wp_image_description_v1::WpImageDescriptionV1
+);
+
 fn spawn_ext_mock(
     cfg: ExtServerCfg,
 ) -> (
@@ -1286,6 +1576,22 @@ fn spawn_ext_mock(
         #[cfg(feature = "ext-workspace")]
         if cfg.enable_ext_workspace {
             dh.create_global::<ExtMockCompositor, ext_workspace_manager_v1::ExtWorkspaceManagerV1, _>(1, ());
+        }
+        #[cfg(feature = "background-effect")]
+        if cfg.enable_background_effect {
+            dh.create_global::<ExtMockCompositor, ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, _>(1, ());
+        }
+        #[cfg(feature = "toplevel-icon")]
+        if cfg.enable_toplevel_icon {
+            dh.create_global::<ExtMockCompositor, xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _>(1, ());
+        }
+        #[cfg(feature = "gamma-control")]
+        if cfg.enable_gamma_control {
+            dh.create_global::<ExtMockCompositor, zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1, _>(1, ());
+        }
+        #[cfg(feature = "color-management")]
+        if cfg.enable_color_management {
+            dh.create_global::<ExtMockCompositor, wp_color_manager_v1::WpColorManagerV1, _>(1, ());
         }
         #[cfg(feature = "idle-inhibit")]
         if cfg.enable_idle_inhibit {
@@ -2033,4 +2339,92 @@ fn idle_inhibit_virtual_keyboard_and_pointer_constraints_wire_protocols() {
     );
     assert_eq!(tr.vk_keys_received, vec![(30, 1), (30, 0)]);
     assert_eq!(tr.vk_modifiers_received, vec![(1, 0, 0, 0)]);
+}
+
+#[cfg(all(
+    feature = "background-effect",
+    feature = "toplevel-icon",
+    feature = "gamma-control",
+    feature = "color-management"
+))]
+#[test]
+fn background_effect_toplevel_icon_gamma_and_color_management_wire_protocols() {
+    struct State {
+        blur: bool,
+    }
+    #[derive(Clone)]
+    enum Msg {
+        ResetAndQuit,
+        Quit,
+    }
+    struct ModernProtoApp;
+    impl Application for ModernProtoApp {
+        type State = State;
+        type Message = Msg;
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            assert!(ctx.capabilities().has(Capability::BackgroundEffect));
+            assert!(ctx.capabilities().has(Capability::ToplevelIcon));
+            assert!(ctx.capabilities().has(Capability::GammaControl));
+            assert!(ctx.capabilities().has(Capability::ColorManagement));
+            ctx.set_output_color_temperature(Output::Primary, 3400, 0.85)?;
+            ctx.after(Duration::from_millis(80), Msg::ResetAndQuit);
+            Ok(State { blur: true })
+        }
+
+        fn update(
+            state: &mut Self::State,
+            msg: Self::Message,
+            ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            match msg {
+                Msg::ResetAndQuit => {
+                    state.blur = false;
+                    ctx.reset_output_gamma(Output::Primary)?;
+                    ctx.after(Duration::from_millis(50), Msg::Quit);
+                }
+                Msg::Quit => ctx.quit(),
+            }
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            let mut s = Surfaces::new();
+            s.push(
+                Surface::window("modern-win")
+                    .size((200.logical_px(), 120.logical_px()))
+                    .background_blur(state.blur)
+                    .window_icon_name("org.waywi.test")
+                    .color_space(ColorSpace::DisplayP3),
+            );
+            s
+        }
+    }
+
+    let (conn, trace, stop, srv) = spawn_ext_mock(ExtServerCfg {
+        enable_background_effect: true,
+        enable_toplevel_icon: true,
+        enable_gamma_control: true,
+        enable_color_management: true,
+        ..Default::default()
+    });
+    App::new()
+        .renderer(RendererPreference::Software)
+        .run_on_connection::<ModernProtoApp>(conn)
+        .unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = srv.join();
+
+    let tr = trace.lock().unwrap();
+    assert_eq!(tr.bg_blur_surfaces_created, 1);
+    assert!(tr.bg_blur_regions_set >= 1);
+    assert_eq!(tr.bg_blur_surfaces_destroyed, 1);
+    assert_eq!(tr.toplevel_icon_names, vec!["org.waywi.test".to_owned()]);
+    assert!(tr.toplevel_icon_set_calls >= 1);
+    assert_eq!(tr.gamma_controls_created, 1);
+    assert_eq!(tr.gamma_table_bytes, vec![256 * 3 * 2]);
+    assert_eq!(tr.gamma_controls_destroyed, 1);
+    assert_eq!(tr.color_surfaces_created, 1);
+    assert_eq!(tr.color_descs_applied, 1);
+    assert_eq!(tr.color_surfaces_destroyed, 1);
 }

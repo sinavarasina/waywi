@@ -12,13 +12,6 @@ use crate::wayland::WaylandState;
 use super::super::subscription_mgr::fanout_event;
 use super::LoopRuntime;
 
-#[cfg(any(
-    feature = "hyprland-ipc",
-    feature = "sway-ipc",
-    feature = "dbus",
-    feature = "global-shortcuts",
-    feature = "control-ipc",
-))]
 fn push_mapped<M: Clone + 'static, E, F>(
     inbox: &std::rc::Rc<std::cell::RefCell<crate::app::subscription_mgr::LoopInbox<M>>>,
     events: Vec<E>,
@@ -52,18 +45,44 @@ pub(crate) fn collect_sources<M: Clone + 'static>(
         }
     }
 
-    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
-    if rt.core.audio_client.has_pending() {
-        let (snap_opt, events) = rt.core.audio_client.drain_updates();
-        if snap_opt.is_some() || !events.is_empty() {
-            let mut guard = rt.inbox.borrow_mut();
-            if let Some(snap) = snap_opt {
-                fanout_event(snap, &rt.sub_mgr.audio_snapshot_subs, &mut guard.messages);
+    {
+        let evs: Vec<_> = rt.inbox.borrow_mut().file_watch_events.drain(..).collect();
+        push_mapped(&rt.inbox, evs, |ev, messages| {
+            for (watched_paths, map) in &rt.sub_mgr.file_watch_subs {
+                if crate::system::watch::event_matches_watched_paths(&ev, watched_paths) {
+                    messages.push_back(map.call(ev.clone()));
+                }
             }
-            for ev in events {
-                fanout_event(ev, &rt.sub_mgr.audio_event_subs, &mut guard.messages);
+        });
+    }
+
+    #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+    {
+        if rt.core.audio_client.has_pending() {
+            let (snap_opt, events) = rt.core.audio_client.drain_updates();
+            if snap_opt.is_some() || !events.is_empty() {
+                let mut guard = rt.inbox.borrow_mut();
+                if let Some(snap) = snap_opt {
+                    fanout_event(snap, &rt.sub_mgr.audio_snapshot_subs, &mut guard.messages);
+                }
+                for ev in events {
+                    fanout_event(ev, &rt.sub_mgr.audio_event_subs, &mut guard.messages);
+                }
             }
         }
+        let frames: Vec<_> = rt
+            .inbox
+            .borrow_mut()
+            .audio_capture_frames
+            .drain(..)
+            .collect();
+        push_mapped(&rt.inbox, frames, |(filter_key, frame), messages| {
+            for (sub_k, _, _, map) in &rt.sub_mgr.audio_capture_subs {
+                if *sub_k == filter_key {
+                    messages.push_back(map.call(frame.clone()));
+                }
+            }
+        });
     }
 
     #[cfg(feature = "hyprland-ipc")]

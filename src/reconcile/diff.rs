@@ -268,6 +268,9 @@ impl<M: Clone + 'static> Reconciler<M> {
             namespace,
             cursor: surf.cursor,
             decoration: surf.decoration,
+            background_blur: surf.background_blur,
+            window_icon: surf.window_icon,
+            color_space: surf.color_space,
             inhibit_idle: surf.inhibit_idle,
             pointer_constraint: surf.pointer_constraint,
             accepts_dnd: surf.on_dnd.is_some(),
@@ -301,6 +304,9 @@ impl<M: Clone + 'static> Reconciler<M> {
                 || prev.spec.buffer_retention != spec.buffer_retention
                 || prev.spec.popup != spec.popup
                 || prev.spec.decoration != spec.decoration
+                || prev.spec.background_blur != spec.background_blur
+                || prev.spec.window_icon != spec.window_icon
+                || prev.spec.color_space != spec.color_space
                 || prev.spec.inhibit_idle != spec.inhibit_idle
                 || prev.spec.pointer_constraint != spec.pointer_constraint
                 || prev.spec.accepts_dnd != spec.accepts_dnd

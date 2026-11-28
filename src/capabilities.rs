@@ -32,6 +32,8 @@ pub enum Capability {
     Text,
     /// PNG decoding (`image-png` feature).
     ImagePng,
+    /// JPEG decoding (`image-jpeg` feature).
+    ImageJpeg,
     /// SVG parsing and rasterization (`image-svg` feature).
     ImageSvg,
     /// Animated GIF decoding (`image-gif` feature).
@@ -96,6 +98,16 @@ pub enum Capability {
     PointerConstraints,
     /// Wayland `zwp_relative_pointer_v1` unaccelerated relative pointer deltas (`pointer-constraints` feature + compositor support).
     RelativePointer,
+    /// Audio PCM/level capture and sink loopback monitoring (`pipewire`, `pulseaudio`, or `alsa` feature).
+    AudioCapture,
+    /// Wayland `ext_background_effect_v1` native compositor backdrop blur (`background-effect` feature + compositor support).
+    BackgroundEffect,
+    /// Wayland `xdg_toplevel_icon_v1` toplevel window icons (`toplevel-icon` feature + compositor support).
+    ToplevelIcon,
+    /// Wayland `zwlr_gamma_control_manager_v1` output gamma / color temperature control (`gamma-control` feature + compositor support).
+    GammaControl,
+    /// Wayland `wp_color_management_v1` surface/output color spaces and HDR metadata (`color-management` feature + compositor support).
+    ColorManagement,
 }
 
 /// Snapshot of runtime and compile-time capabilities exposed by [`App`](crate::app::App) and
@@ -123,6 +135,7 @@ impl Capabilities {
         caps.set(Capability::GpuRenderer, cfg!(feature = "renderer-gpu"));
         caps.set(Capability::Text, cfg!(feature = "text"));
         caps.set(Capability::ImagePng, cfg!(feature = "image-png"));
+        caps.set(Capability::ImageJpeg, cfg!(feature = "image-jpeg"));
         caps.set(Capability::ImageSvg, cfg!(feature = "image-svg"));
         caps.set(Capability::ImageGif, cfg!(feature = "image-gif"));
         caps.set(Capability::ImageWebp, cfg!(feature = "image-webp"));
@@ -131,6 +144,14 @@ impl Capabilities {
         caps.set(Capability::PipeWire, cfg!(feature = "pipewire"));
         caps.set(Capability::PulseAudio, cfg!(feature = "pulseaudio"));
         caps.set(Capability::Alsa, cfg!(feature = "alsa"));
+        caps.set(
+            Capability::AudioCapture,
+            cfg!(any(
+                feature = "pipewire",
+                feature = "pulseaudio",
+                feature = "alsa"
+            )),
+        );
         caps.set(
             Capability::AudioPlayback,
             cfg!(any(
@@ -172,7 +193,7 @@ impl Capabilities {
     /// Updates Wayland protocol and seat capabilities from a live [`Capabilities`] snapshot
     /// without clobbering runtime-probed IPC, GPU, audio, or accessibility flags.
     pub(crate) fn refresh_wayland_from(&mut self, wl_caps: &Self) {
-        const WAYLAND_CAPS: [Capability; 27] = [
+        const WAYLAND_CAPS: [Capability; 31] = [
             Capability::Wayland,
             Capability::LayerShell,
             Capability::XdgShell,
@@ -200,6 +221,10 @@ impl Capabilities {
             Capability::VirtualKeyboard,
             Capability::PointerConstraints,
             Capability::RelativePointer,
+            Capability::BackgroundEffect,
+            Capability::ToplevelIcon,
+            Capability::GammaControl,
+            Capability::ColorManagement,
         ];
         for cap in WAYLAND_CAPS {
             self.set(cap, wl_caps.has(cap));

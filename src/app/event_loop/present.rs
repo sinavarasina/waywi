@@ -227,6 +227,8 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
                 deferred.push(rk);
             } else {
                 wl.create_surface(&rt.qh, rk, &surf.spec)?;
+                #[cfg(feature = "toplevel-icon")]
+                wl.sync_toplevel_icon(&rt.qh, rk, &rt.core.assets);
                 progressed = true;
             }
         }
@@ -252,6 +254,8 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
                 }
                 if let Some(surf) = rt.core.reconciler.surfaces.get(&rk) {
                     wl.create_surface(&rt.qh, rk, &surf.spec)?;
+                    #[cfg(feature = "toplevel-icon")]
+                    wl.sync_toplevel_icon(&rt.qh, rk, &rt.core.assets);
                 }
             }
             break;
@@ -261,6 +265,8 @@ pub(crate) fn sync_view_and_subscriptions<A: Application>(
     for rk in &report.updated_surfaces {
         if let Some(surf) = rt.core.reconciler.surfaces.get(rk) {
             wl.update_surface_spec(&rt.qh, *rk, &surf.spec)?;
+            #[cfg(feature = "toplevel-icon")]
+            wl.sync_toplevel_icon(&rt.qh, *rk, &rt.core.assets);
         }
     }
     if let Some(focus_rk) = wl.pointer_focus_surface

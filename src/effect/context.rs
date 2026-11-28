@@ -4,31 +4,26 @@ use std::time::Duration;
 use crate::app::MemoryConfig;
 use crate::asset::{AssetCache, AssetId, AssetRetention};
 use crate::capabilities::{Capabilities, Capability};
-use crate::display::{OutputId, OutputInfo};
+use crate::display::{Output, OutputId, OutputInfo};
 use crate::error::{Result, WaywiError};
 use crate::image::ImageAsset;
 use crate::input::{DndAction, VirtualKeyState};
 use crate::surface::{IntoSurfaceKey, SurfaceKey};
 use crate::system::SystemProviders;
 use crate::wayland_ext::{
-    ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, ScreencopyFrame, ScreencopyTarget,
+    ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, GammaRamp, ScreencopyFrame,
+    ScreencopyTarget,
 };
 
 use super::worker::{
-    ActivationCallback, AssetCallback, DragStartRequest, ExtWorkspaceAction, ForeignToplevelAction,
-    ScreencopyCallback, VirtualKeyboardAction,
+    ActivationCallback, AssetCallback, BlockingTaskCallback, BlockingTaskJob, DragStartRequest,
+    ExtWorkspaceAction, ForeignToplevelAction, GammaAction, ScreencopyCallback,
+    VirtualKeyboardAction,
 };
 
 #[cfg(feature = "clipboard")]
 pub(crate) type ClipboardSetter<'a> =
     &'a mut dyn FnMut(crate::clipboard::ClipboardSelection, Vec<(String, Vec<u8>)>) -> Result<()>;
-
-#[cfg(feature = "text")]
-pub(crate) type TextCursorMeasurer<'a> = &'a mut dyn FnMut(
-    &crate::text::SharedStr,
-    crate::text::TextMeasureStyle<'_>,
-    usize,
-) -> crate::text::TextCursorMetrics;
 
 /// Runtime context passed into `Application::init` and `Application::update`.
 ///
@@ -43,6 +38,7 @@ pub struct EffectCtx<'a, M> {
     pub(crate) memory_config: &'a MemoryConfig,
     pub(crate) assets: &'a mut AssetCache,
     pub(crate) pending_asset_jobs: &'a mut Vec<(PathBuf, AssetCallback<M>)>,
+    pub(crate) pending_blocking_tasks: &'a mut Vec<(BlockingTaskJob, BlockingTaskCallback<M>)>,
     pub(crate) system: &'a mut SystemProviders,
     pub(crate) pending_after: &'a mut Vec<(Duration, M)>,
     pub(crate) reloaded_assets: &'a mut Vec<(AssetId, u64)>,
@@ -55,6 +51,7 @@ pub struct EffectCtx<'a, M> {
     pub(crate) pending_ext_workspace_actions: &'a mut Vec<ExtWorkspaceAction>,
     pub(crate) pending_virtual_keyboard_actions: &'a mut Vec<VirtualKeyboardAction>,
     pub(crate) pending_drag_starts: &'a mut Vec<DragStartRequest>,
+    pub(crate) pending_gamma_actions: &'a mut Vec<GammaAction>,
 
     #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
     pub(crate) audio: &'a crate::audio::AudioClient,
@@ -74,7 +71,9 @@ pub struct EffectCtx<'a, M> {
     #[cfg(feature = "clipboard")]
     pub(crate) clipboard_writer: Option<ClipboardSetter<'a>>,
     #[cfg(feature = "text")]
-    pub(crate) text_cursor_measurer: TextCursorMeasurer<'a>,
+    pub(crate) text_engine: &'a mut crate::text::TextEngine,
+    #[cfg(feature = "text")]
+    pub(crate) frame_seq: u64,
 }
 
 impl<'a, M: 'static> EffectCtx<'a, M> {
@@ -180,6 +179,27 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
     ) {
         self.pending_asset_jobs
             .push((path.as_ref().to_path_buf(), Box::new(map)));
+    }
+
+    /// Dispatches an arbitrary blocking closure to WayWi's lazy background task worker thread and
+    /// delivers `map(result)` back to `Application::update` via automatic `calloop` wakeup.
+    ///
+    /// No thread is spawned unless this method is called. In [`HeadlessRuntime`](crate::app::HeadlessRuntime),
+    /// tasks execute deterministically inline so tests require no sleeping or thread synchronization.
+    pub fn spawn_blocking<T, F, G>(&mut self, task: F, map: G)
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        G: FnOnce(T) -> M + 'static,
+    {
+        let job: BlockingTaskJob = Box::new(move || Box::new(task()));
+        let cb: BlockingTaskCallback<M> = Box::new(move |boxed| {
+            let value = boxed
+                .downcast::<T>()
+                .expect("spawn_blocking downcast type matches job output");
+            map(*value)
+        });
+        self.pending_blocking_tasks.push((job, cb));
     }
 
     /// Reloads `asset` from `path`, updating its revision counter so dependent surfaces invalidate
@@ -306,6 +326,47 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
             .require(Capability::ForeignToplevelControl)?;
         self.pending_toplevel_actions
             .push(ForeignToplevelAction::Close(id));
+        Ok(())
+    }
+
+    /// Uploads a custom hardware RGB [`GammaRamp`] to matching Wayland output(s) via
+    /// `zwlr_gamma_control_manager_v1`.
+    pub fn set_output_gamma(&mut self, output: Output, ramp: GammaRamp) -> Result<()> {
+        self.capabilities.require(Capability::GammaControl)?;
+        ramp.validate()?;
+        self.pending_gamma_actions
+            .push(GammaAction::SetRamp { output, ramp });
+        Ok(())
+    }
+
+    /// Applies a night-light / color-temperature ramp (`kelvin` in `1000..=25000`, `brightness`
+    /// in `0.05..=1.0`) to matching Wayland output(s) via `zwlr_gamma_control_manager_v1`.
+    pub fn set_output_color_temperature(
+        &mut self,
+        output: Output,
+        kelvin: u32,
+        brightness: f32,
+    ) -> Result<()> {
+        self.capabilities.require(Capability::GammaControl)?;
+        let brightness = if brightness.is_finite() {
+            brightness.clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
+        self.pending_gamma_actions
+            .push(GammaAction::SetTemperature {
+                output,
+                kelvin: kelvin.clamp(1000, 25000),
+                brightness,
+            });
+        Ok(())
+    }
+
+    /// Restores the compositor's default hardware gamma table for matching Wayland output(s).
+    pub fn reset_output_gamma(&mut self, output: Output) -> Result<()> {
+        self.capabilities.require(Capability::GammaControl)?;
+        self.pending_gamma_actions
+            .push(GammaAction::Reset { output });
         Ok(())
     }
 
@@ -602,6 +663,34 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
         writer(selection, entries)
     }
 
+    /// Registers custom font bytes (TTF/OTF/TTC) into the shared text engine so application-local
+    /// or embedded icon/UI fonts can be referenced by [`Font::family`](crate::text::Font::family)
+    /// without system installation. Retained across `trim_memory()` and fallback-font rebuilds.
+    ///
+    /// Returns the number of font faces loaded from `bytes`.
+    #[cfg(feature = "text")]
+    pub fn load_font_bytes(&mut self, bytes: Vec<u8>) -> Result<usize> {
+        self.text_engine
+            .load_font_source(std::sync::Arc::new(bytes))
+    }
+
+    /// Registers static embedded font bytes (e.g. `include_bytes!(...)`) into the shared text engine.
+    ///
+    /// Returns the number of font faces loaded from `bytes`.
+    #[cfg(feature = "text")]
+    pub fn load_font_static(&mut self, bytes: &'static [u8]) -> Result<usize> {
+        self.text_engine
+            .load_font_source(std::sync::Arc::new(bytes))
+    }
+
+    /// Loads a custom font file (TTF/OTF/TTC) from disk into the shared text engine.
+    ///
+    /// Returns the number of font faces loaded from `path`.
+    #[cfg(feature = "text")]
+    pub fn load_font_file(&mut self, path: impl AsRef<Path>) -> Result<usize> {
+        self.text_engine.load_font_file(path.as_ref())
+    }
+
     /// Measures shaped text bounds and exact cursor `(x, y)` coordinates at `cursor_byte`
     /// using the default typography line height (`1.25`) and left alignment matching [`crate::text::Text::new`].
     #[cfg(feature = "text")]
@@ -619,9 +708,13 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
             font,
             align: crate::text::TextAlign::Left,
             bounds_mode: crate::text::TextBoundsMode::Typographic,
+            overflow: crate::text::TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
         };
         let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
-        (self.text_cursor_measurer)(&shared, style, cursor_byte)
+        self.text_engine
+            .measure_text_cursor(&shared, style, cursor_byte, self.frame_seq)
     }
 
     /// Measures shaped text bounds and exact cursor `(x, y)` coordinates with full [`crate::text::TextLayoutOptions`].
@@ -634,6 +727,42 @@ impl<'a, M: 'static> EffectCtx<'a, M> {
     ) -> crate::text::TextCursorMetrics {
         let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
         let style = crate::text::TextMeasureStyle::from_options(options);
-        (self.text_cursor_measurer)(&shared, style, cursor_byte)
+        self.text_engine
+            .measure_text_cursor(&shared, style, cursor_byte, self.frame_seq)
+    }
+
+    /// Measures visual highlight rectangles covering `start_byte..end_byte` in shaped text.
+    #[cfg(feature = "text")]
+    pub fn measure_text_selection(
+        &mut self,
+        text: &str,
+        options: &crate::text::TextLayoutOptions,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> crate::text::TextSelectionMetrics {
+        let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
+        let style = crate::text::TextMeasureStyle::from_options(options);
+        self.text_engine.measure_text_selection(
+            &shared,
+            style,
+            start_byte,
+            end_byte,
+            self.frame_seq,
+        )
+    }
+
+    /// Hit-tests a logical `(x, y)` point relative to the text origin and returns the closest
+    /// valid UTF-8 byte offset inside `text` (for click-to-cursor and drag selection).
+    #[cfg(feature = "text")]
+    pub fn hit_test_text_byte(
+        &mut self,
+        text: &str,
+        options: &crate::text::TextLayoutOptions,
+        point: crate::geometry::Point,
+    ) -> usize {
+        let shared = crate::text::SharedStr::from_str_inline_or_arc(text);
+        let style = crate::text::TextMeasureStyle::from_options(options);
+        self.text_engine
+            .hit_test_text_byte(&shared, style, point, self.frame_seq)
     }
 }

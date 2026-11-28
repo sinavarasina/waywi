@@ -1243,6 +1243,36 @@ impl WorkerState {
         }
     }
 
+    fn move_stream(
+        &mut self,
+        dir: AudioDirection,
+        stream_id: u32,
+        device_id: u32,
+        shared: &Arc<Mutex<SharedAudioState>>,
+    ) {
+        let Some(target_name) = self.node_map(dir).get(&device_id).map(|n| n.name.clone()) else {
+            return;
+        };
+        let Some(stream_rec) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+        if stream_rec.direction != dir {
+            return;
+        }
+        if let Some((_, meta)) = &self.default_metadata {
+            let id_str = device_id.to_string();
+            meta.set_property(stream_id, "target.node", Some("Spa:Id"), Some(&id_str));
+            meta.set_property(
+                stream_id,
+                "target.object",
+                Some("Spa:String"),
+                Some(&target_name),
+            );
+            stream_rec.target_id = Some(device_id);
+            self.publish_if_changed(shared);
+        }
+    }
+
     fn resolve_port_selection(
         &self,
         dir: AudioDirection,
@@ -1432,6 +1462,7 @@ fn run_single_pw_session(
         .register();
 
     let state_cmd = Rc::clone(&state);
+    let shared_cmd = Arc::clone(shared);
     let main_loop_cmd = main_loop.downgrade();
     let _cmd_rx = rx.attach(main_loop.loop_(), move |cmd| match cmd {
         AudioCommand::SetVolume(target, level) => {
@@ -1460,6 +1491,11 @@ fn run_single_pw_session(
         }
         AudioCommand::SetDefaultDevice(dir, id) => {
             state_cmd.borrow().select_default_node(dir, id);
+        }
+        AudioCommand::MoveStream(dir, stream_id, device_id) => {
+            state_cmd
+                .borrow_mut()
+                .move_stream(dir, stream_id, device_id, &shared_cmd);
         }
         AudioCommand::SetPort(target, port_name) => {
             state_cmd.borrow().select_port(target, &port_name);
@@ -1820,7 +1856,10 @@ fn run_single_pw_session(
                 ObjectType::Node
                     if classify_media_class(props.get("media.class").unwrap_or_default())
                         .is_some()
-                        && props.get("node.name") != Some("waywi-audio") =>
+                        && !matches!(
+                            props.get("node.name"),
+                            Some("waywi-audio" | "waywi-capture")
+                        ) =>
                 {
                     let Some(direction) =
                         classify_media_class(props.get("media.class").unwrap_or_default())
@@ -1981,6 +2020,7 @@ fn parse_stream_target_id(props: &spa::utils::dict::DictRef) -> Option<u32> {
     props
         .get("node.target")
         .or_else(|| props.get("target.node"))
+        .or_else(|| props.get("target.object"))
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u32>().ok())
 }

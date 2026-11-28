@@ -1,3 +1,5 @@
+use crate::render::Color;
+
 use super::shared_str::SharedStr;
 
 /// Font weight selection.
@@ -106,4 +108,73 @@ pub enum TextBoundsMode {
     /// Tight actual glyph ink bounding box measured from rasterized glyph extents (ideal for
     /// centered single icon glyphs such as Nerd Font PUA symbols, arrows, or badges).
     Optical,
+}
+
+/// Overflow truncation behavior when shaped text exceeds its layout width or `max_lines` limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextOverflow {
+    /// Wrap or clip text without inserting an ellipsis (default).
+    #[default]
+    Clip,
+    /// Truncate the start of the final visible line with an ellipsis (`…end`).
+    EllipsisStart,
+    /// Truncate the middle of the final visible line with an ellipsis (`sta…end`).
+    EllipsisMiddle,
+    /// Truncate the end of the final visible line with an ellipsis (`start…`).
+    EllipsisEnd,
+}
+
+/// Styled inline span inside a multi-style [`Text`](super::element::Text) element.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TextSpan {
+    /// Text content of this span.
+    pub text: SharedStr,
+    /// Optional color override (`None` inherits the parent [`Text`](super::element::Text) color).
+    pub color: Option<Color>,
+    /// Optional font override (`None` inherits the parent [`Text`](super::element::Text) font).
+    pub font: Option<Font>,
+}
+
+impl TextSpan {
+    /// Creates an unstyled text span inheriting the parent `Text` color and font.
+    #[must_use]
+    pub fn new(text: impl Into<SharedStr>) -> Self {
+        Self {
+            text: text.into(),
+            color: None,
+            font: None,
+        }
+    }
+
+    /// Overrides the text color for this span.
+    #[must_use]
+    pub const fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Overrides the font descriptor for this span.
+    #[must_use]
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = Some(font);
+        self
+    }
+}
+
+impl From<&'static str> for TextSpan {
+    fn from(s: &'static str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for TextSpan {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<SharedStr> for TextSpan {
+    fn from(s: SharedStr) -> Self {
+        Self::new(s)
+    }
 }

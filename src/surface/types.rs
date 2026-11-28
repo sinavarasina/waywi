@@ -3,6 +3,8 @@ use std::hash::Hash;
 use bitflags::bitflags;
 
 use crate::geometry::{Bounds, LogicalPx};
+use crate::image::ImageAsset;
+use crate::text::SharedStr;
 
 /// Stable key identifying a declared Wayland surface across `view(state)` updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,6 +115,43 @@ pub enum WindowDecoration {
     Client,
     /// Do not attach a `zxdg_toplevel_decoration_v1` object; render borderless/client-only.
     None,
+}
+
+/// Declarative background blur region requested via `ext_background_effect_v1`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum BackgroundBlur {
+    /// No compositor background blur.
+    #[default]
+    None,
+    /// Blur the entire surface bounds.
+    Full,
+    /// Blur a specific surface-local logical rectangle.
+    Region(Bounds),
+}
+
+/// Declarative window icon requested via `xdg_toplevel_icon_v1` on [`Surface::window`](super::Surface::window).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowIcon {
+    /// Icon theme name (e.g. `"org.waywi.demo"`, `"audio-volume-high"`).
+    Name(SharedStr),
+    /// Loaded WayWi image asset uploaded as a Wayland SHM icon buffer.
+    Asset(ImageAsset),
+}
+
+/// Target surface color space requested via `wp_color_management_v1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ColorSpace {
+    /// Use the compositor's default color management (typically sRGB; unsets explicit description).
+    #[default]
+    Default,
+    /// Standard sRGB primaries + sRGB transfer function.
+    Srgb,
+    /// Wide-gamut Display P3 primaries + sRGB transfer function.
+    DisplayP3,
+    /// HDR BT.2020 primaries + SMPTE ST 2084 (PQ) transfer function.
+    Rec2020Pq,
+    /// Extended linear sRGB primaries + linear transfer function.
+    LinearSrgb,
 }
 
 /// Anchor point on the parent surface's anchor rectangle (`xdg_positioner.set_anchor`).

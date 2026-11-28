@@ -1,7 +1,7 @@
 use crate::accessibility::{AccessibleProps, AccessibleRole};
 use crate::arena::{FrameSharedFn, FrameVec};
 use crate::display::Output;
-use crate::geometry::{Edges, Length, LogicalPx, Size};
+use crate::geometry::{Bounds, Edges, Length, LogicalPx, Size};
 use crate::input::{
     CursorShape, DndEvent, ElementKey, GestureEvent, ImeConfig, ImeEvent, KeyEvent,
     PointerConstraintMode, PointerEvent, RelativePointerEvent, TabletEvent, TouchEvent,
@@ -10,8 +10,9 @@ use crate::render::{Color, Element, begin_memo_check, set_memo_surface_hash};
 use crate::text::SharedStr;
 
 use super::types::{
-    Anchor, BufferRetention, InputMode, IntoSurfaceKey, KeyboardInteractivity, Layer,
-    PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind, WindowDecoration,
+    Anchor, BackgroundBlur, BufferRetention, ColorSpace, InputMode, IntoSurfaceKey,
+    KeyboardInteractivity, Layer, PopupPositioner, PopupSpec, SurfaceKey, SurfaceKind,
+    WindowDecoration, WindowIcon,
 };
 
 /// Wayland surface specification returned from `view(state)`.
@@ -36,6 +37,9 @@ pub struct Surface<M = ()> {
     pub(crate) namespace: SharedStr,
     pub(crate) cursor: CursorShape,
     pub(crate) decoration: WindowDecoration,
+    pub(crate) background_blur: BackgroundBlur,
+    pub(crate) window_icon: Option<WindowIcon>,
+    pub(crate) color_space: ColorSpace,
     pub(crate) inhibit_idle: bool,
     pub(crate) pointer_constraint: PointerConstraintMode,
     pub(crate) dnd_mime_types: Vec<String>,
@@ -121,6 +125,9 @@ impl<M: 'static> Surface<M> {
             namespace: SharedStr::EMPTY,
             cursor: CursorShape::Default,
             decoration: WindowDecoration::default(),
+            background_blur: BackgroundBlur::None,
+            window_icon: None,
+            color_space: ColorSpace::Default,
             inhibit_idle: false,
             pointer_constraint: PointerConstraintMode::None,
             dnd_mime_types: Vec::new(),
@@ -323,6 +330,52 @@ impl<M: 'static> Surface<M> {
         self
     }
 
+    /// Requests compositor background blur (`ext_background_effect_v1`) covering the full surface
+    /// when `enabled` is `true`, or clears blur when `false`.
+    pub fn background_blur(mut self, enabled: bool) -> Self {
+        self.background_blur = if enabled {
+            BackgroundBlur::Full
+        } else {
+            BackgroundBlur::None
+        };
+        self
+    }
+
+    /// Requests compositor background blur (`ext_background_effect_v1`) for an explicit logical
+    /// region (or clears blur when `None`).
+    pub fn background_blur_region(mut self, region: Option<Bounds>) -> Self {
+        self.background_blur = match region {
+            Some(r) => BackgroundBlur::Region(r),
+            None => BackgroundBlur::None,
+        };
+        self
+    }
+
+    /// Sets a native toplevel window icon (`xdg_toplevel_icon_v1`) for [`Self::window`] surfaces.
+    pub fn window_icon(mut self, icon: WindowIcon) -> Self {
+        self.window_icon = Some(icon);
+        self
+    }
+
+    /// Convenience helper setting a toplevel window icon by XDG icon theme name.
+    pub fn window_icon_name(mut self, name: impl Into<SharedStr>) -> Self {
+        self.window_icon = Some(WindowIcon::Name(name.into()));
+        self
+    }
+
+    /// Clears any explicit toplevel window icon.
+    pub fn clear_window_icon(mut self) -> Self {
+        self.window_icon = None;
+        self
+    }
+
+    /// Requests a Wayland color-management image description (`wp_color_management_v1`) for this
+    /// surface (e.g. `DisplayP3`, `Rec2020Pq`, `Srgb`, or `LinearSrgb`).
+    pub fn color_space(mut self, space: ColorSpace) -> Self {
+        self.color_space = space;
+        self
+    }
+
     /// Requests per-surface idle inhibition (`zwp_idle_inhibit_manager_v1`) while this surface is
     /// mapped and visible.
     pub fn inhibit_idle(mut self, inhibit: bool) -> Self {
@@ -522,6 +575,9 @@ impl<M: 'static> Surface<M> {
             namespace: self.namespace,
             cursor: self.cursor,
             decoration: self.decoration,
+            background_blur: self.background_blur,
+            window_icon: self.window_icon,
+            color_space: self.color_space,
             inhibit_idle: self.inhibit_idle,
             pointer_constraint: self.pointer_constraint,
             dnd_mime_types: self.dnd_mime_types,

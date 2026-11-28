@@ -2,9 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use crate::capabilities::{Capabilities, Capability};
-use crate::display::{OutputId, OutputInfo};
+use crate::display::{Output, OutputId, OutputInfo};
 use crate::effect::{
-    DragStartRequest, ExtWorkspaceAction, ForeignToplevelAction, VirtualKeyboardAction,
+    DragStartRequest, ExtWorkspaceAction, ForeignToplevelAction, GammaAction, VirtualKeyboardAction,
 };
 use crate::error::{Result, WaywiError};
 use crate::geometry::{LogicalPx, LogicalSize, Point};
@@ -15,9 +15,11 @@ use crate::input::{
 };
 use crate::reconcile::RetainedSurfaceKey;
 use crate::render::{FrameScene, RenderBackend, RendererPreference};
-use crate::surface::{SurfaceKey, WindowDecoration};
+use crate::surface::{BackgroundBlur, ColorSpace, SurfaceKey, WindowDecoration, WindowIcon};
 use crate::text::SharedStr;
-use crate::wayland_ext::{ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, ScreencopyFrame};
+use crate::wayland_ext::{
+    ExtWorkspaceGroupId, ExtWorkspaceId, ForeignToplevelId, GammaRamp, ScreencopyFrame,
+};
 
 use super::core::{CoreEngine, EffectPostWork};
 use super::memory::MemoryConfig;
@@ -70,6 +72,23 @@ pub struct HeadlessDragStart {
     pub actions: DndAction,
 }
 
+/// `zwlr_gamma_control_manager_v1` action recorded by [`HeadlessRuntime`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeadlessGammaAction {
+    SetRamp {
+        output: Output,
+        ramp: GammaRamp,
+    },
+    SetTemperature {
+        output: Output,
+        kelvin: u32,
+        brightness: f32,
+    },
+    Reset {
+        output: Output,
+    },
+}
+
 /// Deterministic headless runtime driving any [`Application`] without opening a Wayland socket.
 ///
 /// Designed for unit/integration tests and Criterion event-dispatch benchmarks verifying view
@@ -88,6 +107,7 @@ pub struct HeadlessRuntime<A: Application> {
     recorded_ext_workspace_actions: Vec<HeadlessExtWorkspaceAction>,
     recorded_virtual_keyboard_actions: Vec<HeadlessVirtualKeyboardAction>,
     recorded_drag_starts: Vec<HeadlessDragStart>,
+    recorded_gamma_actions: Vec<HeadlessGammaAction>,
     #[cfg(feature = "accessibility")]
     a11y_tree_state: crate::accessibility::AccessibilityTreeState,
 }
@@ -156,6 +176,7 @@ impl<A: Application> HeadlessRuntime<A> {
             recorded_ext_workspace_actions: Vec::new(),
             recorded_virtual_keyboard_actions: Vec::new(),
             recorded_drag_starts: Vec::new(),
+            recorded_gamma_actions: Vec::new(),
             #[cfg(feature = "accessibility")]
             a11y_tree_state: crate::accessibility::AccessibilityTreeState::default(),
         };
@@ -165,6 +186,7 @@ impl<A: Application> HeadlessRuntime<A> {
     }
 
     fn drain_post_work(&mut self, post: EffectPostWork<A::Message>) {
+        self.inbox.extend(post.inline_messages);
         let supported = self.core.capabilities.has(Capability::XdgActivation);
         for (_app_id, callback) in post.activation_requests {
             let result = if supported {
@@ -268,6 +290,27 @@ impl<A: Application> HeadlessRuntime<A> {
                     entries,
                     actions,
                 });
+            }
+        }
+
+        if self.core.capabilities.has(Capability::GammaControl) {
+            for action in post.gamma_actions {
+                let recorded = match action {
+                    GammaAction::SetRamp { output, ramp } => {
+                        HeadlessGammaAction::SetRamp { output, ramp }
+                    }
+                    GammaAction::SetTemperature {
+                        output,
+                        kelvin,
+                        brightness,
+                    } => HeadlessGammaAction::SetTemperature {
+                        output,
+                        kelvin,
+                        brightness,
+                    },
+                    GammaAction::Reset { output } => HeadlessGammaAction::Reset { output },
+                };
+                self.recorded_gamma_actions.push(recorded);
             }
         }
     }
@@ -648,6 +691,42 @@ impl<A: Application> HeadlessRuntime<A> {
     ) -> Option<WindowDecoration> {
         self.surface_by_key(surface_key)
             .map(|surf| surf.spec.decoration)
+    }
+
+    /// Returns the reconciled [`BackgroundBlur`] configuration for a retained surface.
+    #[must_use]
+    pub fn surface_background_blur(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<BackgroundBlur> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.spec.background_blur)
+    }
+
+    /// Returns the reconciled [`WindowIcon`] for a retained surface, if set.
+    #[must_use]
+    pub fn surface_window_icon(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<&WindowIcon> {
+        self.surface_by_key(surface_key)
+            .and_then(|surf| surf.spec.window_icon.as_ref())
+    }
+
+    /// Returns the reconciled [`ColorSpace`] for a retained surface.
+    #[must_use]
+    pub fn surface_color_space(
+        &self,
+        surface_key: impl crate::surface::IntoSurfaceKey,
+    ) -> Option<ColorSpace> {
+        self.surface_by_key(surface_key)
+            .map(|surf| surf.spec.color_space)
+    }
+
+    /// Returns all `zwlr_gamma_control_manager_v1` actions recorded so far.
+    #[must_use]
+    pub fn recorded_gamma_actions(&self) -> &[HeadlessGammaAction] {
+        &self.recorded_gamma_actions
     }
 
     /// Returns whether a retained surface currently requests idle inhibition.

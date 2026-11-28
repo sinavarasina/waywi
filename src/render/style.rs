@@ -1,4 +1,4 @@
-use crate::geometry::LogicalPx;
+use crate::geometry::{Bounds, LogicalPx, Point};
 
 /// RGBA color in sRGB 8-bit channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -185,4 +185,255 @@ pub enum Align {
     Start,
     Center,
     End,
+}
+
+/// Main-axis distribution inside [`Row`](super::Row) and [`Column`](super::Column) containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Justify {
+    /// Pack items at the start of the main axis (default).
+    #[default]
+    Start,
+    /// Center items along the main axis.
+    Center,
+    /// Pack items at the end of the main axis.
+    End,
+    /// Distribute remaining space evenly between adjacent items.
+    SpaceBetween,
+    /// Distribute remaining space around each item (half-space on outer edges).
+    SpaceAround,
+    /// Distribute remaining space equally between all items and outer edges.
+    SpaceEvenly,
+}
+
+/// Color stop along a [`LinearGradient`] or [`RadialGradient`] (`offset` in `0.0..=1.0`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: Color,
+}
+
+impl GradientStop {
+    #[inline]
+    #[must_use]
+    pub fn new(offset: f32, color: Color) -> Self {
+        Self {
+            offset: offset.clamp(0.0, 1.0),
+            color,
+        }
+    }
+}
+
+/// Linear color gradient using normalized `[0.0, 1.0]` coordinates relative to the target bounds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGradient {
+    /// Start point in normalized `[0.0, 1.0]` box coordinates (`(0, 0)` = top-left).
+    pub start: Point,
+    /// End point in normalized `[0.0, 1.0]` box coordinates (`(1, 1)` = bottom-right).
+    pub end: Point,
+    /// Ordered color stops (`offset` in `0.0..=1.0`).
+    pub stops: Vec<GradientStop>,
+}
+
+impl LinearGradient {
+    /// Creates a linear gradient between normalized `start` and `end` coordinates.
+    #[must_use]
+    pub fn new(start: Point, end: Point, stops: impl IntoIterator<Item = GradientStop>) -> Self {
+        Self {
+            start,
+            end,
+            stops: stops.into_iter().collect(),
+        }
+    }
+
+    /// Creates a left-to-right linear gradient from `from` to `to`.
+    #[must_use]
+    pub fn horizontal(from: Color, to: Color) -> Self {
+        Self::new(
+            Point::new(LogicalPx(0.0), LogicalPx(0.5)),
+            Point::new(LogicalPx(1.0), LogicalPx(0.5)),
+            [GradientStop::new(0.0, from), GradientStop::new(1.0, to)],
+        )
+    }
+
+    /// Creates a top-to-bottom linear gradient from `from` to `to`.
+    #[must_use]
+    pub fn vertical(from: Color, to: Color) -> Self {
+        Self::new(
+            Point::new(LogicalPx(0.5), LogicalPx(0.0)),
+            Point::new(LogicalPx(0.5), LogicalPx(1.0)),
+            [GradientStop::new(0.0, from), GradientStop::new(1.0, to)],
+        )
+    }
+
+    /// Creates a linear gradient at `angle_deg` degrees (`0°` = left-to-right, `90°` = top-to-bottom).
+    #[must_use]
+    pub fn angle_deg(angle_deg: f32, stops: impl IntoIterator<Item = GradientStop>) -> Self {
+        let rad = angle_deg.to_radians();
+        let dx = rad.cos() * 0.5;
+        let dy = rad.sin() * 0.5;
+        Self::new(
+            Point::new(LogicalPx(0.5 - dx), LogicalPx(0.5 - dy)),
+            Point::new(LogicalPx(0.5 + dx), LogicalPx(0.5 + dy)),
+            stops,
+        )
+    }
+
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        !self.stops.is_empty() && self.stops.iter().any(|s| s.color.a > 0)
+    }
+}
+
+/// Radial color gradient using normalized `[0.0, 1.0]` center coordinates and radius relative to
+/// the target box's longest edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadialGradient {
+    /// Center point in normalized `[0.0, 1.0]` box coordinates (`(0.5, 0.5)` = center).
+    pub center: Point,
+    /// Radius normalized to `max(width, height)` (`0.5` reaches the edge of a square box).
+    pub radius: f32,
+    /// Ordered color stops (`offset` in `0.0..=1.0`).
+    pub stops: Vec<GradientStop>,
+}
+
+impl RadialGradient {
+    /// Creates a radial gradient centered at `center` with normalized `radius`.
+    #[must_use]
+    pub fn new(center: Point, radius: f32, stops: impl IntoIterator<Item = GradientStop>) -> Self {
+        Self {
+            center,
+            radius: radius.max(0.001),
+            stops: stops.into_iter().collect(),
+        }
+    }
+
+    /// Creates a centered radial gradient from `inner` (`offset 0.0`) to `outer` (`offset 1.0`).
+    #[must_use]
+    pub fn centered(inner: Color, outer: Color) -> Self {
+        Self::new(
+            Point::new(LogicalPx(0.5), LogicalPx(0.5)),
+            0.5,
+            [GradientStop::new(0.0, inner), GradientStop::new(1.0, outer)],
+        )
+    }
+
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        !self.stops.is_empty() && self.stops.iter().any(|s| s.color.a > 0)
+    }
+}
+
+/// Fill brush for [`Rect`](super::Rect) and [`Painter`](super::Painter) primitives.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fill {
+    Solid(Color),
+    Linear(LinearGradient),
+    Radial(RadialGradient),
+}
+
+impl Default for Fill {
+    fn default() -> Self {
+        Self::Solid(Color::TRANSPARENT)
+    }
+}
+
+impl Fill {
+    /// Returns `true` when the fill has at least one non-transparent color/stop.
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        match self {
+            Self::Solid(c) => c.a > 0,
+            Self::Linear(g) => g.is_visible(),
+            Self::Radial(g) => g.is_visible(),
+        }
+    }
+}
+
+impl From<Color> for Fill {
+    #[inline]
+    fn from(color: Color) -> Self {
+        Self::Solid(color)
+    }
+}
+
+impl From<LinearGradient> for Fill {
+    #[inline]
+    fn from(gradient: LinearGradient) -> Self {
+        Self::Linear(gradient)
+    }
+}
+
+impl From<RadialGradient> for Fill {
+    #[inline]
+    fn from(gradient: RadialGradient) -> Self {
+        Self::Radial(gradient)
+    }
+}
+
+/// Drop shadow attached to a [`Rect`](super::Rect).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: LogicalPx,
+    pub offset_y: LogicalPx,
+    pub blur_radius: LogicalPx,
+    pub spread: LogicalPx,
+    pub color: Color,
+}
+
+impl BoxShadow {
+    /// Creates a drop shadow with `(offset_x, offset_y)`, `blur_radius`, and `color` (zero spread).
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        offset_x: LogicalPx,
+        offset_y: LogicalPx,
+        blur_radius: LogicalPx,
+        color: Color,
+    ) -> Self {
+        Self {
+            offset_x,
+            offset_y,
+            blur_radius,
+            spread: LogicalPx::ZERO,
+            color,
+        }
+    }
+
+    /// Sets the shadow spread expansion in logical pixels.
+    #[inline]
+    #[must_use]
+    pub const fn spread(mut self, spread: LogicalPx) -> Self {
+        self.spread = spread;
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        self.color.a > 0
+            && (self.blur_radius.0 > 0.0
+                || self.spread.0 != 0.0
+                || self.offset_x.0 != 0.0
+                || self.offset_y.0 != 0.0)
+    }
+
+    /// Expands `bounds` to conservatively enclose the rendered shadow region (for dirty rects).
+    #[must_use]
+    pub fn expand_bounds(&self, bounds: Bounds) -> Bounds {
+        let pad = self.blur_radius.0.max(0.0) + self.spread.0.max(0.0) + 1.0;
+        let sx = bounds.x.0 + self.offset_x.0 - pad;
+        let sy = bounds.y.0 + self.offset_y.0 - pad;
+        let sx2 = bounds.x.0 + bounds.width.0 + self.offset_x.0 + pad;
+        let sy2 = bounds.y.0 + bounds.height.0 + self.offset_y.0 + pad;
+        let min_x = bounds.x.0.min(sx);
+        let min_y = bounds.y.0.min(sy);
+        let max_x = (bounds.x.0 + bounds.width.0).max(sx2);
+        let max_y = (bounds.y.0 + bounds.height.0).max(sy2);
+        Bounds::new(
+            LogicalPx(min_x),
+            LogicalPx(min_y),
+            LogicalPx((max_x - min_x).max(0.0)),
+            LogicalPx((max_y - min_y).max(0.0)),
+        )
+    }
 }

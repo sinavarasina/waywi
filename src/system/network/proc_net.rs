@@ -55,22 +55,69 @@ pub fn parse_proc_net_dev(contents: &str) -> Vec<NetDevCounters> {
     out
 }
 
-/// Classifies an interface using sysfs attributes (`wireless`, `type`) and Linux naming conventions.
+fn read_uevent_devtype(iface_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(iface_dir.join("uevent")).ok()?;
+    for line in raw.lines() {
+        if let Some(val) = line.strip_prefix("DEVTYPE=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Classifies an interface using authoritative Linux `sysfs` facts (`type`, `wireless/`,
+/// `uevent` `DEVTYPE`, `bridge/`, `tun_flags`, backing `device/`) first, falling back to Linux
+/// naming conventions only when `sysfs` is unavailable.
 #[must_use]
 pub fn classify_interface(name: &str, iface_sys_dir: Option<&Path>) -> NetInterfaceKind {
     if name == "lo" {
         return NetInterfaceKind::Loopback;
     }
     if let Some(dir) = iface_sys_dir {
+        let arp_type = read_sysfs_u32(&dir.join("type"));
+        if arp_type == Some(772) {
+            return NetInterfaceKind::Loopback;
+        }
         if dir.join("wireless").is_dir() {
             return NetInterfaceKind::Wifi;
         }
-        if let Some(arp_type) = read_sysfs_u32(&dir.join("type"))
-            && arp_type == 772
-        {
-            return NetInterfaceKind::Loopback;
+        if let Some(devtype) = read_uevent_devtype(dir) {
+            match devtype.as_str() {
+                "wlan" => return NetInterfaceKind::Wifi,
+                "wwan" => return NetInterfaceKind::Modem,
+                "bridge" | "vlan" | "bond" | "veth" | "tun" | "tap" | "wireguard" | "vxlan"
+                | "macvlan" | "ipvlan" | "dummy" | "ifb" | "geneve" | "gre" => {
+                    return NetInterfaceKind::Virtual;
+                }
+                _ => {}
+            }
+        }
+        if dir.join("bridge").is_dir() || dir.join("tun_flags").is_file() {
+            return NetInterfaceKind::Virtual;
+        }
+        if arp_type == Some(512) {
+            // ARPHRD_PPP
+            return NetInterfaceKind::Modem;
+        }
+        if arp_type == Some(65534) {
+            // ARPHRD_NONE (WireGuard, TUN, Tailscale, etc.)
+            return NetInterfaceKind::Virtual;
+        }
+        if arp_type == Some(1) {
+            // ARPHRD_ETHER: distinguish physical NICs (which expose a hardware `device` symlink)
+            // from software/virtual Ethernet devices (bridges, veth, docker, custom-named taps).
+            return if dir.join("device").exists() {
+                NetInterfaceKind::Ethernet
+            } else {
+                NetInterfaceKind::Virtual
+            };
         }
     }
+
+    // Fallback naming conventions when sysfs metadata is absent.
     if name.starts_with("wl") || name.starts_with("wlan") {
         return NetInterfaceKind::Wifi;
     }
@@ -95,11 +142,6 @@ pub fn classify_interface(name: &str, iface_sys_dir: Option<&Path>) -> NetInterf
         return NetInterfaceKind::Virtual;
     }
     if name.starts_with("en") || name.starts_with("eth") {
-        return NetInterfaceKind::Ethernet;
-    }
-    if let Some(dir) = iface_sys_dir
-        && read_sysfs_u32(&dir.join("type")) == Some(1)
-    {
         return NetInterfaceKind::Ethernet;
     }
     NetInterfaceKind::Other
@@ -322,4 +364,55 @@ fn read_interface_ips() -> HashMap<String, (Option<String>, Option<String>)> {
     // SAFETY: `ifap` was returned by `getifaddrs` and is freed exactly once.
     unsafe { libc::freeifaddrs(ifap) };
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_interface_prefers_sysfs_facts_over_name_guesses() {
+        let base = std::env::temp_dir().join(format!("waywi-net-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 1. Custom-named bridge ("lan0") with type=1 and no `device` symlink -> Virtual, not Ethernet.
+        let br_dir = base.join("lan0");
+        std::fs::create_dir_all(&br_dir).unwrap();
+        std::fs::write(br_dir.join("type"), "1\n").unwrap();
+        std::fs::write(br_dir.join("uevent"), "DEVTYPE=bridge\n").unwrap();
+        assert_eq!(
+            classify_interface("lan0", Some(&br_dir)),
+            NetInterfaceKind::Virtual
+        );
+
+        // 2. Physical NIC named "eth-custom" with type=1 and backing `device` dir -> Ethernet.
+        let eth_dir = base.join("eth-custom");
+        std::fs::create_dir_all(eth_dir.join("device")).unwrap();
+        std::fs::write(eth_dir.join("type"), "1\n").unwrap();
+        assert_eq!(
+            classify_interface("eth-custom", Some(&eth_dir)),
+            NetInterfaceKind::Ethernet
+        );
+
+        // 3. WireGuard tunnel named "office0" with ARPHRD_NONE (65534) -> Virtual.
+        let wg_dir = base.join("office0");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        std::fs::write(wg_dir.join("type"), "65534\n").unwrap();
+        assert_eq!(
+            classify_interface("office0", Some(&wg_dir)),
+            NetInterfaceKind::Virtual
+        );
+
+        // 4. Wi-Fi device with DEVTYPE=wlan regardless of name.
+        let wifi_dir = base.join("net0");
+        std::fs::create_dir_all(&wifi_dir).unwrap();
+        std::fs::write(wifi_dir.join("type"), "1\n").unwrap();
+        std::fs::write(wifi_dir.join("uevent"), "DEVTYPE=wlan\n").unwrap();
+        assert_eq!(
+            classify_interface("net0", Some(&wifi_dir)),
+            NetInterfaceKind::Wifi
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

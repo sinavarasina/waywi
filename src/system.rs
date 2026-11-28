@@ -14,6 +14,7 @@ pub mod providers;
 pub(crate) mod sysfs;
 pub mod time;
 pub mod units;
+pub mod watch;
 
 pub use builders::{
     BatterySubBuilder, BrightnessSubBuilder, CpuSubBuilder, DiskSubBuilder, GpuSubBuilder,
@@ -37,8 +38,8 @@ pub use os::{
     read_process_cgroup,
 };
 pub use privacy::{
-    PrivacyAccessEntry, PrivacyAccessKind, PrivacyAccessSource, PrivacyMonitor, PrivacySnapshot,
-    sample_privacy_oneshot,
+    PipeWireNodeProps, PrivacyAccessEntry, PrivacyAccessKind, PrivacyAccessSource, PrivacyMonitor,
+    PrivacySnapshot, classify_pipewire_node, sample_privacy_oneshot,
 };
 pub use providers::SystemProviders;
 pub(crate) use providers::SystemSamplers;
@@ -47,3 +48,4 @@ pub use time::{
     days_in_month, iso_week_number, month_name, shift_year_month,
 };
 pub use units::{ByteSize, DataRate, FreqUnit, RateUnit};
+pub use watch::{FileWatch, FileWatchEvent, FileWatchKind};

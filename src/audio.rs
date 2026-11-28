@@ -8,6 +8,8 @@ pub(crate) mod alsa;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub(crate) mod backend;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+pub mod capture;
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub mod client;
 #[cfg(feature = "pipewire")]
 pub(crate) mod pipewire;
@@ -18,6 +20,8 @@ pub mod sound;
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub mod types;
 
+#[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
+pub use capture::{AudioCaptureConfig, AudioCaptureFrame, AudioCaptureTarget};
 #[cfg(any(feature = "pipewire", feature = "pulseaudio", feature = "alsa"))]
 pub use client::AudioClient;
 pub use player::AudioPlayer;

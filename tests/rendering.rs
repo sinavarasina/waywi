@@ -891,3 +891,211 @@ fn optical_text_bounds_centers_ink_pixels_symmetrically_in_box() {
         "optical vertical center {ink_cy} drifted from 23.5 (bounds {min_y}..={max_y})"
     );
 }
+
+#[cfg(feature = "renderer-software")]
+#[test]
+fn software_renderer_draws_gradients_box_shadow_rich_text_and_jpeg() {
+    #[cfg(feature = "image-jpeg")]
+    const MINIMAL_1X1_GRAY_JPEG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0xFF,
+        0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00,
+        0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08,
+        0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x7F, 0xFF, 0xD9,
+    ];
+
+    struct State {
+        #[cfg(feature = "image-jpeg")]
+        jpg: ImageAsset,
+    }
+    struct GradApp;
+    impl Application for GradApp {
+        type State = State;
+        type Message = ();
+
+        fn init(ctx: &mut EffectCtx<'_, Self::Message>) -> Result<Self::State> {
+            #[cfg(feature = "image-jpeg")]
+            let jpg = ctx.load_image_bytes(MINIMAL_1X1_GRAY_JPEG)?;
+            #[cfg(not(feature = "image-jpeg"))]
+            let _ = ctx;
+            Ok(State {
+                #[cfg(feature = "image-jpeg")]
+                jpg,
+            })
+        }
+
+        fn update(
+            _state: &mut Self::State,
+            _msg: Self::Message,
+            _ctx: &mut EffectCtx<'_, Self::Message>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn view(state: &Self::State) -> Surfaces<Self::Message> {
+            #[cfg(not(feature = "image-jpeg"))]
+            let _ = state;
+            let mut s = Surfaces::new();
+            let mut surf = Surface::floating("grad-shadow", Output::Primary)
+                .size((120.logical_px(), 100.logical_px()))
+                .background(Color::WHITE)
+                // Linear gradient red -> blue at (0, 0, 60, 20).
+                .child(
+                    Rect::new()
+                        .position(Position::absolute(0.logical_px(), 0.logical_px()))
+                        .size((60.logical_px(), 20.logical_px()))
+                        .fill(LinearGradient::horizontal(
+                            Color::rgb(255, 0, 0),
+                            Color::rgb(0, 0, 255),
+                        )),
+                )
+                // Radial gradient green -> black at (60, 0, 40, 40).
+                .child(
+                    Rect::new()
+                        .position(Position::absolute(60.logical_px(), 0.logical_px()))
+                        .size((40.logical_px(), 40.logical_px()))
+                        .fill(RadialGradient::centered(
+                            Color::rgb(0, 255, 0),
+                            Color::BLACK,
+                        )),
+                )
+                // Card with drop shadow at (12, 36, 32, 20) over white background.
+                .child(
+                    Rect::new()
+                        .position(Position::absolute(12.logical_px(), 36.logical_px()))
+                        .size((32.logical_px(), 20.logical_px()))
+                        .fill(Color::WHITE)
+                        .shadow(BoxShadow::new(
+                            0.logical_px(),
+                            5.logical_px(),
+                            6.logical_px(),
+                            Color::rgba(0, 0, 0, 200),
+                        )),
+                )
+                // Canvas filled with a vertical gradient at (60, 50, 30, 30).
+                .child(
+                    Canvas::new((30.logical_px(), 30.logical_px()), |p| {
+                        p.fill_rect(
+                            Bounds::from_xywh(0.0, 0.0, 30.0, 30.0),
+                            LinearGradient::vertical(
+                                Color::rgb(255, 255, 0),
+                                Color::rgb(0, 255, 255),
+                            ),
+                        );
+                    })
+                    .position(Position::absolute(60.logical_px(), 50.logical_px())),
+                );
+
+            #[cfg(feature = "image-jpeg")]
+            {
+                surf = surf.child(
+                    Image::new(state.jpg)
+                        .position(Position::absolute(100.logical_px(), 50.logical_px()))
+                        .size((10.logical_px(), 10.logical_px())),
+                );
+            }
+
+            #[cfg(feature = "text")]
+            {
+                surf = surf.child(
+                    Text::rich([
+                        TextSpan::new("R").color(Color::rgb(255, 0, 0)),
+                        TextSpan::new("B").color(Color::rgb(0, 0, 255)),
+                    ])
+                    .font_size(16.logical_px())
+                    .position(Position::absolute(8.logical_px(), 72.logical_px())),
+                );
+            }
+
+            s.push(surf);
+            s
+        }
+    }
+
+    let rt = HeadlessRuntime::<GradApp>::new_with_renderer(
+        Capabilities::from_compile_features(),
+        vec![OutputInfo::default()],
+        RendererPreference::Software,
+    )
+    .unwrap();
+    let buf = rt.rendered_buffer("grad-shadow").unwrap();
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let i = (y * 120 + x) * 4;
+        // ARGB8888 little-endian: [B, G, R, A] -> return [R, G, B, A].
+        [buf[i + 2], buf[i + 1], buf[i], buf[i + 3]]
+    };
+
+    // 1. Linear gradient left=red, mid=purple, right=blue.
+    let left = px(2, 10);
+    let mid = px(30, 10);
+    let right = px(57, 10);
+    assert!(left[0] > 220 && left[2] < 35, "left={left:?}");
+    assert!(mid[0] > 90 && mid[2] > 90, "mid={mid:?}");
+    assert!(right[2] > 220 && right[0] < 35, "right={right:?}");
+
+    // 2. Radial gradient center=green, outer corner=dark.
+    let r_center = px(80, 20);
+    let r_corner = px(61, 1);
+    assert!(r_center[1] > 200, "radial center={r_center:?}");
+    assert!(r_corner[1] < 60, "radial corner={r_corner:?}");
+
+    // 3. BoxShadow darkens pixels below the white card (y = 58, x = 28) relative to white (255).
+    let shadow_px = px(28, 58);
+    assert!(
+        shadow_px[0] < 245 && shadow_px[1] < 245 && shadow_px[2] < 245,
+        "expected visible drop shadow below card, got {shadow_px:?}"
+    );
+
+    // 4. Canvas gradient top=yellow (R+G high, B low), bottom=cyan (G+B high, R low).
+    let c_top = px(75, 52);
+    let c_bot = px(75, 78);
+    assert!(
+        c_top[0] > 200 && c_top[1] > 200 && c_top[2] < 60,
+        "c_top={c_top:?}"
+    );
+    assert!(
+        c_bot[2] > 200 && c_bot[1] > 200 && c_bot[0] < 60,
+        "c_bot={c_bot:?}"
+    );
+
+    // 5. JPEG image rendered opaque grayscale over the white background at (105, 55).
+    #[cfg(feature = "image-jpeg")]
+    {
+        let j = px(105, 55);
+        assert_eq!(j[3], 255);
+        assert_eq!(j[0], j[1]);
+        assert_eq!(j[1], j[2]);
+        assert!(
+            j[0] < 200,
+            "expected JPEG pixels to overwrite white background, got {j:?}"
+        );
+    }
+
+    // 6. Rich text spans rendered both red and blue glyphs in y = 72..98, x = 0..45.
+    #[cfg(feature = "text")]
+    {
+        let mut saw_red = false;
+        let mut saw_blue = false;
+        for y in 72..98 {
+            for x in 0..45 {
+                let p = px(x, y);
+                if p[0] > 200 && p[1] < 100 && p[2] < 100 {
+                    saw_red = true;
+                }
+                if p[2] > 200 && p[1] < 100 && p[0] < 100 {
+                    saw_blue = true;
+                }
+            }
+        }
+        assert!(
+            saw_red && saw_blue,
+            "expected red and blue rich text span pixels"
+        );
+    }
+}

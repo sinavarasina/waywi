@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -15,6 +16,8 @@ pub(crate) type AssetCallback<M> = Box<dyn FnOnce(Result<ImageAsset>) -> M>;
 pub(crate) type ActivationCallback<M> = Box<dyn FnOnce(Result<String>) -> M>;
 pub(crate) type ScreencopyCallback<M> =
     Box<dyn FnOnce(Result<crate::wayland_ext::ScreencopyFrame>) -> M>;
+pub(crate) type BlockingTaskJob = Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>;
+pub(crate) type BlockingTaskCallback<M> = Box<dyn FnOnce(Box<dyn Any + Send>) -> M>;
 
 /// Imperative foreign-toplevel control action queued from [`EffectCtx`](super::EffectCtx).
 #[derive(Debug, Clone)]
@@ -64,6 +67,23 @@ pub(crate) struct DragStartRequest {
     pub(crate) surface_key: crate::surface::SurfaceKey,
     pub(crate) entries: Vec<(String, Vec<u8>)>,
     pub(crate) actions: crate::input::DndAction,
+}
+
+/// Imperative `zwlr_gamma_control_manager_v1` action queued from [`EffectCtx`](super::EffectCtx).
+#[derive(Debug, Clone)]
+pub(crate) enum GammaAction {
+    SetRamp {
+        output: crate::display::Output,
+        ramp: crate::wayland_ext::GammaRamp,
+    },
+    SetTemperature {
+        output: crate::display::Output,
+        kelvin: u32,
+        brightness: f32,
+    },
+    Reset {
+        output: crate::display::Output,
+    },
 }
 
 pub(crate) struct AsyncAssetCompletion {
@@ -239,6 +259,145 @@ impl AsyncAssetWorker {
     }
 
     pub(crate) fn drain_completed(&self) -> Vec<AsyncAssetCompletion> {
+        let mut out = Vec::new();
+        while let Ok(item) = self.rx_done.try_recv() {
+            out.push(item);
+        }
+        out
+    }
+}
+
+pub(crate) struct AsyncTaskCompletion {
+    pub(crate) job_id: u64,
+    pub(crate) payload: Box<dyn Any + Send>,
+}
+
+struct AsyncTaskEntry {
+    job_id: u64,
+    job: BlockingTaskJob,
+}
+
+struct TaskWorkerShared {
+    queue: VecDeque<AsyncTaskEntry>,
+    stopped: bool,
+}
+
+/// Lazy single background worker thread used by
+/// [`EffectCtx::spawn_blocking`](super::EffectCtx::spawn_blocking) so user blocking tasks never
+/// stall the Wayland event loop and wake `calloop` via its registered ping source on completion.
+pub(crate) struct AsyncTaskWorker {
+    shared: Arc<(Mutex<TaskWorkerShared>, Condvar)>,
+    tx_done: mpsc::Sender<AsyncTaskCompletion>,
+    rx_done: mpsc::Receiver<AsyncTaskCompletion>,
+    wakeup: WakeupHook,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Default for AsyncTaskWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AsyncTaskWorker {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.shared.0.lock() {
+            guard.stopped = true;
+            self.shared.1.notify_all();
+        }
+        if let Ok(mut guard) = self.handle.lock()
+            && let Some(h) = guard.take()
+        {
+            let _ = h.join();
+        }
+    }
+}
+
+impl AsyncTaskWorker {
+    pub(crate) fn new() -> Self {
+        let (tx_done, rx_done) = mpsc::channel();
+        Self {
+            shared: Arc::new((
+                Mutex::new(TaskWorkerShared {
+                    queue: VecDeque::new(),
+                    stopped: false,
+                }),
+                Condvar::new(),
+            )),
+            tx_done,
+            rx_done,
+            wakeup: Arc::new(Mutex::new(None)),
+            handle: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_wakeup<F>(&self, wake: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.wakeup.lock() {
+            *guard = Some(Box::new(wake));
+        }
+    }
+
+    fn ensure_started(&self) {
+        let mut handle_guard = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        if handle_guard.is_some() {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let tx = self.tx_done.clone();
+        let wakeup = Arc::clone(&self.wakeup);
+
+        let spawned = thread::Builder::new()
+            .name("waywi-task-worker".to_string())
+            .spawn(move || {
+                loop {
+                    let entry = {
+                        let (lock, cvar) = &*shared;
+                        let mut guard = match lock.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        while guard.queue.is_empty() && !guard.stopped {
+                            guard = match cvar.wait(guard) {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
+                        }
+                        if guard.stopped {
+                            break;
+                        }
+                        guard.queue.pop_front()
+                    };
+
+                    let Some(entry) = entry else {
+                        continue;
+                    };
+                    let payload = (entry.job)();
+                    let _ = tx.send(AsyncTaskCompletion {
+                        job_id: entry.job_id,
+                        payload,
+                    });
+                    notify_wakeup(&wakeup);
+                }
+            });
+
+        if let Ok(h) = spawned {
+            *handle_guard = Some(h);
+        }
+    }
+
+    pub(crate) fn submit(&self, job_id: u64, job: BlockingTaskJob) {
+        self.ensure_started();
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.queue.push_back(AsyncTaskEntry { job_id, job });
+            cvar.notify_one();
+        }
+    }
+
+    pub(crate) fn drain_completed(&self) -> Vec<AsyncTaskCompletion> {
         let mut out = Vec::new();
         while let Ok(item) = self.rx_done.try_recv() {
             out.push(item);

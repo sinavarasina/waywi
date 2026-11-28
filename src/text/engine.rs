@@ -3,16 +3,21 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "text")]
 use std::path::Path;
 #[cfg(feature = "text")]
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "text")]
-use super::font::{Font, FontStyle, TextAlign, TextBoundsMode};
+use super::font::{Font, FontStyle, TextAlign, TextBoundsMode, TextOverflow, TextSpan};
 #[cfg(feature = "text")]
 use super::shared_str::SharedStr;
 #[cfg(feature = "text")]
-use crate::geometry::{LogicalPx, LogicalSize, ScaleFactor};
+use crate::error::{Result, WaywiError};
+#[cfg(feature = "text")]
+use crate::geometry::{Bounds, LogicalPx, LogicalSize, Point, ScaleFactor};
 #[cfg(feature = "text")]
 use crate::render::Color;
+
+#[cfg(feature = "text")]
+const MAX_FONT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "text")]
 #[derive(Clone, Copy)]
@@ -32,7 +37,7 @@ pub(crate) struct TextRasterTarget<'a> {
 }
 
 /// Shared `cosmic-text` font system and glyph cache backed by a process-cached Fontconfig
-/// `fontdb::Database`.
+/// `fontdb::Database` plus any application-registered custom font binaries.
 #[cfg(feature = "text")]
 pub(crate) struct TextEngine {
     font_system: cosmic_text::FontSystem,
@@ -40,6 +45,8 @@ pub(crate) struct TextEngine {
     buffer_cache: HashMap<TextShapeKey, CachedTextBuffer>,
     locale: String,
     load_system_fonts: bool,
+    custom_fonts: Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    custom_font_revision: u64,
     max_cached_buffers: usize,
     stale_frame_age: u64,
     max_mapped_font_files: usize,
@@ -51,6 +58,7 @@ pub(crate) struct TextEngine {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TextShapeKey {
     text: SharedStr,
+    spans: Option<Box<[TextSpan]>>,
     font_size_milli: u32,
     line_height_milli: u32,
     max_width_milli: Option<u32>,
@@ -59,6 +67,8 @@ struct TextShapeKey {
     font: Font,
     align: TextAlign,
     bounds_mode: TextBoundsMode,
+    overflow: TextOverflow,
+    max_lines: Option<usize>,
 }
 
 #[cfg(feature = "text")]
@@ -103,7 +113,7 @@ impl TextEngine {
             .next()
             .unwrap_or("en-US")
             .replace('_', "-");
-        let font_system = Self::build_font_system(locale.clone(), load_system_fonts);
+        let font_system = Self::build_font_system(locale.clone(), load_system_fonts, &[]);
 
         Self {
             font_system,
@@ -111,6 +121,8 @@ impl TextEngine {
             buffer_cache: HashMap::new(),
             locale,
             load_system_fonts,
+            custom_fonts: Vec::new(),
+            custom_font_revision: 0,
             max_cached_buffers: max_cached_buffers.max(8),
             stale_frame_age: stale_frame_age.max(1),
             max_mapped_font_files,
@@ -119,21 +131,79 @@ impl TextEngine {
         }
     }
 
-    fn build_font_system(locale: String, load_system_fonts: bool) -> cosmic_text::FontSystem {
-        let db = if load_system_fonts {
+    fn build_font_system(
+        locale: String,
+        load_system_fonts: bool,
+        custom_fonts: &[Arc<dyn AsRef<[u8]> + Send + Sync>],
+    ) -> cosmic_text::FontSystem {
+        let mut db = if load_system_fonts {
             shared_system_font_db()
         } else {
             fontdb::Database::new()
         };
+        for bytes in custom_fonts {
+            db.load_font_source(fontdb::Source::Binary(Arc::clone(bytes)));
+        }
         cosmic_text::FontSystem::new_with_locale_and_db(locale, db)
     }
 
     fn rebuild_font_system(&mut self) {
         // Cloning `SYSTEM_FONT_DB` preserves deterministic `fontdb::ID` slotmap keys while
         // resetting every face source back to unmapped `Source::File`, dropping all `Arc<Mmap>`s.
-        self.font_system = Self::build_font_system(self.locale.clone(), self.load_system_fonts);
+        self.font_system = Self::build_font_system(
+            self.locale.clone(),
+            self.load_system_fonts,
+            &self.custom_fonts,
+        );
         self.font_system_bloated = false;
         self.bloated_at_frame = 0;
+    }
+
+    #[cfg_attr(not(feature = "renderer-gpu"), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn custom_font_revision(&self) -> u64 {
+        self.custom_font_revision
+    }
+
+    /// Registers custom font bytes (TTF/OTF/TTC/WOFF) into the active `FontSystem` and retains
+    /// them across `trim()` / fallback-storm rebuilds. Returns the number of loaded font faces.
+    pub(crate) fn load_font_source(
+        &mut self,
+        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ) -> Result<usize> {
+        if (*bytes).as_ref().is_empty() {
+            return Err(WaywiError::AssetDecode("font data is empty".to_owned()));
+        }
+        let before = self.font_system.db().len();
+        self.font_system
+            .db_mut()
+            .load_font_source(fontdb::Source::Binary(Arc::clone(&bytes)));
+        let added = self.font_system.db().len().saturating_sub(before);
+        if added == 0 {
+            return Err(WaywiError::AssetDecode(
+                "no valid font faces found in provided font bytes".to_owned(),
+            ));
+        }
+        self.custom_fonts.push(bytes);
+        self.custom_font_revision = self.custom_font_revision.wrapping_add(1);
+        self.buffer_cache.clear();
+        self.swash_cache = cosmic_text::SwashCache::new();
+        Ok(added)
+    }
+
+    /// Reads a bounded font file from disk and registers its faces into the active `FontSystem`.
+    pub(crate) fn load_font_file(&mut self, path: &Path) -> Result<usize> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_FONT_FILE_BYTES {
+            return Err(WaywiError::AssetDecode(format!(
+                "font file {} exceeds max size ({} > {} bytes)",
+                path.display(),
+                meta.len(),
+                MAX_FONT_FILE_BYTES
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        self.load_font_source(Arc::new(bytes))
     }
 
     fn has_mapped_fonts(&self) -> bool {
@@ -285,17 +355,169 @@ impl TextEngine {
         }
     }
 
+    /// Measures logical highlight rectangles for the UTF-8 byte range `start_byte..end_byte`
+    /// across single-line and wrapped/multi-line shaped text.
+    pub(crate) fn measure_text_selection(
+        &mut self,
+        content: &SharedStr,
+        style: super::TextMeasureStyle<'_>,
+        start_byte: usize,
+        end_byte: usize,
+        frame_seq: u64,
+    ) -> super::TextSelectionMetrics {
+        let text = content.as_str();
+        let default_lh = compute_line_height_px(style.font_size, style.line_height_multiplier, 1.0);
+        if text.is_empty() {
+            return super::TextSelectionMetrics {
+                size: LogicalSize::new(LogicalPx::ZERO, LogicalPx(default_lh.ceil())),
+                rects: Vec::new(),
+            };
+        }
+
+        let (raw_lo, raw_hi) = if start_byte <= end_byte {
+            (start_byte, end_byte)
+        } else {
+            (end_byte, start_byte)
+        };
+        let lo = crate::input::text_input::snap_char_boundary(text, raw_lo);
+        let hi = crate::input::text_input::snap_char_boundary(text, raw_hi);
+
+        let params = TextDrawParams {
+            content,
+            style,
+            wrap_to_width: style.max_width.is_some(),
+            scale: ScaleFactor::ONE,
+        };
+        let key = Self::make_key(params);
+        let shaped = self.ensure_shaped(key, params, frame_seq);
+        let size = shaped.logical_size;
+        if lo >= hi {
+            return super::TextSelectionMetrics {
+                size,
+                rects: Vec::new(),
+            };
+        }
+
+        let line_starts = compute_line_byte_starts(text);
+        let mut rects = Vec::new();
+        for run in shaped.buffer.layout_runs() {
+            let Some(&line_global_start) = line_starts.get(run.line_i) else {
+                continue;
+            };
+            let line_len = run.text.len();
+            let line_global_end = line_global_start + line_len;
+            if hi <= line_global_start || lo >= line_global_end {
+                continue;
+            }
+
+            let run_local_lo = lo.saturating_sub(line_global_start).min(line_len);
+            let run_local_hi = hi.saturating_sub(line_global_start).min(line_len);
+            if run_local_lo >= run_local_hi {
+                continue;
+            }
+
+            // Compute visual X span of glyphs intersecting `[run_local_lo, run_local_hi)` in this run.
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            for glyph in run.glyphs {
+                if glyph.end <= run_local_lo || glyph.start >= run_local_hi {
+                    continue;
+                }
+                min_x = min_x.min(glyph.x);
+                max_x = max_x.max(glyph.x + glyph.w);
+            }
+            if !min_x.is_finite() || !max_x.is_finite() {
+                let c0 = cosmic_text::Cursor::new(run.line_i, run_local_lo);
+                let c1 = cosmic_text::Cursor::new(run.line_i, run_local_hi);
+                if let (Some(x0), Some(x1)) = (run.cursor_position(&c0), run.cursor_position(&c1)) {
+                    min_x = x0.min(x1);
+                    max_x = x0.max(x1);
+                }
+            }
+            if min_x.is_finite() && max_x.is_finite() && max_x > min_x {
+                rects.push(Bounds::new(
+                    LogicalPx(min_x),
+                    LogicalPx(run.line_top),
+                    LogicalPx(max_x - min_x),
+                    LogicalPx(run.line_height),
+                ));
+            }
+        }
+
+        super::TextSelectionMetrics { size, rects }
+    }
+
+    /// Maps a logical `(x, y)` point relative to the text origin to the nearest UTF-8 byte offset.
+    pub(crate) fn hit_test_text_byte(
+        &mut self,
+        content: &SharedStr,
+        style: super::TextMeasureStyle<'_>,
+        point: Point,
+        frame_seq: u64,
+    ) -> usize {
+        let text = content.as_str();
+        if text.is_empty() {
+            return 0;
+        }
+        let params = TextDrawParams {
+            content,
+            style,
+            wrap_to_width: style.max_width.is_some(),
+            scale: ScaleFactor::ONE,
+        };
+        let key = Self::make_key(params);
+        let shaped = self.ensure_shaped(key, params, frame_seq);
+        let line_starts = compute_line_byte_starts(text);
+
+        if let Some(cursor) = shaped.buffer.hit(point.x.0, point.y.0)
+            && let Some(&line_start) = line_starts.get(cursor.line)
+        {
+            return crate::input::text_input::snap_char_boundary(
+                text,
+                line_start.saturating_add(cursor.index),
+            );
+        }
+
+        // Fallback when pointer is outside exact glyph boxes (before start, past line end, or below).
+        let mut best_line: Option<(usize, usize, f32, f32)> = None;
+        for run in shaped.buffer.layout_runs() {
+            let dist_y = if point.y.0 < run.line_top {
+                run.line_top - point.y.0
+            } else if point.y.0 > run.line_top + run.line_height {
+                point.y.0 - (run.line_top + run.line_height)
+            } else {
+                0.0
+            };
+            if best_line.is_none_or(|(_, _, best_d, _)| dist_y < best_d) {
+                best_line = Some((run.line_i, run.text.len(), dist_y, run.line_w));
+            }
+        }
+        let Some((line_i, line_len, _, _)) = best_line else {
+            return 0;
+        };
+        let line_start = line_starts.get(line_i).copied().unwrap_or(0);
+        if point.x.0 <= 0.0 {
+            line_start
+        } else {
+            crate::input::text_input::snap_char_boundary(text, line_start.saturating_add(line_len))
+        }
+    }
+
     fn make_key(params: TextDrawParams<'_>) -> TextShapeKey {
         let s = params.style;
-        // Unwrapped left-aligned text has identical layout regardless of container width, so
-        // normalizing `max_width_milli` shares shaped buffers between auto layout and draw passes.
-        let max_width_milli = if params.wrap_to_width || s.align != TextAlign::Left {
+        // Unwrapped left-aligned non-ellipsized text has identical layout regardless of container
+        // width, so normalizing `max_width_milli` shares shaped buffers between layout and draw.
+        let max_width_milli = if params.wrap_to_width
+            || s.align != TextAlign::Left
+            || s.overflow != TextOverflow::Clip
+        {
             s.max_width.map(|w| (w.0.max(0.0) * 1000.0).round() as u32)
         } else {
             None
         };
         TextShapeKey {
             text: params.content.clone(),
+            spans: s.spans.map(|sp| sp.to_vec().into_boxed_slice()),
             font_size_milli: (s.font_size.0.max(1.0) * 1000.0).round() as u32,
             line_height_milli: (s.line_height_multiplier.max(0.5) * 1000.0).round() as u32,
             max_width_milli,
@@ -304,6 +526,8 @@ impl TextEngine {
             font: s.font.clone(),
             align: s.align,
             bounds_mode: s.bounds_mode,
+            overflow: s.overflow,
+            max_lines: s.max_lines,
         }
     }
 
@@ -359,49 +583,73 @@ impl TextEngine {
             let metrics = cosmic_text::Metrics::new(fs_px, lh_px);
             let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
 
-            buffer.set_wrap(if params.wrap_to_width {
+            let effective_wrap = if params.wrap_to_width
+                || (s.overflow != TextOverflow::Clip && s.max_lines.is_some_and(|n| n > 1))
+            {
                 cosmic_text::Wrap::WordOrGlyph
             } else {
                 cosmic_text::Wrap::None
-            });
-            let width_px = s.max_width.map(|w| (w.0 * scale).max(1.0));
-            buffer.set_size(width_px, None);
-
-            let family = match (&s.font.family, s.font.monospace) {
-                (Some(name), _) => match name.as_str() {
-                    "sans-serif" | "sans serif" => cosmic_text::Family::SansSerif,
-                    "monospace" => cosmic_text::Family::Monospace,
-                    "serif" => cosmic_text::Family::Serif,
-                    "cursive" => cosmic_text::Family::Cursive,
-                    "fantasy" => cosmic_text::Family::Fantasy,
-                    other => cosmic_text::Family::Name(other),
-                },
-                (None, true) => cosmic_text::Family::Monospace,
-                (None, false) => cosmic_text::Family::SansSerif,
             };
-            let attrs = cosmic_text::Attrs::new()
-                .family(family)
-                .weight(cosmic_text::Weight(s.font.weight.to_numeric()))
-                .style(match s.font.style {
-                    FontStyle::Normal => cosmic_text::Style::Normal,
-                    FontStyle::Italic => cosmic_text::Style::Italic,
-                });
+            buffer.set_wrap(effective_wrap);
+            let ellipsize = match s.overflow {
+                TextOverflow::Clip => cosmic_text::Ellipsize::None,
+                TextOverflow::EllipsisStart => cosmic_text::Ellipsize::Start(
+                    cosmic_text::EllipsizeHeightLimit::Lines(s.max_lines.unwrap_or(1).max(1)),
+                ),
+                TextOverflow::EllipsisMiddle => cosmic_text::Ellipsize::Middle(
+                    cosmic_text::EllipsizeHeightLimit::Lines(s.max_lines.unwrap_or(1).max(1)),
+                ),
+                TextOverflow::EllipsisEnd => cosmic_text::Ellipsize::End(
+                    cosmic_text::EllipsizeHeightLimit::Lines(s.max_lines.unwrap_or(1).max(1)),
+                ),
+            };
+            buffer.set_ellipsize(ellipsize);
+
+            let width_px = s.max_width.map(|w| (w.0 * scale).max(1.0));
+            let height_px = s.max_lines.map(|n| (n.max(1) as f32) * lh_px);
+            buffer.set_size(width_px, height_px);
+
+            let attrs = font_to_cosmic_attrs(s.font);
             let c_align = match s.align {
                 TextAlign::Left => Some(cosmic_text::Align::Left),
                 TextAlign::Center => Some(cosmic_text::Align::Center),
                 TextAlign::Right => Some(cosmic_text::Align::Right),
             };
-            buffer.set_text(
-                params.content.as_str(),
-                &attrs,
-                cosmic_text::Shaping::Advanced,
-                c_align,
-            );
+            if let Some(spans) = s.spans
+                && !spans.is_empty()
+            {
+                let span_attrs: Vec<(&str, cosmic_text::Attrs<'_>)> = spans
+                    .iter()
+                    .map(|sp| {
+                        let mut a = match sp.font.as_ref() {
+                            Some(f) => font_to_cosmic_attrs(f),
+                            None => attrs.clone(),
+                        };
+                        if let Some(c) = sp.color {
+                            a = a.color(cosmic_text::Color::rgba(c.r, c.g, c.b, c.a));
+                        }
+                        (sp.text.as_str(), a)
+                    })
+                    .collect();
+                buffer.set_rich_text(span_attrs, &attrs, cosmic_text::Shaping::Advanced, c_align);
+            } else {
+                buffer.set_text(
+                    params.content.as_str(),
+                    &attrs,
+                    cosmic_text::Shaping::Advanced,
+                    c_align,
+                );
+            }
             buffer.shape_until_scroll(font_system, false);
 
             let mut max_w = 0.0_f32;
             let mut line_count = 0_usize;
             for run in buffer.layout_runs() {
+                if let Some(limit) = s.max_lines
+                    && line_count >= limit.max(1)
+                {
+                    break;
+                }
                 max_w = max_w.max(run.line_w);
                 line_count += 1;
             }
@@ -491,8 +739,8 @@ impl TextEngine {
             ..
         } = self;
         let cached = buffer_cache.get_mut(&key).expect("shaped buffer cached");
-        let base_alpha = (f32::from(color.a) * opacity.clamp(0.0, 1.0)).round() as u8;
-        let text_color = cosmic_text::Color::rgba(color.r, color.g, color.b, base_alpha);
+        let clamped_opacity = opacity.clamp(0.0, 1.0);
+        let text_color = cosmic_text::Color::rgba(color.r, color.g, color.b, color.a);
         let ox = (origin.0 * scale_f).round() as i32 + cached.draw_offset_px.0;
         let oy = (origin.1 * scale_f).round() as i32 + cached.draw_offset_px.1;
 
@@ -506,7 +754,11 @@ impl TextEngine {
                 }
                 let gx = ox + px;
                 let gy = oy + py;
-                let ga = glyph_color.a();
+                let ga = if clamped_opacity < 1.0 {
+                    (f32::from(glyph_color.a()) * clamped_opacity).round() as u8
+                } else {
+                    glyph_color.a()
+                };
                 if ga == 0 {
                     return;
                 }
@@ -555,6 +807,40 @@ fn compute_line_height_px(font_size: LogicalPx, multiplier: f32, scale: f32) -> 
     (fs_px * multiplier.max(0.5)).max(1.0)
 }
 
+#[cfg(feature = "text")]
+fn font_to_cosmic_attrs(font: &Font) -> cosmic_text::Attrs<'_> {
+    let family = match (&font.family, font.monospace) {
+        (Some(name), _) => match name.as_str() {
+            "sans-serif" | "sans serif" => cosmic_text::Family::SansSerif,
+            "monospace" => cosmic_text::Family::Monospace,
+            "serif" => cosmic_text::Family::Serif,
+            "cursive" => cosmic_text::Family::Cursive,
+            "fantasy" => cosmic_text::Family::Fantasy,
+            other => cosmic_text::Family::Name(other),
+        },
+        (None, true) => cosmic_text::Family::Monospace,
+        (None, false) => cosmic_text::Family::SansSerif,
+    };
+    cosmic_text::Attrs::new()
+        .family(family)
+        .weight(cosmic_text::Weight(font.weight.to_numeric()))
+        .style(match font.style {
+            FontStyle::Normal => cosmic_text::Style::Normal,
+            FontStyle::Italic => cosmic_text::Style::Italic,
+        })
+}
+
+#[cfg(feature = "text")]
+fn compute_line_byte_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (idx, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
 #[cfg(all(test, feature = "text"))]
 mod tests {
     use super::*;
@@ -576,6 +862,9 @@ mod tests {
                     font: &font,
                     align: TextAlign::Left,
                     bounds_mode: TextBoundsMode::Typographic,
+                    overflow: TextOverflow::Clip,
+                    max_lines: None,
+                    spans: None,
                 },
                 ScaleFactor::ONE,
                 1,
@@ -595,6 +884,9 @@ mod tests {
                         font: &font,
                         align: TextAlign::Left,
                         bounds_mode: TextBoundsMode::Typographic,
+                        overflow: TextOverflow::Clip,
+                        max_lines: None,
+                        spans: None,
                     },
                     wrap_to_width: false,
                     scale,
@@ -622,6 +914,9 @@ mod tests {
             font: &font,
             align: TextAlign::Left,
             bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
         };
 
         let m_empty = engine.measure_text_cursor(&SharedStr::EMPTY, style, 0, 1);
@@ -668,6 +963,9 @@ mod tests {
             font: &font,
             align: TextAlign::Left,
             bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
         };
         let optical_style = TextMeasureStyle {
             bounds_mode: TextBoundsMode::Optical,
@@ -745,6 +1043,9 @@ mod tests {
             font: &font,
             align: TextAlign::Left,
             bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
         };
         let first =
             engine.measure_text(&SharedStr::from("Hello WayWi"), style, ScaleFactor::ONE, 1);
@@ -788,6 +1089,9 @@ mod tests {
             font: &font,
             align: TextAlign::Left,
             bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
         };
         // Noncharacter U+10FFFD is guaranteed unassigned in Unicode, triggering exhaustive fallback.
         let content = SharedStr::from("Alert \u{10FFFD}");
@@ -841,5 +1145,120 @@ mod tests {
         assert!(disabled.mapped_font_file_count() > 2);
         disabled.trim();
         assert_eq!(disabled.mapped_font_file_count(), 0);
+    }
+
+    #[test]
+    fn ellipsis_max_lines_rich_spans_selection_and_hit_test_work() {
+        let mut engine = TextEngine::new();
+        let font = Font::sans();
+        let long =
+            SharedStr::from("This is a very long window title that should ellipsize cleanly");
+        let full_style = TextMeasureStyle {
+            font_size: LogicalPx(14.0),
+            line_height_multiplier: 1.25,
+            max_width: Some(LogicalPx(90.0)),
+            font: &font,
+            align: TextAlign::Left,
+            bounds_mode: TextBoundsMode::Typographic,
+            overflow: TextOverflow::Clip,
+            max_lines: None,
+            spans: None,
+        };
+        let wrapped = engine.measure_text(&long, full_style, ScaleFactor::ONE, 1);
+        let single_line = engine.measure_text(
+            &long,
+            TextMeasureStyle {
+                overflow: TextOverflow::EllipsisEnd,
+                max_lines: Some(1),
+                ..full_style
+            },
+            ScaleFactor::ONE,
+            2,
+        );
+        assert!(
+            single_line.height.0 < wrapped.height.0,
+            "1-line ellipsized text ({:?}) must be shorter than unwrapped multiline ({:?})",
+            single_line,
+            wrapped
+        );
+        assert!(single_line.width.0 <= 92.0);
+
+        // Rich spans render per-span colors into distinct RGBA channels.
+        let spans = [
+            TextSpan::new("R").color(Color::RED),
+            TextSpan::new("B").color(Color::BLUE),
+        ];
+        let rich_style = TextMeasureStyle {
+            max_width: None,
+            spans: Some(&spans),
+            ..full_style
+        };
+        let content = SharedStr::from("RB");
+        let sz = engine.measure_text(&content, rich_style, ScaleFactor::ONE, 3);
+        let w = (sz.width.0.ceil() as u32).max(16) + 8;
+        let h = (sz.height.0.ceil() as u32).max(16) + 8;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut target = TextRasterTarget {
+            dst: &mut pixels,
+            width: w,
+            height: h,
+            clip: crate::geometry::BufferRect {
+                x: 0,
+                y: 0,
+                width: w as i32,
+                height: h as i32,
+            },
+        };
+        engine.draw_text_premultiplied_rgba(
+            &mut target,
+            (2.0, 2.0),
+            TextDrawParams {
+                content: &content,
+                style: rich_style,
+                wrap_to_width: false,
+                scale: ScaleFactor::ONE,
+            },
+            Color::WHITE,
+            1.0,
+            3,
+        );
+        let (rgba, _) = pixels.as_chunks::<4>();
+        let has_red = rgba.iter().any(|p| p[0] > 180 && p[2] < 40 && p[3] > 0);
+        let has_blue = rgba.iter().any(|p| p[2] > 180 && p[0] < 40 && p[3] > 0);
+        assert!(
+            has_red && has_blue,
+            "expected both red and blue span pixels"
+        );
+
+        // Selection metrics & hit-testing roundtrip.
+        let sample = SharedStr::from("Hello World");
+        let sel_style = TextMeasureStyle {
+            max_width: None,
+            ..full_style
+        };
+        let sel = engine.measure_text_selection(&sample, sel_style, 0, 5, 4);
+        assert_eq!(sel.rects.len(), 1);
+        assert!(sel.rects[0].width.0 > 0.0);
+        let hit_end = engine.hit_test_text_byte(
+            &sample,
+            sel_style,
+            Point::new(LogicalPx(500.0), LogicalPx(8.0)),
+            4,
+        );
+        assert_eq!(hit_end, sample.len());
+        let hit_start = engine.hit_test_text_byte(
+            &sample,
+            sel_style,
+            Point::new(LogicalPx(0.0), LogicalPx(8.0)),
+            4,
+        );
+        assert_eq!(hit_start, 0);
+
+        // Invalid custom font bytes return an honest error.
+        assert!(
+            engine
+                .load_font_source(Arc::new(&b"not-a-font"[..]))
+                .is_err()
+        );
     }
 }

@@ -60,15 +60,35 @@ pub fn parse_proc_diskstats(contents: &str) -> Vec<DiskIoCounters> {
 }
 
 fn is_whole_block_device(name: &str) -> bool {
+    // Stacked device-mapper (LUKS/LVM) and RAM-backed zram devices sit above physical block
+    // devices or memory; excluding them from `is_whole_disk` prevents double-counting totals.
+    if name.starts_with("dm-") || name.starts_with("zram") {
+        return false;
+    }
     if let Some(rest) = name.strip_prefix("nvme") {
-        // nvme0n1 is whole namespace; nvme0n1p1 is a partition.
-        return rest.contains('n') && !rest.split('n').next_back().unwrap_or("").contains('p');
+        // `nvme<ctrl>n<ns>` is whole namespace; `nvme<ctrl>n<ns>p<part>` is a partition.
+        let Some((ctrl, ns)) = rest.split_once('n') else {
+            return false;
+        };
+        return !ctrl.is_empty()
+            && !ns.is_empty()
+            && ctrl.bytes().all(|b| b.is_ascii_digit())
+            && ns.bytes().all(|b| b.is_ascii_digit());
     }
     if let Some(rest) = name.strip_prefix("mmcblk") {
-        return !rest.contains('p');
+        // `mmcblk<n>` is whole card; `mmcblk<n>p<k>`, `mmcblk<n>boot<k>`, `mmcblk<n>rpmb` are not.
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
     }
-    if name.starts_with("sd") || name.starts_with("vd") || name.starts_with("hd") {
-        return name.bytes().last().is_some_and(|b| !b.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix("md").or_else(|| name.strip_prefix("nbd")) {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(rest) = name
+        .strip_prefix("xvd")
+        .or_else(|| name.strip_prefix("sd"))
+        .or_else(|| name.strip_prefix("vd"))
+        .or_else(|| name.strip_prefix("hd"))
+    {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic());
     }
     true
 }
@@ -205,5 +225,22 @@ mod tests {
         assert!((snap1.total_write_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
         assert!((snap1.io[0].read_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
         assert!((snap1.io[0].write_rate.as_bytes_per_sec() - 1_024_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn whole_block_device_excludes_partitions_dm_and_zram() {
+        assert!(is_whole_block_device("nvme0n1"));
+        assert!(!is_whole_block_device("nvme0n1p1"));
+        assert!(is_whole_block_device("sda"));
+        assert!(!is_whole_block_device("sda1"));
+        assert!(is_whole_block_device("xvda"));
+        assert!(!is_whole_block_device("xvda2"));
+        assert!(is_whole_block_device("mmcblk0"));
+        assert!(!is_whole_block_device("mmcblk0p1"));
+        assert!(!is_whole_block_device("mmcblk0boot0"));
+        assert!(is_whole_block_device("md0"));
+        assert!(!is_whole_block_device("md0p1"));
+        assert!(!is_whole_block_device("dm-0"));
+        assert!(!is_whole_block_device("zram0"));
     }
 }

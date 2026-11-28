@@ -71,12 +71,15 @@ impl<M: 'static> Element<M> {
             ElementKind::Text(t) => ElementKind::Text(Text {
                 common: t.common.map_with(mapper),
                 content: t.content,
+                spans: t.spans,
                 font_size: t.font_size,
                 line_height_multiplier: t.line_height_multiplier,
                 color: t.color,
                 font: t.font,
                 align: t.align,
                 bounds_mode: t.bounds_mode,
+                overflow: t.overflow,
+                max_lines: t.max_lines,
             }),
             ElementKind::Image(img) => ElementKind::Image(Image {
                 common: img.common.map_with(mapper),
@@ -101,6 +104,7 @@ impl<M: 'static> Element<M> {
                 fill: r.fill,
                 corner_radius: r.corner_radius,
                 border: r.border,
+                shadow: r.shadow,
             }),
             ElementKind::Canvas(c) => ElementKind::Canvas(Canvas {
                 common: c.common.map_with(mapper),
@@ -126,6 +130,7 @@ impl<M: 'static> Element<M> {
                     common: r.common.map_with(mapper),
                     gap: r.gap,
                     align: r.align,
+                    justify: r.justify,
                     padding: r.padding,
                     children,
                 })
@@ -139,6 +144,7 @@ impl<M: 'static> Element<M> {
                     common: c.common.map_with(mapper),
                     gap: c.gap,
                     align: c.align,
+                    justify: c.justify,
                     padding: c.padding,
                     children,
                 })

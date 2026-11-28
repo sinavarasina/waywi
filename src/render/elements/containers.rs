@@ -2,7 +2,7 @@ use crate::arena::{FrameSharedFn, FrameVec};
 use crate::geometry::{Edges, LogicalPx};
 use crate::input::CommonProps;
 use crate::render::elements::Element;
-use crate::render::style::{Align, CornerRadius};
+use crate::render::style::{Align, CornerRadius, Justify};
 
 /// Neutral grouping container for parent-relative positioning, transforms, and z-order.
 #[must_use]
@@ -67,6 +67,7 @@ pub struct Row<M = ()> {
     pub(crate) common: CommonProps<M>,
     pub(crate) gap: LogicalPx,
     pub(crate) align: Align,
+    pub(crate) justify: Justify,
     pub(crate) padding: Edges,
     pub(crate) children: FrameVec<Element<M>>,
 }
@@ -83,6 +84,7 @@ impl<M: 'static> Row<M> {
             common: CommonProps::default(),
             gap: LogicalPx::ZERO,
             align: Align::Start,
+            justify: Justify::Start,
             padding: Edges::ZERO,
             children: FrameVec::new(),
         }
@@ -95,6 +97,12 @@ impl<M: 'static> Row<M> {
 
     pub fn align(mut self, align: Align) -> Self {
         self.align = align;
+        self
+    }
+
+    /// Sets main-axis distribution along the horizontal row.
+    pub fn justify(mut self, justify: Justify) -> Self {
+        self.justify = justify;
         self
     }
 
@@ -134,6 +142,7 @@ impl<M: 'static> Row<M> {
             common: self.common.map_with(&mapper),
             gap: self.gap,
             align: self.align,
+            justify: self.justify,
             padding: self.padding,
             children: mapped_children,
         }
@@ -147,6 +156,7 @@ pub struct Column<M = ()> {
     pub(crate) common: CommonProps<M>,
     pub(crate) gap: LogicalPx,
     pub(crate) align: Align,
+    pub(crate) justify: Justify,
     pub(crate) padding: Edges,
     pub(crate) children: FrameVec<Element<M>>,
 }
@@ -163,6 +173,7 @@ impl<M: 'static> Column<M> {
             common: CommonProps::default(),
             gap: LogicalPx::ZERO,
             align: Align::Start,
+            justify: Justify::Start,
             padding: Edges::ZERO,
             children: FrameVec::new(),
         }
@@ -175,6 +186,12 @@ impl<M: 'static> Column<M> {
 
     pub fn align(mut self, align: Align) -> Self {
         self.align = align;
+        self
+    }
+
+    /// Sets main-axis distribution along the vertical column.
+    pub fn justify(mut self, justify: Justify) -> Self {
+        self.justify = justify;
         self
     }
 
@@ -214,6 +231,7 @@ impl<M: 'static> Column<M> {
             common: self.common.map_with(&mapper),
             gap: self.gap,
             align: self.align,
+            justify: self.justify,
             padding: self.padding,
             children: mapped_children,
         }

@@ -247,6 +247,19 @@ impl TextInputState {
         self.finish_external_edit(changed)
     }
 
+    /// Collapses any active selection at the current cursor position without modifying text.
+    /// Returns `true` if a selection was cleared.
+    pub fn clear_selection(&mut self) -> bool {
+        let had = self.anchor.take().is_some_and(|a| a != self.cursor);
+        self.finish_external_edit(had)
+    }
+
+    /// Deletes the active selection range if one exists. Returns `true` if text was removed.
+    pub fn delete_selection(&mut self) -> bool {
+        let deleted = self.delete_selection_internal();
+        self.finish_external_edit(deleted)
+    }
+
     /// Moves the cursor to `byte_idx` (snapped down to a valid UTF-8 char boundary).
     pub fn set_cursor_bytes(&mut self, byte_idx: usize, keep_selection: bool) -> bool {
         let clamped = snap_char_boundary(&self.text, byte_idx);
