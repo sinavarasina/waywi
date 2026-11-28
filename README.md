@@ -106,3 +106,6 @@ See [Integrations](docs/integrations.md) for the complete list of Cargo features
 ## License
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
+
+> [!CAUTION]
+> Built with LLM assistance and still experimental. Any version update may introduce breaking changes or regressions — check [CHANGELOG.md](CHANGELOG.md) before upgrading.

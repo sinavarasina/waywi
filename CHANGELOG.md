@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.1] - 2026-11-28
 
 ### Breaking Changes
 - **Unified `Fill` type on `Rect` and `Painter` (`render`)**:
